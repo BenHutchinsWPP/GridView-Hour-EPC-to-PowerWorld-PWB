@@ -20,6 +20,9 @@ HourEPCs/*.epc
 Output/*.pwb
 Output/*.xls*
 Seed/*.pwb
-TopoSeed/*
+TopoSeed/*.pwb
+TopoSeed/*.csv
+TopoSeed/*.aux
+TopoSeed/*.xls*
 
 *pycache*
