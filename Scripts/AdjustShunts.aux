@@ -1,0 +1,42 @@
+Script
+{
+   EnterMode(Edit);
+}
+
+Filter (ObjectType,Name,Logic,LogicNumTrue,FilterPre,Enabled,DataMaintainerAssign)
+{
+"Shunt" "Capacitor_To_Close" "AND" 0 "NO " "YES" ""
+"Shunt" "Capacitor_To_Open" "AND" 0 "NO " "YES" ""
+"Shunt" "Reactor_To_Close" "AND" 0 "NO " "YES" ""
+"Shunt" "Reactor_To_Open" "AND" 0 "NO " "YES" ""
+}
+
+Condition (ObjectType,Filter,CondNum,ObjectField,ConditionType,Value,OtherValue,Absolute)
+{
+"Shunt" "Capacitor_To_Close" 1 "MvarNom" ">" "0" "" "NO "
+"Shunt" "Capacitor_To_Close" 2 "Status" "=" "Open" "" "NO "
+"Shunt" "Capacitor_To_Close" 3 "Vpu" "<" "0.9" "" "NO "
+"Shunt" "Capacitor_To_Close" 4 "IslandNumber" "=" "1" "" "NO "
+"Shunt" "Capacitor_To_Open" 1 "MvarNom" ">" "0" "" "NO "
+"Shunt" "Capacitor_To_Open" 2 "Status" "=" "Closed" "" "NO "
+"Shunt" "Capacitor_To_Open" 3 "Vpu" ">" "1.1" "" "NO "
+"Shunt" "Capacitor_To_Open" 4 "IslandNumber" "=" "1" "" "NO "
+"Shunt" "Reactor_To_Close" 1 "MvarNom" "<" "0" "" "NO "
+"Shunt" "Reactor_To_Close" 2 "Status" "=" "Open" "" "NO "
+"Shunt" "Reactor_To_Close" 3 "Vpu" ">" "1.1" "" "NO "
+"Shunt" "Reactor_To_Close" 4 "IslandNumber" "=" "1" "" "NO "
+"Shunt" "Reactor_To_Open" 1 "MvarNom" "<" "0" "" "NO "
+"Shunt" "Reactor_To_Open" 2 "Status" "=" "Closed" "" "NO "
+"Shunt" "Reactor_To_Open" 3 "Vpu" "<" "0.9" "" "NO "
+"Shunt" "Reactor_To_Open" 4 "IslandNumber" "=" "1" "" "NO "
+}
+
+Script
+{
+   // Set generators to maintain existing bus voltages. 
+   EnterMode(Edit);
+   SetData(Shunt,[Status],["Open"],"Capacitor_To_Open");
+   SetData(Shunt,[Status],["Open"],"Reactor_To_Open");
+   SetData(Shunt,[Status],["Closed"],"Capacitor_To_Close");
+   SetData(Shunt,[Status],["Closed"],"Reactor_To_Close");
+}

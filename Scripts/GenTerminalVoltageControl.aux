@@ -1,0 +1,36 @@
+// Sets all generators to terminal voltage control mode. 
+// Benefits: 
+//  - This often solves better. 
+//  - You can also resolve issues where the terminal bus voltage is far from nominal. 
+
+Script
+{
+    EnterMode(Edit);
+}
+
+Filter (ObjectType,Name,Logic,LogicNumTrue,FilterPre,Enabled,DataMaintainerAssign)
+{
+    "Gen" "Gen_VoltSet_gt_1.1" "OR" 0 "NO " "YES" ""
+    "Gen" "Gen_VoltSet_lt_0.9" "OR" 0 "NO " "YES" ""
+    "Gen" "Gen_Remote_Reg" "OR" 0 "NO " "YES" ""
+}
+
+Condition (ObjectType,Filter,CondNum,ObjectField,ConditionType,Value,OtherValue,Absolute)
+{
+    "Gen" "Gen_VoltSet_gt_1.1" 1 "VoltSet" ">" "1.1" "" "NO "
+    "Gen" "Gen_VoltSet_lt_0.9" 1 "VoltSet" "<" "0.9" "" "NO "
+    "Gen" "Gen_Remote_Reg" 1 "RegBusNum" "<>" "<Field>BusNum" "" "NO "
+}
+
+Script
+{
+    // Store current control mode and setpoint in case you want to restore it later. 
+    SetData(Gen,[CustomInteger:0, CustomFloat:0],[@RegBusNum, @VoltSet],ALL);
+    // Regulate terminal bus. 
+    SetData(Gen,[RegBusNum, VoltSet],[@BusNum, 1.0],"Gen_Remote_Reg");
+    // If outside +/- 10%, regulate to at least within that band. 
+    SetData(Gen,[VoltSet],[1.1],"Gen_VoltSet_gt_1.1");
+    SetData(Gen,[VoltSet],[0.9],"Gen_VoltSet_lt_0.9");
+}
+
+
