@@ -40,6 +40,7 @@ Produce (Output):
 ## Methodology Summary
 - Setup GridView and PWB cases to have the same Dummy-Bus-Numbers for Multi-Section Lines. 
 - Bring all missing elements from GridView into the PWB. 
+  - Gets all X1/X2/X3 etc loads from all GridView EPCs into the TopoSeed (GridView seems to creates loads to represent distributed generation on-the-fly, differently in each hour case)
 - Fix bad transformer taps (If taps are > 15% from Nominal kV, set to 1.0 Taps). 
 - Make PWB branch statuses match GridView. 
   - Ignore unsupported GridView branch types, such as Breakers/Disconnects. 

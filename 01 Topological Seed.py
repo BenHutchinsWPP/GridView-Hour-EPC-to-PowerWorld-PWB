@@ -101,7 +101,17 @@ if(__name__=='__main__'):
     if not wpp_lib.solve(SimAuto, wpp_lib.mva_mismatch_threshold):
         print('WARNING: Did not solve after running create_giant_swing() !!!')
         SimAuto.LoadState()
-    wpp_lib.save_case(SimAuto, cur_dir / 'TopoSeed' / '06_create_giant_swing.pwb', case_format)
+    case_fp = cur_dir / 'TopoSeed' / '06_create_giant_swing.pwb'
+    wpp_lib.save_case(SimAuto, case_fp, case_format)
+
+    print('07_create_distgen_XN_loads')
+    SimAuto.SaveState()
+    distgen_loads_df = wpp_lib.create_distgen_XN_loads(SimAuto, gv_fps, case_fp)
+    distgen_loads_df.to_excel(writer, sheet_name='distgen_loads', index=False)
+    if not wpp_lib.solve(SimAuto, wpp_lib.mva_mismatch_threshold):
+        print('WARNING: Did not solve after running create_distgen_XN_loads() !!!')
+        SimAuto.LoadState()
+    wpp_lib.save_case(SimAuto, cur_dir / 'TopoSeed' / '07_create_distgen_XN_loads.pwb', case_format)
 
     wpp_lib.save_case(SimAuto, cur_dir / 'TopoSeed' / 'TopoSeed.pwb', case_format)
 
