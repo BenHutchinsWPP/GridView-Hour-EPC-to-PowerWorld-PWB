@@ -52,6 +52,7 @@ def create_case(SimAuto, gv_fp, pw_fp):
     pvqv_df = pd.read_csv(pvqv_fp)
 
     print('iterate_to_gen_load_targets')
+    wpp_lib.report_gen_load_balance(gen_target_df, load_target_df)
     if not wpp_lib.open_case(SimAuto, pw_fp):
         raise
     scalelog_dict = wpp_lib.iterate_to_gen_load_targets(SimAuto, gen_target_df, load_target_df, pvqv_df)
