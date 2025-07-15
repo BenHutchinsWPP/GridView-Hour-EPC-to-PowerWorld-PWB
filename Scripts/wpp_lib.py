@@ -130,6 +130,37 @@ def solve(SimAuto, mva_mismatch_threshold = 1.0) -> bool:
 
     return max_mismatch < mva_mismatch_threshold
 
+# Given:
+#   SimAuto: PowerWorld SimulatorAuto object
+#   df: A dataframe of object parameters to set. 
+# Attempt to apply all the changes in bulk edits using set_param_df().
+# If it fails, revert to the previous system state, and bifurcate the df into two halves to test recursively until reaching 1 item. 
+# If individual items fail, keep track of those failures on a row-by-row basis.
+def set_param_df_recursive(SimAuto, table: str, df: pd.DataFrame):
+    SimAuto.SaveState()
+
+    # Attempt all the edits in a single bulk step. 
+    message = set_param_df(SimAuto, table, df)
+
+    if not solve(SimAuto, mva_mismatch_threshold):
+        SimAuto.LoadState()
+        # Failed to do all changes at once! Revert, and try individual branch changes. 
+        print(f'Failed to set parameters on all elements at the same time. Bifurcating into half the list size.')
+
+        # If dataframe is already only 1 item, record the failure on that row of the slice of the dataframe. 
+        # 'ExclusionReason' = 'Diverged'. 
+        # 'Include' = False.
+        if len(df) == 1:
+            df.at[df.index[0], 'Include'] = False
+            df.at[df.index[0], 'ExclusionReason'] = 'Diverged'
+            return
+        
+        # Split the list into two halves to process. 
+        set_param_df_recursive(SimAuto, table, df.iloc[:len(df)//2])
+        set_param_df_recursive(SimAuto, table, df.iloc[len(df)//2:])
+
+    return 
+
 def get_case_data(SimAuto) -> dict[str,dict[str,object]]:
     print('get_case_data()')
     
@@ -802,6 +833,45 @@ def test_gen_targets_parallel(pw_fp: Path, gen_target_df):
     gen_target_df = pd.concat(results, ignore_index=True)
     gen_target_df.sort_values(by='Success', ascending=True, inplace=True)
     return gen_target_df
+
+def report_gen_load_balance(gen_target_df, load_target_df):
+    # This function will write out a tabular report of the total gen/load MW and differences. 
+    # Rows: 
+    #   - Gen MW
+    #   - Dist Gen MW (In Load Table)
+    #   - Load MW
+    #   - Total Delta (Gen + Dist Gen - Load)
+    # Columns: 
+    #   - Base Case
+    #   - Target Case
+    #   - Delta
+    
+    base_gen_mw = gen_target_df['MWSetPoint'].sum()
+    base_dist_mw = load_target_df['DistMWInput'].sum()
+    base_load_mw = load_target_df['SMW'].sum()
+    base_total_delta = base_gen_mw + base_dist_mw - base_load_mw
+
+    target_gen_mw = gen_target_df['MWSetPoint_Target'].sum()
+    target_dist_mw = load_target_df['DistMWInput_Target'].sum()
+    target_load_mw = load_target_df['SMW_Target'].sum()
+    target_total_delta = target_gen_mw + target_dist_mw - target_load_mw
+
+    total_delta_df = pd.DataFrame({
+        'Base Case': [base_gen_mw, base_dist_mw, base_load_mw, base_total_delta]
+        ,'Target Case': [target_gen_mw, target_dist_mw, target_load_mw, target_total_delta]
+    })
+
+    total_delta_df.index = ['Gen MW', 'Dist Gen MW', 'Load MW', 'Gen + Dist Gen - Load']
+
+    # Display the report.
+    print(total_delta_df.round(0))
+
+    if((target_total_delta / base_total_delta) > 1.5):
+        print('-----------------------------------------------------------------------------------')
+        print('WARNING: Gen/Load imbalance in the target case is high. This may cause instability.')
+        print('-----------------------------------------------------------------------------------')
+
+    return
 
 def iterate_to_gen_load_targets(SimAuto, gen_target_df, load_target_df, pvqv_df, iterations=100):
 
