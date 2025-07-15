@@ -5,6 +5,12 @@ import numpy as np
 import pandas as pd
 import openpyxl.utils
 import win32com.client
+import warnings
+
+# Filter warnings on applymap and fillna for now. 
+# To Do: Identify a future-proof version of these calls. 
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*DataFrame[.]applymap.*")
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*fillna.*")
 
 mva_mismatch_threshold = 1.0 
 
@@ -42,6 +48,7 @@ def get_param_df(SimAuto, table: str, parameter_type: dict[str,type], filter_gro
     # Pack into a dataframe. 
     df = pd.DataFrame(data=rows, columns=parameter_list)
     # Trim all strings. 
+    # TO DO: fix future warning. 
     df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
     # Change all data types to the proper types. 
     for parameter in parameter_list:
@@ -65,6 +72,7 @@ def set_param_df(SimAuto, table, df: pd.DataFrame):
     # Get parameters. 
     parameters: list[str] = df.columns.tolist()
     # Convert df into list of lists. All numerical values which are "nan" must be treated as empty strings. 
+    # TO DO: fix future warning. 
     rows: list[list[str]] = df.fillna('').astype(str).values.tolist()
     # Set data in PowerWorld. 
     return_value = set_param(SimAuto, table, parameters, rows)
