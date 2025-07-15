@@ -1027,13 +1027,9 @@ def iterate_to_gen_load_targets(SimAuto, gen_target_df, load_target_df, pvqv_df,
         # This means opening several generators at 0 MW, but they may be providing VAR support. 
         # If it cannot be opened, make note of it and proceed. 
         print('Setting all gen statuses...')
-        df = gen_target_df[gen_target_df['Status'] != gen_target_df['Status_Target']].copy()
-        df['Status_Old'] = df['Status']
-        df['Status'] = df['Status_Target']
-        df['FinalStatusChange'] = 'Okay'
-        set_param_df_recursive(SimAuto, 'Gen', df)
-        df.drop(columns=['Status'], inplace=True)
-        return df
+        gen_target_df['Status'] = gen_target_df['Status_Target']
+        set_param_df_recursive(SimAuto, 'Gen', gen_target_df)
+        return gen_target_df
 
     def compute_deltas():
         gen_target_df['MWSetPoint_Delta'] = (gen_target_df['MWSetPoint_Target'] - gen_target_df['MWSetPoint']) / iterations
@@ -1212,9 +1208,6 @@ def iterate_to_gen_load_targets(SimAuto, gen_target_df, load_target_df, pvqv_df,
     if not solve(SimAuto):
         print('Setting final gen/load statuses did not succeed. Reverting change.')
         SimAuto.LoadState()
-
-    # Package the logs for return. 
-    scalelog_dict['gen_final_st_change'] = gen_final_status_change_df[gen_final_status_change_df['FinalStatusChange'] == 'DIVERGED']
 
     print('Reached end of iterate_to_gen_load_targets(). Returning.')
 
