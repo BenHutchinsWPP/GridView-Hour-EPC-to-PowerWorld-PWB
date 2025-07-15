@@ -148,9 +148,12 @@ def set_param_df_recursive(SimAuto, table: str, df: pd.DataFrame):
     SimAuto.SaveState()
 
     # Attempt all the edits in a single bulk step. 
+    print(f'Attempting to set {len(df)} {table} parameters at once.')
     message = set_param_df(SimAuto, table, df)
 
-    if not solve(SimAuto, mva_mismatch_threshold):
+    if solve(SimAuto, mva_mismatch_threshold):
+        print('Success!')
+    else:
         SimAuto.LoadState()
         # Failed to do all changes at once! Revert, and try individual branch changes. 
         print(f'Failed to set parameters on all elements at the same time. Bifurcating into half the list size.')
@@ -161,6 +164,8 @@ def set_param_df_recursive(SimAuto, table: str, df: pd.DataFrame):
         if len(df) == 1:
             df.at[df.index[0], 'Include'] = False
             df.at[df.index[0], 'ExclusionReason'] = 'Diverged'
+            print(f'Could not set this {table}:')
+            print(df.at[df.index[0]])
             return
         
         # Split the list into two halves to process. 
@@ -984,7 +989,7 @@ def iterate_to_gen_load_targets(SimAuto, gen_target_df, load_target_df, pvqv_df,
         gens_to_close = (gen_target_df['Status']=='Open') & (gen_target_df['Status_Target']=='Closed')
         gen_target_df.loc[gens_to_close, 'MWSetPoint'] = 0
         gen_target_df.loc[gens_to_close, 'Status'] = 'Closed'
-        set_param_df_recursive(SimAuto, 'Gen', gen_target_df)
+        set_param_df_recursive(SimAuto, 'Gen', gen_target_df[gen_target_df['Include'] == True])
         if solve(SimAuto):
             SimAuto.SaveState()
         else:
@@ -1021,14 +1026,14 @@ def iterate_to_gen_load_targets(SimAuto, gen_target_df, load_target_df, pvqv_df,
         # Opening these should have no impact on the model solution.
         load_target_df['Status'] = load_target_df['Status_Target']
         load_target_df['DistStatus'] = load_target_df['DistStatus_Target']
-        set_param_df_recursive(SimAuto, 'Load', load_target_df)
+        set_param_df_recursive(SimAuto, 'Load', load_target_df[load_target_df['Include'] == True])
         
         # Iterate through each generator, and attempt to change the status to the final target status.
         # This means opening several generators at 0 MW, but they may be providing VAR support. 
         # If it cannot be opened, make note of it and proceed. 
         print('Setting all gen statuses...')
         gen_target_df['Status'] = gen_target_df['Status_Target']
-        set_param_df_recursive(SimAuto, 'Gen', gen_target_df)
+        set_param_df_recursive(SimAuto, 'Gen', gen_target_df[gen_target_df['Include'] == True])
         return gen_target_df
 
     def compute_deltas():
