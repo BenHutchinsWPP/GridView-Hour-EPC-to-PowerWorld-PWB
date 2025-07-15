@@ -761,6 +761,12 @@ def compute_pw_targets(SimAuto, left_fp: Path, right_fp: Path) -> list[pd.DataFr
         ,'MWSetPoint_Target': 0
     }, inplace=True)
 
+    # If the generator is open, set the MW to 0 MW.
+    gen_target_df.loc[gen_target_df['Status'] == "Open", 'MWSetPoint'] = 0
+
+    # If the generator target is open, set the MW target to 0 MW.
+    gen_target_df.loc[gen_target_df['Status_Target'] == "Open", 'MWSetPoint_Target'] = 0
+
     load_target_df = right_load_df.merge(
         left_load_df
         ,on='ObjectID'
@@ -772,6 +778,22 @@ def compute_pw_targets(SimAuto, left_fp: Path, right_fp: Path) -> list[pd.DataFr
     load_target_df['Status_Target'] = load_target_df['Status_Target'].fillna("Open")
     load_target_df['DistStatus_Target'] = load_target_df['DistStatus_Target'].fillna("Open")
     load_target_df = load_target_df.fillna(0)
+
+    # If the load target is open, set all targets to 0 MW and 0 MVAR.
+    cols_to_zero = ['SMW_Target', 'SMvar_Target', 'DistMWInput_Target', 'DistMvarInput_Target']
+    load_target_df.loc[load_target_df['Status_Target'] == "Open", cols_to_zero] = 0
+
+    # If the distributed generation load target is open, set dist targets to 0 MW and 0 MVAR.
+    cols_to_zero = ['DistMWInput_Target', 'DistMvarInput_Target']
+    load_target_df.loc[load_target_df['DistStatus_Target'] == "Open", cols_to_zero] = 0
+
+    # If the load is open in the base case, set all values to 0 MW and 0 MVAR.
+    cols_to_zero = ['SMW', 'SMvar', 'DistMWInput', 'DistMvarInput']
+    load_target_df.loc[load_target_df['Status'] == "Open", cols_to_zero] = 0
+
+    # If the distributed generation load is open in the base case, set the starting MW and MVAR to 0. 
+    cols_to_zero = ['DistMWInput', 'DistMvarInput']
+    load_target_df.loc[load_target_df['DistStatus'] == "Open", cols_to_zero] = 0
 
     gen_target_df = gen_target_df.set_index('ObjectID')
     load_target_df = load_target_df.set_index('ObjectID')
