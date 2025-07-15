@@ -977,12 +977,22 @@ def iterate_to_gen_load_targets(SimAuto, gen_target_df, load_target_df, pvqv_df,
         return
     
     def close_all_related_gen_load():
+        print('close_all_related_gen_load()')
+        SimAuto.SaveState()
+
+        print('Closing all related generation at 0 MW output.')
         gens_to_close = (gen_target_df['Status']=='Open') & (gen_target_df['Status_Target']=='Closed')
         gen_target_df.loc[gens_to_close, 'MWSetPoint'] = 0
         gen_target_df.loc[gens_to_close, 'Status'] = 'Closed'
-        set_param_df(SimAuto, 'Gen', gen_target_df)
-        solve(SimAuto)
-
+        set_param_df_recursive(SimAuto, 'Gen', gen_target_df)
+        if solve(SimAuto):
+            SimAuto.SaveState()
+        else:
+            SimAuto.LoadState()
+            print('WARNING: Failed to close all related generators at 0 MW output levels. Check target Excel sheet, and manually check if you can close those generators at 0 MW without divergence. Rolling back change.')
+            return
+        
+        print('Closing all related load at 0 MW // 0 MVAR.')
         loads_to_close = (load_target_df['Status']=='Open') & (load_target_df['Status_Target']=='Closed')
         columns_to_zero = ['SMW', 'SMvar']
         load_target_df.loc[loads_to_close, columns_to_zero] = 0
@@ -994,18 +1004,24 @@ def iterate_to_gen_load_targets(SimAuto, gen_target_df, load_target_df, pvqv_df,
         load_target_df.loc[dist_loads_to_close, 'DistStatus'] = 'Closed'
 
         set_param_df(SimAuto, 'Load', load_target_df)
-        solve(SimAuto)
+        if solve(SimAuto):
+            SimAuto.SaveState()
+        else:
+            print('WARNING: Failed to close all related loads at 0 MW output levels. Check target Excel sheet, and manually check if you can close those loads at 0 MW without divergence. Rolling back change.')
+            SimAuto.LoadState()
+
         return
 
     def set_gen_load_status():
+        SimAuto.SaveState()
         print('set_gen_load_status()')
         print('Setting all load statuses...')
+
         # At this stage, all loads which are intended to be opened should have reached 0 MW and 0 MVAR. 
         # Opening these should have no impact on the model solution.
         load_target_df['Status'] = load_target_df['Status_Target']
         load_target_df['DistStatus'] = load_target_df['DistStatus_Target']
-        set_param_df(SimAuto, 'Load', load_target_df)
-        ret_val = solve(SimAuto)
+        set_param_df_recursive(SimAuto, 'Load', load_target_df)
         
         # Iterate through each generator, and attempt to change the status to the final target status.
         # This means opening several generators at 0 MW, but they may be providing VAR support. 
@@ -1015,13 +1031,7 @@ def iterate_to_gen_load_targets(SimAuto, gen_target_df, load_target_df, pvqv_df,
         df['Status_Old'] = df['Status']
         df['Status'] = df['Status_Target']
         df['FinalStatusChange'] = 'Okay'
-        for i in range(len(df)):
-            print(f'Attempting to set status for Gen {i} of {len(df)}')
-            SimAuto.SaveState()
-            set_param_df(SimAuto, 'Gen', df.iloc[[i]])
-            if not solve(SimAuto):
-                SimAuto.LoadState()
-                df.loc[df.index[i], 'FinalStatusChange'] = 'DIVERGED'
+        set_param_df_recursive(SimAuto, 'Gen', df)
         df.drop(columns=['Status'], inplace=True)
         return df
 
@@ -1042,6 +1052,7 @@ def iterate_to_gen_load_targets(SimAuto, gen_target_df, load_target_df, pvqv_df,
         return
     
     def create_statcom_on_lowestv_bus(vpu_min = 0.85, vnom_min = 50) -> int:
+        SimAuto.SaveState()
         # If there is a bus with voltage lower than v_min, this will 
         bus_params: dict[str,type] = {
             'Number': int
@@ -1064,10 +1075,11 @@ def iterate_to_gen_load_targets(SimAuto, gen_target_df, load_target_df, pvqv_df,
         nomvolt = min_row['BusNomVolt']
 
         print(f'Adding statcom to: {number}, kV={nomvolt}, Vpu={vpu}')
+        # Create a STATCOM, in the "Open" position. Solve case. 
         statcom_dict = {
             'BusNum': number
             ,'GenID': 'xx'
-            ,'GenStatus': 'Closed'
+            ,'GenStatus': 'Open'
             ,'GenAVRAble': 'YES'
             ,'GenMVRMax': 9999
             ,'GenMVRMin': -9999
@@ -1084,9 +1096,27 @@ def iterate_to_gen_load_targets(SimAuto, gen_target_df, load_target_df, pvqv_df,
         SimAuto.CreateIfNotFound = True
         set_param_df(SimAuto, 'Gen', statcom_df)
         SimAuto.RunScriptCommand('EnterMode(RUN);')
+
+        if solve(SimAuto):
+            SimAuto.SaveState()
+        else:
+            print('WARNING: Did not solve after creating statcom in Open state. Rolling back change.')
+            SimAuto.LoadState()
+            return number
+
+        # Try to close STATCOM. Roll back if it doesn't solve.
+        SimAuto.SaveState()
+        statcom_dict['GenStatus'] = 'Closed'
+        set_param_df(SimAuto, 'Gen', statcom_df)
+        if not solve(SimAuto, mva_mismatch_threshold):
+            print('WARNING: Did not solve after closing statcom. Rolling back change.')
+            SimAuto.LoadState()
+
         return number
 
     def drop_collapsed_sections(vpu_min = 0.80, vpu_max = 0.80):
+        SimAuto.SaveState()
+
         # Disconnects network sections which are beginning to show collapse. 
         # I.e. opens branches connecting from buses with OK voltage (>vpu_max) to 
         # buses with awful voltage (<vpu_min).
@@ -1102,71 +1132,91 @@ def iterate_to_gen_load_targets(SimAuto, gen_target_df, load_target_df, pvqv_df,
                              (df['BranchVpuLow'] < vpu_min)].copy()
         if len(filtered_df) == 0:
             return set([0])
+        
         print(f'Dropping branches to collapsed network sections: {filtered_df["ObjectID"].unique()}')
         filtered_df['Status'] = 'Open'
         set_param_df(SimAuto, 'Branch', filtered_df)
+        # Run command "ClearSmallIslands;"
+        SimAuto.RunScriptCommand('ClearSmallIslands;')
+
+        if not solve(SimAuto, mva_mismatch_threshold):
+            print('WARNING: Did not solve after dropping branches. Rolling back change.')
+            SimAuto.LoadState()
         return set(filtered_df['ObjectID'].unique())
 
+    # Save state. 
     SimAuto.SaveState()
-    if not solve(SimAuto):
+
+    # Setup logs. 
+    scalelog_dict: dict[str,pd.DataFrame] = {}
+    statcom_bus_set = set()
+    dropped_branch_set = set()
+
+    if not solve(SimAuto, mva_mismatch_threshold):
         SimAuto.LoadState()
-        raise
+        print('Could not solve the original input case!')
+        scalelog_dict['iteration_df'] = pd.DataFrame({"Value": ['Failed to converge base case.']})
+        return scalelog_dict
 
     [gen_pvqv_df, load_pvqv_df] = compute_pvqv_exclusions()
     compute_voltage_exclusions()
     close_all_related_gen_load()
-    adjust_shunts(SimAuto)
     compute_deltas()
+
+    adjust_shunts(SimAuto)
     if not solve(SimAuto):
         SimAuto.LoadState()
-
-    statcom_bus_set = set()
-    dropped_branch_set = set()
+        print('Could not solve after adjusting shunts in the original case!')
+        scalelog_dict['iteration_df'] = pd.DataFrame({"Value": ['Failed to converge base case with shunt adjustments.']})
+        return scalelog_dict
 
     print('')
+    iteration_success = True
     for iteration in range(iterations):
-        print(f'\r----- Iteration: {iteration} of {iterations} -----           ', end='')
         SimAuto.SaveState()
+        print(f'\r----- Iteration: {iteration} of {iterations} -----           ') # , end='')
         increment(1.0)
         set_param_df(SimAuto, 'Gen', gen_target_df)
         set_param_df(SimAuto, 'Load', load_target_df)
-        adjust_shunts(SimAuto)
-        dropped_branches = drop_collapsed_sections()
-        dropped_branch_set.update(dropped_branches)
-        statcom_number = create_statcom_on_lowestv_bus()
-        statcom_bus_set.add(statcom_number)
-        if solve(SimAuto):
+        if solve(SimAuto) and solve(SimAuto):
+            SimAuto.SaveState()
+            adjust_shunts(SimAuto)
             compute_voltage_exclusions()
+            dropped_branches = drop_collapsed_sections()
+            dropped_branch_set.update(dropped_branches)
+            statcom_number = create_statcom_on_lowestv_bus()
+            statcom_bus_set.add(statcom_number)
         else:
             print(f'Stopped at Iteration: {iteration} of {iterations}')
             print('Iteration did not solve. Reverting iteration and stopping.')
             increment(-1.0)
-            SimAuto.LoadState()
+            SimAuto.LoadState() # SimAuto.RunScriptCommand("RestoreState('LASTSUCCESSFUL','');")
+            iteration_success = False
             break # Exit the for-loop.
+
+    # Package the logs for return. 
+    scalelog_dict['gen'] = gen_target_df[gen_target_df['Include'] == False]
+    scalelog_dict['load'] = load_target_df[load_target_df['Include'] == False]
+    scalelog_dict['iteration_df'] = pd.DataFrame({"Value": [iteration]})
+    scalelog_dict['statcom_bus_df'] = pd.DataFrame({"BusNum": list(statcom_bus_set)})
+    scalelog_dict['gen_pvqv'] = gen_pvqv_df
+    scalelog_dict['load_pvqv'] = load_pvqv_df
+    scalelog_dict['dropped_branch_df'] = pd.DataFrame({"ObjectID": list(dropped_branch_set)})
     
+    if not iteration_success:
+        return scalelog_dict
+    
+    compute_voltage_exclusions()
     SimAuto.SaveState()
     gen_final_status_change_df = set_gen_load_status()
     if not solve(SimAuto):
         print('Setting final gen/load statuses did not succeed. Reverting change.')
         SimAuto.LoadState()
 
-    SimAuto.SaveState()
-    dropped_branches = drop_collapsed_sections()
-    dropped_branch_set.update(dropped_branches)
-    if not solve(SimAuto):
-        print('There are some voltage-collapsed network sections which could not be opened.')
-        SimAuto.LoadState()
-
     # Package the logs for return. 
-    scalelog_dict: dict[str,pd.DataFrame] = {}
-    scalelog_dict['gen'] = gen_target_df[gen_target_df['Include'] == False]
-    scalelog_dict['load'] = load_target_df[load_target_df['Include'] == False]
-    scalelog_dict['iteration_df'] = pd.DataFrame({"Value": [iteration]})
-    scalelog_dict['statcom_bus_df'] = pd.DataFrame({"BusNum": list(statcom_bus_set)})
-    scalelog_dict['dropped_branch_df'] = pd.DataFrame({"ObjectID": list(dropped_branch_set)})
-    scalelog_dict['gen_pvqv'] = gen_pvqv_df
-    scalelog_dict['load_pvqv'] = load_pvqv_df
     scalelog_dict['gen_final_st_change'] = gen_final_status_change_df[gen_final_status_change_df['FinalStatusChange'] == 'DIVERGED']
+
+    print('Reached end of iterate_to_gen_load_targets(). Returning.')
 
     return scalelog_dict
 
@@ -1250,6 +1300,9 @@ def set_branch_statuses(SimAuto, left_case_dict, right_case_dict):
     return [status_targets_df, fail_df]
 
 def adjust_shunts(SimAuto, vlow: float = 0.92, vhigh: float = 1.08, max_iterations: int = 10):
+    # Save state.
+    SimAuto.SaveState()
+
     # Adjusts shunts to attempt to get buses back within a set voltage band. 
 
     table = 'Shunt'
@@ -1311,10 +1364,11 @@ def adjust_shunts(SimAuto, vlow: float = 0.92, vhigh: float = 1.08, max_iteratio
                 SimAuto.LoadState()
 
         return
-
     adjust_all_shunts()
     iterate_on_individual_shunts()
-
+    if not solve(SimAuto, mva_mismatch_threshold):
+        print('adjust_shunts() did not solve. Restoring state.')
+        SimAuto.LoadState()
     return
 
 def fix_transformer_taps(SimAuto, threshold = 0.15):
