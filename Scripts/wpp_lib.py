@@ -165,14 +165,14 @@ def set_param_df_recursive(SimAuto, table: str, df: pd.DataFrame):
             df.at[df.index[0], 'Include'] = False
             df.at[df.index[0], 'ExclusionReason'] = 'Diverged'
             print(f'Could not set this {table}:')
-            print(df.at[df.index[0]])
+            print(df)
             return
         
         # Split the list into two halves to process. 
         set_param_df_recursive(SimAuto, table, df.iloc[:len(df)//2])
         set_param_df_recursive(SimAuto, table, df.iloc[len(df)//2:])
 
-    return 
+    return df
 
 def get_case_data(SimAuto) -> dict[str,dict[str,object]]:
     print('get_case_data()')
@@ -760,6 +760,10 @@ def compute_pw_targets(SimAuto, left_fp: Path, right_fp: Path) -> list[pd.DataFr
     )
     gen_target_df.drop(columns=['BusNum_Target', 'BusName_Target', 'NomkV_Target', 'ID_Target'], inplace=True)
 
+    # Save original state. 
+    gen_target_df['Status_Seed'] = gen_target_df['Status']
+    gen_target_df['MWSetPoint_Seed'] = gen_target_df['MWSetPoint']
+
     # If the generator exists on the right, but not on the left (target), set to 0 MW and Open it.
     gen_target_df.fillna({
         'Status_Target': "Open"
@@ -989,7 +993,8 @@ def iterate_to_gen_load_targets(SimAuto, gen_target_df, load_target_df, pvqv_df,
         gens_to_close = (gen_target_df['Status']=='Open') & (gen_target_df['Status_Target']=='Closed')
         gen_target_df.loc[gens_to_close, 'MWSetPoint'] = 0
         gen_target_df.loc[gens_to_close, 'Status'] = 'Closed'
-        set_param_df_recursive(SimAuto, 'Gen', gen_target_df[gen_target_df['Include'] == True])
+        result_df = set_param_df_recursive(SimAuto, 'Gen', gen_target_df[gen_target_df['Include'] == True])
+        gen_target_df.update(result_df)
         if solve(SimAuto):
             SimAuto.SaveState()
         else:
@@ -997,6 +1002,9 @@ def iterate_to_gen_load_targets(SimAuto, gen_target_df, load_target_df, pvqv_df,
             print('WARNING: Failed to close all related generators at 0 MW output levels. Check target Excel sheet, and manually check if you can close those generators at 0 MW without divergence. Rolling back change.')
             return
         
+        # In gen_target_df, for any gens where "Include" = False, set the status equal to the original seed status.
+        gen_target_df.loc[gen_target_df['Include'] == False, 'Status'] = gen_target_df['Status_Seed']
+
         print('Closing all related load at 0 MW // 0 MVAR.')
         loads_to_close = (load_target_df['Status']=='Open') & (load_target_df['Status_Target']=='Closed')
         columns_to_zero = ['SMW', 'SMvar']
@@ -1026,14 +1034,16 @@ def iterate_to_gen_load_targets(SimAuto, gen_target_df, load_target_df, pvqv_df,
         # Opening these should have no impact on the model solution.
         load_target_df['Status'] = load_target_df['Status_Target']
         load_target_df['DistStatus'] = load_target_df['DistStatus_Target']
-        set_param_df_recursive(SimAuto, 'Load', load_target_df[load_target_df['Include'] == True])
+        result_df = set_param_df_recursive(SimAuto, 'Load', load_target_df[load_target_df['Include'] == True])
+        load_target_df.update(result_df)
         
         # Iterate through each generator, and attempt to change the status to the final target status.
         # This means opening several generators at 0 MW, but they may be providing VAR support. 
         # If it cannot be opened, make note of it and proceed. 
         print('Setting all gen statuses...')
         gen_target_df['Status'] = gen_target_df['Status_Target']
-        set_param_df_recursive(SimAuto, 'Gen', gen_target_df[gen_target_df['Include'] == True])
+        result_df = set_param_df_recursive(SimAuto, 'Gen', gen_target_df[gen_target_df['Include'] == True])
+        gen_target_df.update(result_df)
         return gen_target_df
 
     def compute_deltas():
