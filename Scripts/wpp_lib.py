@@ -1117,7 +1117,7 @@ def iterate_to_gen_load_targets(SimAuto, gen_target_df, load_target_df, pvqv_df,
 
         # Try to close STATCOM. Roll back if it doesn't solve.
         SimAuto.SaveState()
-        statcom_dict['GenStatus'] = 'Closed'
+        statcom_df['GenStatus'] = 'Closed'
         set_param_df(SimAuto, 'Gen', statcom_df)
         if not solve(SimAuto, mva_mismatch_threshold):
             print('WARNING: Did not solve after closing statcom. Rolling back change.')
