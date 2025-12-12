@@ -744,6 +744,11 @@ def compute_pw_targets(SimAuto, left_fp: Path, right_fp: Path) -> list[pd.DataFr
         raise
     left_gen_df = get_param_df(SimAuto, 'Gen', gen_params)
     left_load_df = get_param_df(SimAuto, 'Load', load_params)
+    # In the GridView case, the distributed generation in the load table is not used, but left at the seed-case values. 
+    # We need to set those targets to "Open" and 0 MW/MVAR.
+    left_load_df['DistStatus'] = 'Open'
+    left_load_df['DistMWInput'] = 0
+    left_load_df['DistMvarInput'] = 0
 
     # Get data from right case.
     if not open_case(SimAuto, right_fp):
