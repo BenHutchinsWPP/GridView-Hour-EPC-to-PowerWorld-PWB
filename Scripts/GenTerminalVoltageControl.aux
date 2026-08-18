@@ -27,7 +27,7 @@ Script
     // Store current control mode and setpoint in case you want to restore it later. 
     SetData(Gen,[CustomInteger:0, CustomFloat:0],[@RegBusNum, @VoltSet],ALL);
     // Regulate terminal bus. 
-    SetData(Gen,[RegBusNum, VoltSet],[@BusNum, 1.0],"Gen_Remote_Reg");
+    SetData(Gen,[RegBusNum, VoltSet],[@BusNum, @Vpu],"Gen_Remote_Reg");
     // If outside +/- 10%, regulate to at least within that band. 
     SetData(Gen,[VoltSet],[1.1],"Gen_VoltSet_gt_1.1");
     SetData(Gen,[VoltSet],[0.9],"Gen_VoltSet_lt_0.9");
