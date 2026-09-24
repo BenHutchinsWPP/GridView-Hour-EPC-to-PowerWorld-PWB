@@ -1,74 +1,74 @@
 from pathlib import Path
+import traceback
 import pandas as pd
 import win32com.client
-import Scripts.wpp_lib as wpp_lib
-SimAuto = win32com.client.Dispatch("pwrworld.SimulatorAuto")
+from Scripts import pw, topo, scale
 
 cur_dir = Path(__file__).parent
 
 case_format = 'PWB23'
 
+# ------------------ Options ------------------
+# How to handle gens/loads which make the case diverge:
+#   'pretest': Test each gen target on its own first (in parallel), and exclude those which diverge.
+#              Scaling stops at the first step which diverges.
+#   'bisect':  No pretest. When a scaling step diverges, bisect it to find the gens/loads which diverge,
+#              exclude them at their last good step, and continue scaling the rest.
+divergence_mode = 'pretest'
+
 # ------------------ Inputs ------------------
 gv_dir = cur_dir / 'HourEPCs'
 pw_fp = cur_dir / 'TopoSeed' / 'TopoSeed.pwb'
+pvqv_fp = cur_dir / 'TopoSeed' / 'pvqv.csv'
+dummy_bus_fp = cur_dir / 'TopoSeed' / 'DummyBus.aux'
 
 # ------------------ Outputs ------------------
-fault_fp = cur_dir / 'TopoSeed' / 'fault_duty.csv'
-pvqv_fp = cur_dir / 'TopoSeed' / 'pvqv.csv'
-toposeed_log_fp = cur_dir / 'TopoSeed' / 'TopoSeed_Log.xlsx'
+out_dir = cur_dir / 'Output'
 
-def create_case(SimAuto, gv_fp, pw_fp):
-    target_fp = cur_dir / 'Output' / (gv_fp.stem + '_01_Target.xlsx')
-    target_test_fp = cur_dir / 'Output' / (gv_fp.stem + '_02_TargetTest.xlsx')
-    scale_log_fp = cur_dir / 'Output' / (gv_fp.stem + '_03_ScaleLog.xlsx')
-
+def create_case(SimAuto, gv_fp, out_fp):
     print('compute_pw_targets')
-    [gen_target_df, load_target_df] = wpp_lib.compute_pw_targets(SimAuto, gv_fp, pw_fp)
-    wpp_lib.df_dict_to_excel_workbook(target_fp, {
-        'gen':gen_target_df
-        ,'load':load_target_df
-    })
+    targets = scale.compute_pw_targets(SimAuto, gv_fp, pw_fp, dummy_bus_fp)
+    pw.write_excel(out_dir / (gv_fp.stem + '_01_Target.xlsx'), {table.lower(): df for table, df in targets.items()})
 
-    print('test_gen_targets_parallel')
-    gen_target_df = wpp_lib.test_gen_targets_parallel(pw_fp, gen_target_df)
-    wpp_lib.df_dict_to_excel_workbook(target_test_fp, {
-        'gen':gen_target_df
-    })
-    
-    # Exclude generation changes which do not solve successfully on their own. 
-    gen_target_df.loc[gen_target_df['Success'] == False, ['Include', 'ExclusionReason']] = [False, 'Individual Gen Test Diverged']
+    # Don't adjust the swing unit.
+    gen_df = targets['Gen']
+    swing = gen_df['ID'] == topo.SWING_ID
+    gen_df.loc[swing, 'Status_Target'] = 'Closed'
+    scale.exclude(gen_df, swing, 'Swing Unit')
 
-    # Don't adjust the swing unit. 
-    print('get_swing')
-    swing_df = pd.read_excel(toposeed_log_fp, sheet_name='swing')
-    swing_bus = swing_df.loc[swing_df.index[0], 'BusNum']
-    swing_id = swing_df.loc[swing_df.index[0], 'ID']
-    gen_target_df.loc[
-        (gen_target_df['BusNum'] == swing_bus) & (gen_target_df['ID'] == swing_id), 
-        ['Status_Target', 'Include', 'ExclusionReason']
-    ] = ['Closed', False, 'Swing Unit']
-    
-    print('get_pvqv_csv')
-    pvqv_df = pd.read_csv(pvqv_fp)
+    if divergence_mode == 'pretest':
+        print('test_gen_targets_parallel')
+        gen_df = targets['Gen'] = scale.test_gen_targets_parallel(pw_fp, gen_df)
+        pw.write_excel(out_dir / (gv_fp.stem + '_02_TargetTest.xlsx'), {'gen': gen_df})
+        # Exclude generation changes which do not solve successfully on their own.
+        scale.exclude(gen_df, ~gen_df['Success'], 'Individual Gen Test Diverged')
 
     print('iterate_to_gen_load_targets')
-    wpp_lib.report_gen_load_balance(gen_target_df, load_target_df)
-    if not wpp_lib.open_case(SimAuto, pw_fp):
-        raise
-    scalelog_dict = wpp_lib.iterate_to_gen_load_targets(SimAuto, gen_target_df, load_target_df, pvqv_df)
-    wpp_lib.df_dict_to_excel_workbook(scale_log_fp, scalelog_dict)
-    wpp_lib.save_case(SimAuto, cur_dir / 'Output' / (gv_fp.stem + '.pwb'),case_format)
+    scale.report_gen_load_balance(targets)
+    pw.open_case(SimAuto, pw_fp)
+    scalelog_dict = scale.iterate_to_gen_load_targets(SimAuto, targets, pd.read_csv(pvqv_fp), bisect=divergence_mode == 'bisect')
+    pw.write_excel(out_dir / (gv_fp.stem + '_03_ScaleLog.xlsx'), scalelog_dict)
+    pw.save_case(SimAuto, out_fp, case_format)
 
-    # Exit. 
     SimAuto.CloseCase()
-    return
 
 if(__name__=='__main__'):
-    for gv_fp in gv_dir.glob('*.epc'):
-        gv_fp = Path(gv_fp)
-        create_case(SimAuto, gv_fp, pw_fp)
+    if divergence_mode not in ('pretest', 'bisect'):
+        raise SystemExit(f"divergence_mode must be 'pretest' or 'bisect', not {divergence_mode!r}")
+
+    # Created here, not at import: multiprocessing workers re-import this module.
+    SimAuto = win32com.client.Dispatch("pwrworld.SimulatorAuto")
+    for gv_fp in sorted(gv_dir.glob('*.epc')):
+        out_fp = out_dir / (gv_fp.stem + '.pwb')
+        if out_fp.exists():
+            print(f'Skipping {gv_fp.name}: {out_fp.name} already exists. Delete it to re-run.')
+            continue
+        # Keep going with the remaining hours if one fails.
+        try:
+            create_case(SimAuto, gv_fp, out_fp)
+        except Exception:
+            print(f'FAILED: {gv_fp.name}')
+            traceback.print_exc()
 
     SimAuto = None
     print('done')
-
-

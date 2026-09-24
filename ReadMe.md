@@ -16,9 +16,12 @@ Produce (Output):
     - Generation MW, Status
     - Branch Statuses
 
+## Status
+The restructured scripts (`Scripts/pw.py`, `topo.py`, `scale.py`) have not yet been run against PowerWorld. The offline tests in `tests/test_lib.py` pass.
+
 ## Prerequisites
 - PowerWorld v23+ with a SimAuto license
-- Python 3.4+
+- Python 3.9+
 - Python libraries: `pip install -r requirements.txt`
 
 ## How to Use
@@ -27,13 +30,18 @@ Produce (Output):
 - Open `Workspace.code-workspace` 
 - Place GridView EPC Exports into `./HourEPCs/`, and remove any sample cases. 
 - Place your PWB seed-case into `./Seed/`, and remove any sample cases. 
-- In `01 Topological Seed.py`, edit `gv_fp` and `pw_fp` to the paths for the two files you wish to use to create a topological seed-case. 
+- `01 Topological Seed.py` uses the first `.pwb` in `./Seed/` and the first `.epc` (alphabetically) in `./HourEPCs/` to create the topological seed-case. 
 - Run `01 Topological Seed.py`
 - Review the results in `./TopoSeed/` to ensure that `TopoSeed.PWB` is satisfactorily matching your GridView topology. 
 - Run `02 Load and Gen Scaling.py`
+  - `divergence_mode` at the top chooses how gens/loads which diverge are handled: `'pretest'` or `'bisect'`. See [Test Gen Targets](#test-gen-targets).
   - Note: It may take ~1-2 hours per EPC converted, depending on your CPU's speed. 
+  - EPCs which already have an output `.pwb` in `./Output/` are skipped, so the script can be re-run after a failure. Delete an output `.pwb` to redo that hour.
+  - If one EPC fails, the error is printed and the remaining EPCs continue.
 - Run `03 Merge Reports.py`
 - Review `03 Merge Reports.xlsx` to see what has been adjusted. 
+- Tuning thresholds (voltage bands, iteration count, worker count, etc.) are at the top of `Scripts/topo.py` (step 01) and `Scripts/scale.py` (step 02). 
+- Code layout: `Scripts/pw.py` talks to PowerWorld, `Scripts/topo.py` holds the step 01 operations, and `Scripts/scale.py` holds the step 02 operations. `tests/test_lib.py` runs without PowerWorld: `python tests/test_lib.py`. 
 
 # Process Notes
 
@@ -43,7 +51,7 @@ Produce (Output):
   - Gets all X1/X2/X3 etc loads from all GridView EPCs into the TopoSeed (GridView seems to creates loads to represent distributed generation on-the-fly, differently in each hour case)
 - Fix bad transformer taps (If taps are > 15% from Nominal kV, set to 1.0 Taps). 
 - Make PWB branch statuses match GridView. 
-  - Ignore unsupported GridView branch types, such as Breakers/Disconnects. 
+  - Ignore unsupported GridView branch types (`UNSUPPORTED_GV_BRANCH_TYPES` in `Scripts/topo.py`), such as Breakers/Disconnects. 
 - Put all generators in terminal voltage-control mode, at current solved Vpu as the setpoint. 
 - Place a giant slack on the max fault-duty MVA bus, to balance while scaling. Turn off Area AGC in the solution settings. 
 - Calculate target Load/Gen MW, MVAR, & Status. 
@@ -60,7 +68,7 @@ Produce (Output):
 - Engineer to manually adjust, as desired:
   - Phase Shifters
   - DC Lines in `MTDCConverter` and `DCTransmissionLine` tables.
-  - Generation/load until the `ID`=`XX` giant swing generator is close to 0MW, and can be deleted from the case, replacing it with another system swing.
+  - Generation/load until the `ID`=`xx` giant swing generator is close to 0MW, and can be deleted from the case, replacing it with another system swing.
   - Areas where STATCOMs have been added to support voltage. 
   - Areas where branches have been dropped to isolate collapsed system elements. 
   - Areas where Gens/Loads have been excluded from scaling. 
@@ -100,7 +108,7 @@ It's common for engineers to add generation, load, lines, transformers, etc into
 Since GridView does not take voltage into account, transformer taps from a GridView model may be very far from nominal voltages and therefore divergent when added into a powerflow model. `fix_transformer_taps()` was designed to resolve this issue. Any transformers with taps further than a threshold from nominal kV (default = 0.15) will be set to 1.0 taps on the from & to sides. 
 
 ### Branch Statuses
-Branch statuses are set to match those which come from GridView in an iterative fashion in `set_branch_statuses()`. If an element exists in the PWB model but not the GridView EPC, those must be turned off. Then for all matching branches, those statuses must be modified to match GridView. The routine will first attempt to modify all branch statuses at once; if that fails, it will perform branch status changes one at a time. If any individual branch status operation fails (diverges), the system state is rolled back and that branch is listed in a list of failed status change attempts. 
+Branch statuses are set to match those which come from GridView in an iterative fashion in `set_branch_statuses()`. If an element exists in the PWB model but not the GridView EPC, those must be turned off. Then for all matching branches, those statuses must be modified to match GridView. The routine will first attempt to modify all branch statuses at once; if that fails, it will split the changes in half and retry each half, recursively, down to individual branches. If any individual branch status operation fails (diverges), the system state is rolled back and that branch is listed in a list of failed status change attempts. 
 
 Note that in GridView, some branch types may go missing from the exported EPCs. This may include:
 - Breakers
@@ -110,7 +118,7 @@ Note that in GridView, some branch types may go missing from the exported EPCs. 
 - Load Break Disconnects
 - ZBR
 
-As such, those branches may be excluded when setting final branch statuses to match the model topology. 
+As such, those branch types are excluded when setting branch statuses to match the model topology. The list is `UNSUPPORTED_GV_BRANCH_TYPES` in `Scripts/topo.py`. 
 
 ### Adjust Shunts
 GridView does not take voltage into consideration. As such, shunt statuses may need to be modified to ensure good system voltage. `adjust_shunts()` will toggle shunt statuses Open/Closed based on the voltage on the bus. By default, vlow=0.92, vhigh=1.08. 
@@ -125,7 +133,7 @@ However, from a Newton-Raphson solution stability standpoint, remote regulation 
 
 All of the above reasons can cause significant instability in solving Newton-Raphson. Furthermore, generation voltage setpoints may get modified season to season as their voltage-support needs change operationally throughout the year. This means that for a targeted GridView hour, those voltage setpoints are quite possibly going to be different than the base-case PWB model. 
 
-For all of the above reasons, prior to tuning the case to match a GridView hour, the `Scripts/GenTerminalVoltageControl.aux` script is run on the topological seed case to set all generation to terminal voltage control mode. The voltage target is set equal to the current voltage solution in the base-case, so that there should be no change to system voltages pre/post change. However, if terminal voltages are >1.1 PU or <0.9 PU, then the setpoint is modified to control the terminal bus to 1.0 PU voltage to ensure stable solutions. 
+For all of the above reasons, prior to tuning the case to match a GridView hour, the `Scripts/GenTerminalVoltageControl.aux` script is run on the topological seed case to set all generation to terminal voltage control mode. The voltage target is set equal to the current voltage solution in the base-case, so that there should be no change to system voltages pre/post change. However, if terminal voltages are >1.1 PU or <0.9 PU, then the setpoint is clamped to 1.1 PU or 0.9 PU respectively to ensure stable solutions. The original regulated bus and setpoint are stored in `CustomInteger:0` and `CustomFloat:0`. 
 
 ### Get Fault Duty & PVQV Sensitivities
 - Fault Duty: is computed on all buses, and saved in `TopoSeed/fault_duty.csv`. 
@@ -145,6 +153,8 @@ In GridView, a resource of virtually any size can be placed virtually anywhere, 
 
 `test_gen_targets_parallel()` opens several instance of PowerWorld, to split this task up. Each instance of PowerWorld opens the TopoSeed.pwb case, then begins testing each target. It applies the generation target, solves, then rolls it back, and keeps track of whether the solve was a "Success". Those generation targets which are not successful individually should be excluded from the Load & Gen scaling process. 
 
+This is `divergence_mode = 'pretest'` in `02 Load and Gen Scaling.py`. The alternative, `divergence_mode = 'bisect'`, skips this test. Instead, when a scaling step diverges, the step is bisected (applied in halves, recursively) to find the gens/loads which cause divergence. Those are excluded at their last good step, and scaling continues with the rest. It avoids the extra PowerWorld instances, and scaling doesn't stop partway. However, an excluded element is left partway between its seed and target values, rather than at its seed value. 
+
 ### Iterate to Gen and Load Targets
 `iterate_to_gen_load_targets()` contains the logic to linearly scale loads and gens to their final targets. 
 - `compute_pvqv_exclusions()` excludes Loads & Gens from scaling, if the $\Delta P$ and $\Delta Q$ indicates more than a 10% $\Delta V$ from a linear PVQV analysis standpoint. 
@@ -159,10 +169,10 @@ In GridView, a resource of virtually any size can be placed virtually anywhere, 
 - `compute_voltage_exclusions()` excludes Loads & Gens from scaling if their respective buses exceed +/- 12% of nominal voltage. 
 - `adjust_shunts()` opens/closes shunt capacitors/reactors when voltages reach +/- 8% of nominal. 
 - `close_all_related_gen_load()` closes all generation and load which is to be scaled up/down. If the element is in-service in the target (GridView EPC), or in-service in the source (TopoSeed.PWB), then it gets closed by this routine. Any loads/gens which were previously out of service are closed in at 0 MW / 0 MVAR to begin the scaling. 
-- `create_statcom_on_lowestv_bus()` will place a large STATCOM on a bus which is beginning to see signs of collapse (<85% of Nominal Voltage). 
+- `create_statcom_on_lowestv_bus()` will place a large STATCOM (`ID`=`SC`) on a bus which is beginning to see signs of collapse (<85% of Nominal Voltage). The scale log lists each STATCOM bus, and whether the STATCOM could be closed in. 
 - `drop_collapsed_sections()` is a last-ditch effort which drops branches on network sections which are showing voltage collapse (<80% Voltage). Sometimes, Newton-Raphson solves into a state where network sections have 0.2 PU voltages and it still shows as solved. This is intended to catch those situations to some degree, by dropping those problematic areas to be resolved later by engineering review. 
 
-The routine will attempt to increment the loads and generators to their final targets in 100 steps, while using the above techniques to avoid case divergence along the way. Should the case become divergent, it will stop there. At the end of the scaling process, it will set the final statuses on loads/gens. 
+The routine will attempt to increment the loads and generators to their final targets in 100 steps, while using the above techniques to avoid case divergence along the way. Should the case become divergent, it will stop there (`'pretest'` mode), or exclude the gens/loads causing it and continue (`'bisect'` mode). At the end of the scaling process, it will set the final statuses on loads/gens. 
 
 ## Manual Work
 

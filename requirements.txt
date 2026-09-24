@@ -1,5 +1,4 @@
-pathlib
 numpy
-pandas
+pandas>=2,<3
 openpyxl
 pywin32
