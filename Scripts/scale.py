@@ -5,8 +5,10 @@ Gens and loads are handled by the same code. Their working tables ("targets") ar
     <field>          current value in the case
     <field>_Target   value in the GridView hour
     <field>_Seed     value in the TopoSeed case
-    <field>_Delta    change per scaling step
-    ExclusionReason  '' while the row is scaled. Otherwise, why it was excluded.
+    <field>_Start    value when scaling started (after closing in, at 0 MW)
+    Progress         how far the row has been scaled from start to target, in 1/RESOLUTION units
+    HeldReason       '' while the row is scaled. Otherwise, why it is held back for now (it is retried later).
+    ExclusionReason  '' while the row is scaled or held. Otherwise, why it was excluded for good.
 """
 from pathlib import Path
 import multiprocessing as mp
@@ -14,13 +16,17 @@ import pandas as pd
 from . import pw, topo
 
 # ------------------ Tuning thresholds ------------------
-EXCLUDE_VMIN = 0.88             # Stop scaling gens/loads on buses below this Vpu...
+EXCLUDE_VMIN = 0.88             # Hold gens/loads back from scaling on buses below this Vpu...
 EXCLUDE_VMAX = 1.12             # ...or above this Vpu.
 STATCOM_VPU = 0.85              # Add a STATCOM to the lowest-voltage bus below this Vpu...
 STATCOM_VNOM_MIN = 50           # ...with nominal kV above this.
 COLLAPSE_VPU = 0.80             # Drop branches between buses above and below this Vpu.
 PVQV_DV_LIMIT = 0.10            # Exclude buses whose linear PVQV dV estimate exceeds this.
-SCALING_ITERATIONS = 100        # Steps used to scale gens/loads from seed to target.
+RESOLUTION = 100                # Smallest scaling step is 1/RESOLUTION of the way from start to target.
+INITIAL_STEP = 25               # First step, in 1/RESOLUTION units. Doubles after each step which solves, up to MAX_STEP.
+MAX_STEP = 100                  # Halves after each step which diverges, down to 1. A step which still diverges is bisected.
+STEP_SOLVES = 2                 # Solves a step must pass to count as converged.
+FINAL_MAX_ROUNDS = 20           # Max rounds retrying held gens/loads, once the rest have reached their targets.
 MAX_WORKERS = None              # Parallel PowerWorld instances for gen target tests. None = CPU count.
 
 STATCOM_ID = 'SC'   # ID of STATCOMs added during scaling.
@@ -52,6 +58,16 @@ def included(df: pd.DataFrame) -> pd.Series:
 def exclude(df: pd.DataFrame, mask, reason: str):
     """Excludes rows from scaling. The first recorded reason is kept."""
     df.loc[pd.Series(mask, index=df.index) & included(df), 'ExclusionReason'] = reason
+
+def scaling(df: pd.DataFrame) -> pd.Series:
+    return included(df) & (df['HeldReason'] == '')
+
+def held(df: pd.DataFrame) -> pd.Series:
+    return included(df) & (df['HeldReason'] != '')
+
+def hold(df: pd.DataFrame, mask, reason: str):
+    """Holds rows back from scaling, at their current progress, until they are retried."""
+    df.loc[pd.Series(mask, index=df.index) & scaling(df), 'HeldReason'] = reason
 
 # ------------------ Targets ------------------
 def compute_pw_targets(SimAuto, gv_fp: Path, pw_fp: Path, dummy_bus_fp: Path) -> dict[str,pd.DataFrame]:
@@ -174,23 +190,29 @@ def compute_pvqv_exclusions(targets, pvqv_df, delta_v_limit = PVQV_DV_LIMIT) -> 
 def voltage_ok(df: pd.DataFrame, vpu_by_bus: pd.Series, v_min = EXCLUDE_VMIN, v_max = EXCLUDE_VMAX) -> pd.Series:
     return df['BusNum'].map(vpu_by_bus).between(v_min, v_max, inclusive='neither')
 
-def compute_voltage_exclusions(SimAuto, targets, v_min = EXCLUDE_VMIN, v_max = EXCLUDE_VMAX):
-    # Once a bus exceeds the vmin/vmax limits, take it out of the scaling equation.
-    # This ensures no voltage collapse related issues occur during scaling.
-    vpu_by_bus = pw.get_df(SimAuto, 'Bus', {'Number': int, 'Vpu': float}).set_index('Number')['Vpu']
+def bus_vpu(SimAuto) -> pd.Series:
+    return pw.get_df(SimAuto, 'Bus', {'Number': int, 'Vpu': float}).set_index('Number')['Vpu']
+
+def hold_voltage(targets, vpu_by_bus: pd.Series, v_min = EXCLUDE_VMIN, v_max = EXCLUDE_VMAX):
+    # Once a bus exceeds the vmin/vmax limits, hold its gens/loads back from scaling until it recovers.
+    # This avoids voltage collapse related issues during scaling.
     for df in targets.values():
-        exclude(df, ~voltage_ok(df, vpu_by_bus, v_min, v_max), 'Voltage')
+        hold(df, ~voltage_ok(df, vpu_by_bus, v_min, v_max), 'Voltage')
 
 # ------------------ Applying changes ------------------
-def apply_or_exclude(SimAuto, table: str, df: pd.DataFrame, new_df: pd.DataFrame, reason: str):
+def apply_rows(SimAuto, table: str, df: pd.DataFrame, new_df: pd.DataFrame, solves: int = 1) -> list:
     """
-    Applies new_df (rows of df, with new values) to the case, then records those values in df.
-    Rows which diverge are left unchanged in df, and excluded from scaling.
+    Applies new_df (rows of df, with new values) to the case, bisecting to find rows which diverge.
+    Records the rest in df. Returns the index labels of rows which diverged (left unchanged).
     """
-    fields = write_fields(table)
-    failed = pw.set_df_bisect(SimAuto, table, new_df, fields)
+    failed = pw.set_df_bisect(SimAuto, table, new_df, write_fields(table), solves)
     ok_df = new_df.drop(index=failed)
-    df.loc[ok_df.index, fields] = ok_df[fields]
+    df.loc[ok_df.index, ok_df.columns] = ok_df
+    return failed
+
+def apply_or_exclude(SimAuto, table: str, df: pd.DataFrame, new_df: pd.DataFrame, reason: str):
+    """Like apply_rows(), but excludes rows which diverge from scaling."""
+    failed = apply_rows(SimAuto, table, df, new_df)
     exclude(df, df.index.isin(failed), reason)
 
 def close_all_related_gen_load(SimAuto, targets):
@@ -217,17 +239,19 @@ def set_gen_load_status(SimAuto, targets):
         new_df = new_df.assign(**{s: new_df[f'{s}_Target'] for s in STATUS[table]})
         apply_or_exclude(SimAuto, table, df, new_df, 'Diverged setting final status')
 
-def compute_deltas(targets, iterations):
+def mark_start(targets):
+    """Records where scaling starts from. Call after close_all_related_gen_load(), which changes MW/Mvar."""
     for table, df in targets.items():
         for c in SCALED[table]:
-            df[f'{c}_Delta'] = (df[f'{c}_Target'] - df[c]) / iterations
+            df[f'{c}_Start'] = df[c]
+        df['Progress'] = 0
 
-def next_step(table: str, df: pd.DataFrame) -> pd.DataFrame:
-    """Included rows, moved one step towards their targets."""
-    step_df = df[included(df)].copy()
+def at_progress(table: str, df: pd.DataFrame, progress) -> pd.DataFrame:
+    """Rows of df, with scaled fields moved to `progress` (in 1/RESOLUTION units) of the way from start to target."""
+    new_df = df.assign(Progress=progress)
     for c in SCALED[table]:
-        step_df[c] += step_df[f'{c}_Delta']
-    return step_df
+        new_df[c] = df[f'{c}_Start'] + (df[f'{c}_Target'] - df[f'{c}_Start']) * new_df['Progress'] / RESOLUTION
+    return new_df
 
 # ------------------ Voltage support ------------------
 def create_statcom_on_lowestv_bus(SimAuto, skip_buses, vpu_min = STATCOM_VPU, vnom_min = STATCOM_VNOM_MIN):
@@ -309,68 +333,142 @@ def drop_collapsed_sections(SimAuto, vpu = COLLAPSE_VPU) -> list[str]:
     return dropped
 
 # ------------------ Scaling ------------------
-def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df, iterations=SCALING_ITERATIONS, bisect=False) -> dict[str,pd.DataFrame]:
+def catch_up(SimAuto, targets, progress: int, step: int, bisect: bool) -> int:
     """
-    Scales included gens & loads to their targets in `iterations` steps. Returns the scale log sheets.
-    If a step diverges:
-        bisect=False: stop scaling there.
-        bisect=True: bisect the step to find the gens/loads which diverge, exclude them at their last good step, and continue.
+    Retries held gens/loads on buses within the voltage band, moving each up to `step` closer to `progress`.
+    Those which reach `progress` resume scaling with the rest.
+    bisect=False: one attempt with all of them together. bisect=True: bisect to find those which still diverge.
+    Returns how many moved.
+    """
+    vpu_by_bus = bus_vpu(SimAuto)
+    moved = 0
+    for table, df in targets.items():
+        rows = df[held(df) & voltage_ok(df, vpu_by_bus)]
+        new_df = at_progress(table, rows, (rows['Progress'] + step).clip(upper=progress))
+        new_df = new_df[new_df['Progress'] > rows['Progress']]
+        if len(new_df) == 0:
+            failed = []
+        elif bisect:
+            failed = apply_rows(SimAuto, table, df, new_df, STEP_SOLVES)
+        else:
+            with pw.trial(SimAuto, solves=STEP_SOLVES) as t:
+                pw.set_df(SimAuto, table, new_df, write_fields(table))
+            failed = [] if t.ok else list(new_df.index)
+            if t.ok:
+                df.loc[new_df.index, new_df.columns] = new_df
+        moved += len(new_df) - len(failed)
+        df.loc[rows.index[df.loc[rows.index, 'Progress'] >= progress], 'HeldReason'] = ''
+    return moved
+
+def retry_held(SimAuto, targets, max_rounds=FINAL_MAX_ROUNDS):
+    """
+    Once the rest have reached their targets: retries held gens/loads, bisecting to find those which still diverge.
+    Tries one jump to target first, and halves the jump whenever a round moves nothing.
+    Those still held at the end are excluded, left where they got to.
+    """
+    step = MAX_STEP
+    for _ in range(max_rounds):
+        hold_voltage(targets, bus_vpu(SimAuto))
+        if not any(held(df).any() for df in targets.values()):
+            break
+        print(f'Retrying held gens/loads, {step}/{RESOLUTION} at a time.')
+        if catch_up(SimAuto, targets, RESOLUTION, step, bisect=True):
+            topo.adjust_shunts(SimAuto)
+        elif step > 1:
+            step //= 2
+        else:
+            break
+    for df in targets.values():
+        mask = held(df)
+        df.loc[mask, 'ExclusionReason'] = df.loc[mask, 'HeldReason']
+
+def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, initial_step=INITIAL_STEP) -> dict[str,pd.DataFrame]:
+    """
+    Scales included gens & loads from their start to their targets. Returns the scale log sheets.
+    Steps are in 1/RESOLUTION units. Each step which solves doubles the next one (up to MAX_STEP),
+    and each which diverges is retried at half the size. A 1/RESOLUTION step which still diverges is bisected:
+    the gens/loads which diverge are held back at their last good values, and the rest go ahead.
+    Held gens/loads (including those on buses outside the voltage band) are retried after each step, and again at the end.
+    pvqv_df: optional PVQV sensitivities. If given, gens/loads with a large linear dV estimate are excluded up front.
     """
     if not pw.solve(SimAuto):
         print('Could not solve the original input case!')
-        return {'iteration_df': pd.DataFrame({"Value": ['Failed to converge base case.']})}
+        return {'step_df': pd.DataFrame({"Result": ['Failed to converge base case.']})}
 
-    pvqv = compute_pvqv_exclusions(targets, pvqv_df)
-    pvqv_buses = pd.concat([bus_df['Number'] for bus_df in pvqv.values()])
     for df in targets.values():
-        exclude(df, df['BusNum'].isin(pvqv_buses), 'PVQV')
-    compute_voltage_exclusions(SimAuto, targets)
+        df['HeldReason'] = ''
+    pvqv = {}
+    if pvqv_df is not None:
+        pvqv = compute_pvqv_exclusions(targets, pvqv_df)
+        pvqv_buses = pd.concat([bus_df['Number'] for bus_df in pvqv.values()])
+        for df in targets.values():
+            exclude(df, df['BusNum'].isin(pvqv_buses), 'PVQV')
+    hold_voltage(targets, bus_vpu(SimAuto))
     close_all_related_gen_load(SimAuto, targets)
-    compute_deltas(targets, iterations)
+    mark_start(targets)
 
     topo.adjust_shunts(SimAuto)
     if not pw.solve(SimAuto):
         print('Could not solve after adjusting shunts in the original case!')
-        return {'iteration_df': pd.DataFrame({"Value": ['Failed to converge base case with shunt adjustments.']})}
+        return {'step_df': pd.DataFrame({"Result": ['Failed to converge base case with shunt adjustments.']})}
 
-    completed = 0
+    progress, step = 0, initial_step
+    failed_step = None              # The step size which first diverged, before halving.
+    step_log = []
     statcoms: dict[int,bool] = {}   # Bus number -> whether the STATCOM closed in successfully.
     dropped_branches: list[str] = []
-    for iteration in range(1, iterations + 1):
-        print(f'----- Iteration: {iteration} of {iterations} -----')
-        steps = {table: next_step(table, df) for table, df in targets.items()}
-        with pw.trial(SimAuto, solves=2) as t:
-            for table, step_df in steps.items():
-                pw.set_df(SimAuto, table, step_df, write_fields(table))
+    def log(start, goal, result, caught_up=0):
+        held_count = sum(int(held(df).sum()) for df in targets.values())
+        step_log.append({'From': start, 'To': goal, 'Result': result, 'CaughtUp': caught_up, 'Held': held_count})
+
+    while progress < RESOLUTION:
+        step = min(step, RESOLUTION - progress)
+        goal = progress + step
+        print(f'----- Scaling {progress} -> {goal} of {RESOLUTION} -----')
+        new = {table: at_progress(table, df[scaling(df)], goal) for table, df in targets.items()}
+        with pw.trial(SimAuto, solves=STEP_SOLVES) as t:
+            for table, new_df in new.items():
+                pw.set_df(SimAuto, table, new_df, write_fields(table))
         if t.ok:
-            for table, step_df in steps.items():
-                targets[table].loc[step_df.index, SCALED[table]] = step_df[SCALED[table]]
-        elif bisect:
-            print(f'Iteration {iteration} did not solve. Bisecting to find the gens/loads which diverge.')
-            for table, step_df in steps.items():
-                apply_or_exclude(SimAuto, table, targets[table], step_df, 'Diverged during scaling')
+            for table, new_df in new.items():
+                targets[table].loc[new_df.index, new_df.columns] = new_df
+            result = 'Solved'
+        elif step > 1:
+            print('Did not solve. Halving the step.')
+            log(progress, goal, 'Diverged, halved step')
+            failed_step = failed_step or step
+            step //= 2
+            continue
         else:
-            print(f'Iteration {iteration} did not solve. Reverted iteration and stopping.')
-            break
-        completed = iteration
+            print('Did not solve at the smallest step. Bisecting to find the gens/loads which diverge, and holding them back.')
+            for table, new_df in new.items():
+                df = targets[table]
+                hold(df, df.index.isin(apply_rows(SimAuto, table, df, new_df, STEP_SOLVES)), 'Diverged during scaling')
+            result = 'Bisected'
+        start, progress = progress, goal
 
         topo.adjust_shunts(SimAuto)
-        compute_voltage_exclusions(SimAuto, targets)
+        hold_voltage(targets, bus_vpu(SimAuto))
         dropped_branches += drop_collapsed_sections(SimAuto)
         statcom = create_statcom_on_lowestv_bus(SimAuto, skip_buses=list(statcoms))
         if statcom:
             statcoms[statcom[0]] = statcom[1]
+        log(start, goal, result, catch_up(SimAuto, targets, progress, step, bisect=False))
+        if t.ok:
+            step = min(step * 2, MAX_STEP)
+        elif failed_step:
+            step = failed_step      # The gens/loads which diverged are held now, so go back to the larger step.
+        failed_step = None
 
-    if completed == iterations:
-        compute_voltage_exclusions(SimAuto, targets)
-        set_gen_load_status(SimAuto, targets)
+    retry_held(SimAuto, targets)
+    set_gen_load_status(SimAuto, targets)
 
     print('Reached end of iterate_to_gen_load_targets(). Returning.')
 
     # Package the logs for return.
     return {
         **{table.lower(): df[~included(df)] for table, df in targets.items()}
-        ,'iteration_df': pd.DataFrame({"Value": [f'Completed {completed} of {iterations} iterations']})
+        ,'step_df': pd.DataFrame(step_log)
         ,'statcom_bus_df': pd.DataFrame({"BusNum": list(statcoms), "Closed": list(statcoms.values())})
         ,**{f'{table.lower()}_pvqv': bus_df for table, bus_df in pvqv.items()}
         ,'dropped_branch_df': pd.DataFrame({"ObjectID": dropped_branches})

@@ -30,9 +30,12 @@ class FakeSimAuto:
             self.applied = dict(self.states[name.group(1)])
         elif command.startswith('DeleteState'):
             del self.states[name.group(1)]
-        elif command.startswith('SolvePowerFlow') and self.bad & {k for _, k in self.applied}:
+        elif command.startswith('SolvePowerFlow') and self.diverged():
             return ('Diverged',)
         return ('',)
+
+    def diverged(self):
+        return bool(self.bad & {k for _, k in self.applied})
 
     def ChangeParametersMultipleElementRect(self, table, fields, rows):
         for row in rows:
@@ -145,13 +148,13 @@ def test_voltage_ok_and_pvqv():
     result = scale.compute_pvqv_exclusions({'Gen': gen, 'Load': load}, pvqv)
     assert result['Gen']['Number'].tolist() == [1] and len(result['Load']) == 0
 
-def test_deltas_and_next_step():
-    gen = targets_df(ObjectID=['g1', 'g2'], MWSetPoint=[0.0, 0.0], MWSetPoint_Target=[100.0, 100.0])
-    gen.loc['g2', 'ExclusionReason'] = 'PVQV'
-    scale.compute_deltas({'Gen': gen}, 4)
-    step_df = scale.next_step('Gen', gen)
-    assert step_df['MWSetPoint'].to_dict() == {'g1': 25.0}
-    assert gen['MWSetPoint'].tolist() == [0.0, 0.0]  # Unchanged until applied.
+def test_mark_start_and_at_progress():
+    gen = targets_df(ObjectID=['g1', 'g2'], MWSetPoint=[10.0, 0.0], MWSetPoint_Target=[50.0, 100.0])
+    scale.mark_start({'Gen': gen})
+    new_df = scale.at_progress('Gen', gen, pd.Series({'g1': 25, 'g2': 50}))
+    assert new_df['MWSetPoint'].to_dict() == {'g1': 20.0, 'g2': 50.0}
+    assert new_df['Progress'].to_dict() == {'g1': 25, 'g2': 50}
+    assert gen['MWSetPoint'].tolist() == [10.0, 0.0]  # Unchanged until applied.
 
 def test_close_all_related_gen_load_skips_excluded_and_restores_failures():
     sa = FakeSimAuto(bad={'2'})  # Closing the gen on bus 2 diverges.
@@ -165,34 +168,55 @@ def test_close_all_related_gen_load_skips_excluded_and_restores_failures():
     assert ('Gen', '3') not in sa.applied
     assert load.loc['l1', 'Status'] == 'Closed' and load.loc['l1', 'SMW'] == 0
 
-def test_iterate_pretest_mode():
-    sa = FakeSimAuto(bad={'2'})  # Closing the gen on bus 2 diverges; caught before scaling.
-    targets, pvqv = scaling_targets(gen_status=['Closed', 'Open'])
-    log = scale.iterate_to_gen_load_targets(sa, targets, pvqv, iterations=4)
-    gen, load = targets['Gen'], targets['Load']
+def results(log):
+    return log['step_df']['Result'].tolist()
 
-    assert log['iteration_df']['Value'].iloc[0] == 'Completed 4 of 4 iterations'
-    assert gen.loc['g1', 'MWSetPoint'] == 50.0 and gen.loc['g2', 'Status'] == 'Open'
-    assert log['gen']['ExclusionReason'].to_dict() == {'g2': 'Diverged closing at 0 MW'}
-    assert load['SMW'].tolist() == [10.0, 8.0] and load.loc['l2', 'Status'] == 'Closed'
+def test_iterate_grows_step_while_solving():
+    sa = FakeSimAuto()
+    targets, pvqv = scaling_targets(gen_status='Closed')
+    log = scale.iterate_to_gen_load_targets(sa, targets, pvqv)
+    assert log['step_df'][['From', 'To']].values.tolist() == [[0, 25], [25, 75], [75, 100]]
+    assert results(log) == ['Solved'] * 3
+    assert targets['Gen']['MWSetPoint'].tolist() == [50.0, 20.0]
+    assert targets['Load']['SMW'].tolist() == [10.0, 8.0] and targets['Load'].loc['l2', 'Status'] == 'Closed'
     assert sa.states == {}
 
-def test_iterate_stops_at_divergence_without_bisect():
-    sa = FakeSimAuto(bad={'2'})  # g2 is already closed, so it first diverges during scaling.
-    targets, pvqv = scaling_targets(gen_status='Closed')
-    log = scale.iterate_to_gen_load_targets(sa, targets, pvqv, iterations=4)
-    assert log['iteration_df']['Value'].iloc[0] == 'Completed 0 of 4 iterations'
-    assert targets['Gen']['MWSetPoint'].tolist() == [10.0, 10.0]
-
-def test_iterate_bisect_excludes_divergent_and_continues():
-    sa = FakeSimAuto(bad={'2'})
-    targets, pvqv = scaling_targets(gen_status='Closed')
-    log = scale.iterate_to_gen_load_targets(sa, targets, pvqv, iterations=4, bisect=True)
+def test_iterate_excludes_gens_which_diverge_closing_in():
+    sa = FakeSimAuto(bad={'2'})  # Closing the gen on bus 2 diverges.
+    targets, _ = scaling_targets(gen_status=['Closed', 'Open'])
+    log = scale.iterate_to_gen_load_targets(sa, targets)
     gen = targets['Gen']
-    assert log['iteration_df']['Value'].iloc[0] == 'Completed 4 of 4 iterations'
-    assert gen['MWSetPoint'].tolist() == [50.0, 10.0]  # g2 left at its last good step.
+    assert results(log) == ['Solved'] * 3
+    assert gen.loc['g1', 'MWSetPoint'] == 50.0 and gen.loc['g2', 'Status'] == 'Open'
+    assert log['gen']['ExclusionReason'].to_dict() == {'g2': 'Diverged closing at 0 MW'}
+
+def test_iterate_halves_step_then_bisects_and_holds():
+    sa = FakeSimAuto(bad={'2'})  # g2 is already closed, so it first diverges during scaling, and never recovers.
+    targets, _ = scaling_targets(gen_status='Closed')
+    log = scale.iterate_to_gen_load_targets(sa, targets)
+    gen = targets['Gen']
+    assert results(log)[:5] == ['Diverged, halved step'] * 4 + ['Bisected']  # 25, 12, 6, 3 halve; 1 is bisected.
+    assert log['step_df']['To'].iloc[-1] == 100
+    assert gen['MWSetPoint'].tolist() == [50.0, 10.0]  # g2 left where it got to.
     assert log['gen']['ExclusionReason'].to_dict() == {'g2': 'Diverged during scaling'}
     assert targets['Load']['SMW'].tolist() == [10.0, 8.0]
+    assert sa.states == {}
+
+class LaterConvergesSimAuto(FakeSimAuto):
+    """Raising g2 (bus 2) above its start diverges, until g1 (bus 1) reaches 30 MW."""
+    def diverged(self):
+        mw = {k: float(v['MWSetPoint']) for (table, k), v in self.applied.items() if table == 'Gen'}
+        return mw.get('2', 10.0) > 10.0 and mw.get('1', 10.0) < 30.0
+
+def test_iterate_held_gen_resumes_once_it_converges():
+    sa = LaterConvergesSimAuto()
+    targets, _ = scaling_targets(gen_status='Closed')
+    log = scale.iterate_to_gen_load_targets(sa, targets)
+    gen = targets['Gen']
+    assert 'Bisected' in results(log) and log['step_df']['CaughtUp'].sum() > 0
+    assert gen['MWSetPoint'].tolist() == [50.0, 20.0]
+    assert (gen['ExclusionReason'] == '').all() and (gen['HeldReason'] == '').all()
+    assert sa.states == {}
 
 if __name__ == '__main__':
     tests = [f for name, f in dict(globals()).items() if name.startswith('test_')]

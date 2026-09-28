@@ -519,18 +519,24 @@ def get_pvqv(SimAuto) -> pd.DataFrame:
     pw.run(SimAuto, 'CalculateVoltSelfSense();')
     return pw.get_df(SimAuto, 'Bus', bus_fields)
 
-def create_giant_swing(SimAuto, fault_df) -> pd.DataFrame:
-    """
-    Creates a giant swing/slack unit on the bus with the max MVA fault duty.
-    """
-    max_mva_busnum = fault_df.loc[fault_df['MVA'].idxmax(), 'BusNumber']
+def max_fault_duty_bus(fault_df) -> int:
+    return int(fault_df.loc[fault_df['MVA'].idxmax(), 'BusNumber'])
 
-    # Get current bus information at the max MVA bus.
+def slack_bus(SimAuto) -> int:
+    """The case's existing swing bus (the first, if there are several)."""
+    bus_df = pw.get_df(SimAuto, 'Bus', {'Number': int, 'Slack': str})
+    return int(bus_df.loc[bus_df['Slack'] == 'YES', 'Number'].iloc[0])
+
+def create_giant_swing(SimAuto, bus_num: int) -> pd.DataFrame:
+    """
+    Creates a giant swing/slack unit on the given bus, e.g. max_fault_duty_bus() or slack_bus().
+    """
+    # Get current bus information at the swing bus.
     bus_df = pw.get_df(SimAuto, 'Bus', {'Number': int, 'Name': str, 'NomkV': float, 'Vpu': float})
-    bus_row = bus_df.loc[bus_df['Number'] == max_mva_busnum].iloc[0]
+    bus_row = bus_df.loc[bus_df['Number'] == bus_num].iloc[0]
 
     swing_dict = {
-        'BusNum': max_mva_busnum
+        'BusNum': bus_num
         ,'BusName': bus_row['Name']
         ,'NomkV': bus_row['NomkV']
         ,'ID': SWING_ID
@@ -555,7 +561,7 @@ def create_giant_swing(SimAuto, fault_df) -> pd.DataFrame:
 
     # Disable any other swings, and make this bus the system swing.
     pw.run(SimAuto, 'SetData(Bus,[Slack],[NO],ALL);')
-    pw.run(SimAuto, f'SetData(Bus,[Number,Slack],[{int(max_mva_busnum)}, YES]);')
+    pw.run(SimAuto, f'SetData(Bus,[Number,Slack],[{int(bus_num)}, YES]);')
 
     # Turn off MW AGC
     pw.set_df(SimAuto, 'Sim_Solution_Options_Value', pd.DataFrame({'Option':['ChkMWAGC'], 'Value':['NO']}), ['Option', 'Value'])

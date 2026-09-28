@@ -6,6 +6,12 @@ cur_dir = Path(__file__).parent
 
 case_format = 'PWB23'
 
+# ------------------ Options ------------------
+# Fault duty on every bus (slow): places the giant swing on the max fault-duty bus. Otherwise it goes on the case's existing swing bus.
+compute_fault_duty = False
+# PVQV self-sensitivities (fast), saved to pvqv.csv. Used by use_pvqv in step 02.
+compute_pvqv = True
+
 # ------------------ Inputs ------------------
 # First GridView EPC, and first PowerWorld PWB.
 gv_dir = cur_dir / 'HourEPCs'
@@ -75,15 +81,20 @@ if(__name__=='__main__'):
     try_step('GenTerminalVoltageControl.aux', lambda: pw.run(SimAuto, f'LoadAux("{cur_dir / "Scripts" / "GenTerminalVoltageControl.aux"}",YES);'))
     save('05_GenTerminalVoltageControl')
 
-    print('get_fault_duty')
-    fault_df = topo.get_fault_duty(SimAuto)
-    fault_df.to_csv(fault_fp, index=False)
+    if compute_fault_duty:
+        print('get_fault_duty')
+        fault_df = topo.get_fault_duty(SimAuto)
+        fault_df.to_csv(fault_fp, index=False)
+        swing_bus = topo.max_fault_duty_bus(fault_df)
+    else:
+        swing_bus = topo.slack_bus(SimAuto)
 
-    print('get_pvqv')
-    topo.get_pvqv(SimAuto).to_csv(pvqv_fp, index=False)
+    if compute_pvqv:
+        print('get_pvqv')
+        topo.get_pvqv(SimAuto).to_csv(pvqv_fp, index=False)
 
     print('06_create_giant_swing')
-    log['swing'] = try_step('create_giant_swing()', lambda: topo.create_giant_swing(SimAuto, fault_df))
+    log['swing'] = try_step('create_giant_swing()', lambda: topo.create_giant_swing(SimAuto, swing_bus))
     save('06_create_giant_swing')
 
     print('07_create_distgen_XN_loads')

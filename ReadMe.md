@@ -34,7 +34,7 @@ The restructured scripts (`Scripts/pw.py`, `topo.py`, `scale.py`) have not yet b
 - Run `01 Topological Seed.py`
 - Review the results in `./TopoSeed/` to ensure that `TopoSeed.PWB` is satisfactorily matching your GridView topology. 
 - Run `02 Load and Gen Scaling.py`
-  - `divergence_mode` at the top chooses how gens/loads which diverge are handled: `'pretest'` or `'bisect'`. See [Test Gen Targets](#test-gen-targets).
+  - `pretest_gens` and `use_pvqv` at the top are off by default. Gens/loads which diverge are found by bisecting the scaling step instead. See [Test Gen Targets](#test-gen-targets).
   - Note: It may take ~1-2 hours per EPC converted, depending on your CPU's speed. 
   - EPCs which already have an output `.pwb` in `./Output/` are skipped, so the script can be re-run after a failure. Delete an output `.pwb` to redo that hour.
   - If one EPC fails, the error is printed and the remaining EPCs continue.
@@ -53,16 +53,18 @@ The restructured scripts (`Scripts/pw.py`, `topo.py`, `scale.py`) have not yet b
 - Make PWB branch statuses match GridView. 
   - Ignore unsupported GridView branch types (`UNSUPPORTED_GV_BRANCH_TYPES` in `Scripts/topo.py`), such as Breakers/Disconnects. 
 - Put all generators in terminal voltage-control mode, at current solved Vpu as the setpoint. 
-- Place a giant slack on the max fault-duty MVA bus, to balance while scaling. Turn off Area AGC in the solution settings. 
+- Place a giant slack on the case's existing swing bus (or the max fault-duty MVA bus, with `compute_fault_duty`), to balance while scaling. Turn off Area AGC in the solution settings. 
 - Calculate target Load/Gen MW, MVAR, & Status. 
-- Do a PVQV sensitivity test. If dvdp and dvdq tests indicate a > 10% change in voltage, exclude those targets from scaling. 
-- Test all gen targets 1 at a time. If they diverge the base-case, exclude them from scaling. 
+- Optional (off by default): Do a PVQV sensitivity test. If dvdp and dvdq tests indicate a > 10% change in voltage, exclude those targets from scaling. 
+- Optional (off by default): Test all gen targets 1 at a time. If they diverge the base-case, exclude them from scaling. 
 - Close all loads & gens which will get scaled. 
-- Scale all loads & gens to their targets in 100 steps. On each iteration: 
+- Scale all loads & gens to their targets in adaptive steps: start at 25%, double after each step which solves, halve after each which diverges (down to 1%). A 1% step which still diverges is bisected, and the gens/loads which diverge are held back. After each step: 
   - If Bus Vpu > 8% high/low? Adjust shunt Capacitors/Reactors.
-  - If Bus Vpu > 12% high/low? Exclude loads/gens from scaling. 
+  - If Bus Vpu > 12% high/low? Hold loads/gens back from scaling until it recovers. 
+  - Retry held loads/gens. Those which solve catch up with the rest.
   - If Bus Vpu < 85%? Create an infinite STATCOM on that bus. 
   - If Bus Vpu < 80%? Drop branches to isolate collapsed area. 
+- Retry held loads/gens once more, bisecting. Exclude those which still diverge, where they got to. 
 - Set final load & gen statuses 1 at a time. Roll back upon any divergent edits. 
 - Save resulting model, and all logs. 
 - Engineer to manually adjust, as desired:
@@ -136,11 +138,12 @@ All of the above reasons can cause significant instability in solving Newton-Rap
 For all of the above reasons, prior to tuning the case to match a GridView hour, the `Scripts/GenTerminalVoltageControl.aux` script is run on the topological seed case to set all generation to terminal voltage control mode. The voltage target is set equal to the current voltage solution in the base-case, so that there should be no change to system voltages pre/post change. However, if terminal voltages are >1.1 PU or <0.9 PU, then the setpoint is clamped to 1.1 PU or 0.9 PU respectively to ensure stable solutions. The original regulated bus and setpoint are stored in `CustomInteger:0` and `CustomFloat:0`. 
 
 ### Get Fault Duty & PVQV Sensitivities
+Set by `compute_fault_duty` (off by default, since it is slow) and `compute_pvqv` (on by default) in `01 Topological Seed.py`. 
 - Fault Duty: is computed on all buses, and saved in `TopoSeed/fault_duty.csv`. 
 - PVQV: Bus voltage sensitivity to additional MW or MVAR (linearly) is computed and saved to `TopoSeed/pvqv.csv`. 
 
 ### Add a Giant Swing/Slack Generator
-Since the GridView EPC exports are unsolved powerflow models, they will not have accurate accounting for system losses. In systems such as the WECC (with peak loads > 100 GW), even a few percent difference in losses could be several GW of power imbalance, which has to be placed somewhere in the model until the user can later distinguish where to balance the difference. As such, a giant swing/slack generator is created and placed on the maximum fault-duty bus to allow such balancing to occur. 
+Since the GridView EPC exports are unsolved powerflow models, they will not have accurate accounting for system losses. In systems such as the WECC (with peak loads > 100 GW), even a few percent difference in losses could be several GW of power imbalance, which has to be placed somewhere in the model until the user can later distinguish where to balance the difference. As such, a giant swing/slack generator is created and placed on the case's existing swing bus (or the maximum fault-duty bus, with `compute_fault_duty`) to allow such balancing to occur. 
 
 ## Load and Gen Scaling
 Load and generation scaling starts from the Topological seed. 
@@ -153,11 +156,11 @@ In GridView, a resource of virtually any size can be placed virtually anywhere, 
 
 `test_gen_targets_parallel()` opens several instance of PowerWorld, to split this task up. Each instance of PowerWorld opens the TopoSeed.pwb case, then begins testing each target. It applies the generation target, solves, then rolls it back, and keeps track of whether the solve was a "Success". Those generation targets which are not successful individually should be excluded from the Load & Gen scaling process. 
 
-This is `divergence_mode = 'pretest'` in `02 Load and Gen Scaling.py`. The alternative, `divergence_mode = 'bisect'`, skips this test. Instead, when a scaling step diverges, the step is bisected (applied in halves, recursively) to find the gens/loads which cause divergence. Those are excluded at their last good step, and scaling continues with the rest. It avoids the extra PowerWorld instances, and scaling doesn't stop partway. However, an excluded element is left partway between its seed and target values, rather than at its seed value. 
+This is `pretest_gens = True` in `02 Load and Gen Scaling.py`. It is off by default: instead, gens/loads which diverge are found while scaling, by bisecting the step (see below). That avoids the extra PowerWorld instances. 
 
 ### Iterate to Gen and Load Targets
 `iterate_to_gen_load_targets()` contains the logic to linearly scale loads and gens to their final targets. 
-- `compute_pvqv_exclusions()` excludes Loads & Gens from scaling, if the $\Delta P$ and $\Delta Q$ indicates more than a 10% $\Delta V$ from a linear PVQV analysis standpoint. 
+- `compute_pvqv_exclusions()` (only with `use_pvqv = True`) excludes Loads & Gens from scaling, if the $\Delta P$ and $\Delta Q$ indicates more than a 10% $\Delta V$ from a linear PVQV analysis standpoint. 
   - Variables:
     - $\Delta P$ = $P_{final} - P_{initial}$
     - $\Delta Q$ = $Q_{final} - Q_{initial}$
@@ -166,13 +169,20 @@ This is `divergence_mode = 'pretest'` in `02 Load and Gen Scaling.py`. The alter
     - $|\Delta P \times \frac{dV}{dP}| > 10\%$ 
   - Load Check:
     - $|\Delta P \times \frac{dV}{dP} + \Delta Q \times \frac{dV}{dQ}| > 10\%$ 
-- `compute_voltage_exclusions()` excludes Loads & Gens from scaling if their respective buses exceed +/- 12% of nominal voltage. 
+- `hold_voltage()` holds Loads & Gens back from scaling while their respective buses exceed +/- 12% of nominal voltage. 
 - `adjust_shunts()` opens/closes shunt capacitors/reactors when voltages reach +/- 8% of nominal. 
 - `close_all_related_gen_load()` closes all generation and load which is to be scaled up/down. If the element is in-service in the target (GridView EPC), or in-service in the source (TopoSeed.PWB), then it gets closed by this routine. Any loads/gens which were previously out of service are closed in at 0 MW / 0 MVAR to begin the scaling. 
 - `create_statcom_on_lowestv_bus()` will place a large STATCOM (`ID`=`SC`) on a bus which is beginning to see signs of collapse (<85% of Nominal Voltage). The scale log lists each STATCOM bus, and whether the STATCOM could be closed in. 
 - `drop_collapsed_sections()` is a last-ditch effort which drops branches on network sections which are showing voltage collapse (<80% Voltage). Sometimes, Newton-Raphson solves into a state where network sections have 0.2 PU voltages and it still shows as solved. This is intended to catch those situations to some degree, by dropping those problematic areas to be resolved later by engineering review. 
 
-The routine will attempt to increment the loads and generators to their final targets in 100 steps, while using the above techniques to avoid case divergence along the way. Should the case become divergent, it will stop there (`'pretest'` mode), or exclude the gens/loads causing it and continue (`'bisect'` mode). At the end of the scaling process, it will set the final statuses on loads/gens. 
+The routine moves the loads and generators to their final targets in adaptive steps, measured in 1/100ths (`RESOLUTION`) of the way from start to target, while using the above techniques to avoid case divergence along the way. Tuning is at the top of `Scripts/scale.py`. 
+- The first step is `INITIAL_STEP` (25). Each step which solves doubles the next, up to `MAX_STEP` (100). Each which diverges is rolled back and retried at half the size.
+- A 1/100 step which still diverges is bisected (applied in halves, recursively) to find the gens/loads which cause divergence. Those are held back at their last good values, and the rest go ahead. The step then returns to the size which first diverged.
+- Held gens/loads aren't excluded straight away, since a unit which diverges early may solve after other changes have taken effect. After each step, `catch_up()` tries to move them all up to one step closer to the rest (in one attempt). Those which catch up resume scaling.
+- Once the rest reach their targets, `retry_held()` retries the held gens/loads, bisecting, starting with a jump to target and halving the jump when nothing moves. Those which still diverge are excluded, left partway between their start and target values.
+- The `step_df` sheet of the scale log lists each step, its result, how many held gens/loads caught up, and how many are still held.
+
+At the end of the scaling process, it will set the final statuses on loads/gens. 
 
 ## Manual Work
 

@@ -89,17 +89,18 @@ def creating(SimAuto):
     finally:
         SimAuto.CreateIfNotFound = False
 
-def set_df_bisect(SimAuto, table: str, df: pd.DataFrame, fields: list[str]) -> list:
+def set_df_bisect(SimAuto, table: str, df: pd.DataFrame, fields: list[str], solves: int = 1) -> list:
     """
     Attempts to apply all rows of df in one bulk edit.
     If it fails, rolls back and bisects df into two halves to test recursively until reaching 1 row.
+    Each attempt must pass `solves` solves.
     Returns the index labels of rows which could not be applied without divergence.
     """
     if len(df) == 0:
         return []
 
     print(f'Attempting to set {len(df)} {table} parameters at once.')
-    with trial(SimAuto) as t:
+    with trial(SimAuto, solves=solves) as t:
         set_df(SimAuto, table, df, fields)
     if t.ok:
         return []
@@ -111,7 +112,7 @@ def set_df_bisect(SimAuto, table: str, df: pd.DataFrame, fields: list[str]) -> l
 
     print('Failed to set parameters on all elements at the same time. Bisecting into half the list size.')
     mid = len(df) // 2
-    return set_df_bisect(SimAuto, table, df.iloc[:mid], fields) + set_df_bisect(SimAuto, table, df.iloc[mid:], fields)
+    return set_df_bisect(SimAuto, table, df.iloc[:mid], fields, solves) + set_df_bisect(SimAuto, table, df.iloc[mid:], fields, solves)
 
 def open_case(SimAuto, fp):
     if not Path(fp).exists():
