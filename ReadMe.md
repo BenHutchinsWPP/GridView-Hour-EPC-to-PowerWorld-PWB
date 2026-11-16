@@ -6,7 +6,7 @@ Given (Input):
 - EPC(s) which have been exported from GridView for one or more hour snapshots.
 
 Produce (Output): a solved PWB for every provided GridView hour. Two modes, set by `mode` in `settings.toml`:
-- **`area`** (default): the same load MW & Mvar in each area, and the same generation MW in each area for each generation type (Solar, Hydro, Wind, Thermal, Battery Storage, Unknown). Topology is not matched: nothing is created or deleted, and no branch or load is opened or closed. Gens are brought online or taken offline only to suit their area & type target ([Unit Commitment](#unit-commitment)). Areas whose gens (or loads) have exactly the same keys in both cases are matched unit by unit.
+- **`area`** (default): the same load MW & Mvar in each area, and the same generation MW in each area for each generation type (Solar, Hydro, Wind, Thermal, Battery Storage, Unknown). Topology is not matched: nothing is created or deleted, and no branch or load is opened or closed to match GridView. (The last-ditch solve aids, STATCOMs and dropping collapsed sections, can still change the network to keep the case solving: `add_statcoms`, `drop_collapsed`.) Gens are brought online or taken offline only to suit their area & type target ([Unit Commitment](#unit-commitment)). Areas whose gens (or loads) have exactly the same keys in both cases are matched unit by unit.
 - **`topology`**: the same topology (buses, branches, loads, gens, and their statuses) and the same MW/Mvar on every load and gen (unless `balance_swing` moves them: see [Topology Mode](#topology-mode)). Missing elements are created in the PWB.
 
 ## Status
@@ -37,7 +37,8 @@ Area mode: first draft (2026-11-15), first written in `~/projects/areascale` (th
 - `create_giant_swing`: add a giant swing (`ID`=`xx`), or use the case's own swing (the gens on its slack bus). `swing_bus`: `"slack"`, `"max_fault_duty"` or a bus number.
 - `balance_swing`: move MW off the swing onto the whole case, half gen and half load, during scaling whenever the swing leaves its band (`[area] balance_trigger_mw` and/or the swing unit's MW limits, `balance_at_swing_limits`), and after scaling until it is ~0 MW. The swing unit itself is never moved, in either mode.
 - `adjust_seed_shunts`, `gen_terminal_voltage_control`, `compute_pvqv`: the seed preparation steps.
-- `pretest_gens`, `use_pvqv`: optional scaling exclusions (both off).
+- `pretest_gens`, `use_pvqv`: extra scaling exclusions, off by default. Turn them on for a case which is hard to solve. `use_pvqv` needs step 01's `compute_pvqv` (on by default).
+- `[scale] add_statcoms`, `drop_collapsed`: last-ditch solve aids, on by default (see [Iterate to Gen and Load Targets](#iterate-to-gen-and-load-targets)).
 
 The other sections (`[area]`, `[scale]`, `[prep]`, `[topology]`, `[pw]`) set the tuning constants of the `Scripts/` file they name: e.g. `[scale] exclude_vmin` sets `EXCLUDE_VMIN` in `Scripts/scale.py`. The code holds the defaults, so a setting left out of the file keeps its default, and a misspelt one is an error. `[area.unit_gentype]` / `[area.fuel_gentype]` add to or override the GenType maps.
 
@@ -90,7 +91,6 @@ The other sections (`[area]`, `[scale]`, `[prep]`, `[topology]`, `[pw]`) set the
 - Should the GridView X1/X2 distributed generation loads (in the EPC, not in the PWB) count in the area load target? Positive and negative load are matched separately, so a positive one adds to the area's positive target. A negative one (if GridView writes them so) can only be placed on the area's negative PWB loads: with none, it shows as `Unmet MW -` and goes to the swing. Their MW shows as `EPC-only MW` in `area_load`.
 - Gen sharing by `MWMax` ignores `MWMin` above 0, and never exceeds `MWMax`. Should a target above the bucket's capacity push units past `MWMax` instead of going to the swing?
 - `AreaNumber` is the gen's / load's own area field. Should it be the bus's area?
-- The scaling engine's solve aids do change the network: it switches shunts, may add STATCOMs (`ID`=`SC`) and may open branches into collapsed sections. These are not there to match GridView, only to keep the case solving. `add_statcoms` and `drop_collapsed` in `[scale]` of `settings.toml` turn the last two off. Should they be off by default here?
 
 ## Topology Mode
 

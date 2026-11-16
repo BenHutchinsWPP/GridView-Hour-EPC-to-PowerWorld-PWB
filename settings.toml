@@ -22,11 +22,14 @@ balance_swing = true
 # Seed preparation (step 01).
 adjust_seed_shunts = true
 gen_terminal_voltage_control = true     # Scripts/GenTerminalVoltageControl.aux
-compute_pvqv = true                     # PVQV self-sensitivities, for use_pvqv.
+compute_pvqv = true                     # PVQV self-sensitivities (Prepared/pvqv.csv). Keep on, so use_pvqv can be turned on
+                                        # in step 02 without rerunning step 01.
 
 # Scaling (step 02).
+# Two extra exclusions, off by default (bisecting the scaling step finds the gens/loads which diverge). Turn them on for a
+# case which is hard to solve.
 pretest_gens = false    # Test each gen target alone first, in parallel PowerWorld instances; exclude those which diverge.
-use_pvqv = false        # Exclude gens/loads whose linear PVQV voltage change estimate is too large.
+use_pvqv = false        # Exclude gens/loads whose linear PVQV voltage change estimate is too large. Needs compute_pvqv.
 
 [area]
 # Unit commitment per area & GenType: bring gens online / take them offline to suit the target.
@@ -59,6 +62,8 @@ gen_types = ["Solar", "Hydro", "Wind", "Thermal", "Battery Storage", "Unknown"]
 [area.fuel_gentype]
 
 [scale]
+# Last-ditch solve aids. They change the network (in both modes), only to keep the case solving; every change is listed
+# in the scale log (statcom_bus_df, dropped_branch_df) for review. true / false.
 add_statcoms = true         # Add a STATCOM (ID "SC") on the lowest-voltage bus below statcom_vpu.
 drop_collapsed = true       # Open branches into network sections below collapse_vpu.
 exclude_vmin = 0.88         # Hold gens/loads back from scaling while their bus is outside this band.

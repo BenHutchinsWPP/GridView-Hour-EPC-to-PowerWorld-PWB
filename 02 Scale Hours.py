@@ -64,6 +64,8 @@ def create_case(SimAuto, gv_fp, out_fp):
 
 if(__name__=='__main__'):
     print(f'Mode: {run["mode"]}')
+    if run['use_pvqv'] and not pvqv_fp.exists():
+        raise SystemExit(f'use_pvqv needs {pvqv_fp}: run step 01 with compute_pvqv = true.')
     # Created here, not at import: multiprocessing workers re-import this module.
     SimAuto = pw.connect()
     for gv_fp in sorted(gv_dir.glob('*.epc')):
