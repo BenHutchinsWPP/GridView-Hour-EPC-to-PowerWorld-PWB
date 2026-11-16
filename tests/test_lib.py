@@ -423,11 +423,12 @@ def test_commitment_headroom_and_all_on_types():
     df, _ = area.gen_targets(gens([]), case)
     assert df['Status_Target'].to_dict() == {'b1': 'Closed'} and df['MWSetPoint_Target'].tolist() == [0.0]
 
-def test_build_targets_leaves_slack_bus_gens_alone():
-    case = gens([('s1', 1, '1', 'Closed', 'GT', 300.0, 500.0, 0.0), ('g1', 1, '2', 'Closed', 'GT', 0.0, 100.0, 0.0)]).assign(BusNum=[5, 6])
-    epc = gens([('e1', 1, '9', 'Closed', 'GT', 80.0, 100.0, 0.0)])
-    targets, _ = area.build_targets({'Load': loads([]), 'Gen': epc}, {'Load': loads([]), 'Gen': case}, swing_buses=[5])
+def test_build_targets_leaves_slack_bus_gens_out_of_both_cases():
+    # Identical cases: the slack-bus unit's 300 MW is not loaded onto g1, and the area still matches by key.
+    case = gens([('s1', 1, '1', 'Closed', 'GT', 300.0, 500.0, 0.0), ('g1', 1, '2', 'Closed', 'GT', 80.0, 100.0, 0.0)]).assign(BusNum=[5, 6])
+    targets, reports = area.build_targets({'Load': loads([]), 'Gen': case}, {'Load': loads([]), 'Gen': case}, swing_buses=[5])
     assert targets['Gen'].index.tolist() == ['g1'] and targets['Gen'].loc['g1', 'MWSetPoint_Target'] == 80
+    assert reports['area_gen']['Method'].tolist() == ['Matched keys'] and reports['area_gen']['Unmet MW'].tolist() == [0.0]
 
 # ------------------ settings ------------------
 def test_repo_settings_file_loads():
@@ -447,7 +448,7 @@ def test_settings_apply_and_reject(tmp_path=None):
         try:
             fp.write_text('[run]\nmode = "topology"\n[scale]\nexclude_vmin = 0.7\n'
                           '[area]\nall_on_types = ["Wind"]\ngen_types = ["Solar", "Hydro", "Wind", "Thermal", "Battery Storage", "Unknown", "Pumped"]\n'
-                          '[area.unit_gentype]\nPS = "Pumped"\nHY = "fuel"\n')
+                          '[area.unit_gentype]\nps = "Pumped"\nHY = "fuel"\n')
             run = settings.load(fp)
             assert run['mode'] == 'topology' and run['balance_swing'] is True     # Default filled in.
             assert scale.EXCLUDE_VMIN == 0.7 and area.ALL_ON_TYPES == {'Wind'}
@@ -457,7 +458,8 @@ def test_settings_apply_and_reject(tmp_path=None):
             assert scale.voltage_ok(gen, pd.Series({1: 0.75})).tolist() == [True]
             scale.EXCLUDE_VMIN, area.UNIT_GENTYPE, area.ALL_ON_TYPES, area.GEN_TYPES = saved[0], dict(saved[1]), set(saved[2]), list(saved[3])
             for bad in ['[run]\nmode = "x"\n', '[run]\nmodee = "area"\n', '[scale]\nnope = 1\n', '[nope]\n',
-                        '[area.unit_gentype]\nPS = "Pumped"\n']:
+                        '[area.unit_gentype]\nPS = "Pumped"\n', '[run]\nswing_bus = true\n', '[scale]\nexclude_vmin = "low"\n',
+                        '[run]\nbalance_swing = 1\n', '[scale]\nstatus = {}\n', '[area]\nall_on_types = "Wind"\n']:
                 fp.write_text(bad)
                 try:
                     settings.load(fp)

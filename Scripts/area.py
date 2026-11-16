@@ -198,7 +198,7 @@ def capacity_share(target: float, cap: pd.Series) -> pd.Series:
 
 def scalable_gens(df: pd.DataFrame) -> pd.DataFrame:
     """All gens but the giant swing and MANUAL_UNIT_TYPES."""
-    return df[(df['ID'] != prep.SWING_ID) & ~_code(df['UnitTypeCode']).isin(MANUAL_UNIT_TYPES)]
+    return df[(df['ID'] != prep.SWING_ID) & ~_code(df['UnitTypeCode']).isin({c.upper() for c in MANUAL_UNIT_TYPES})]
 
 # ------------------ Unit commitment ------------------
 # Per (area, GenType) bucket, which PWB units are online is chosen to fit the target, rather than kept from the seed.
@@ -319,10 +319,12 @@ def gen_targets(epc_gen: pd.DataFrame, case_gen: pd.DataFrame) -> tuple[pd.DataF
 def build_targets(epc: dict[str, pd.DataFrame], case: dict[str, pd.DataFrame], swing_buses=()) -> tuple[dict, dict]:
     """
     Returns (targets {'Gen', 'Load'} for scale.iterate_to_gen_load_targets(), reports {'area_load', 'area_gen'}).
-    The case's gens on swing_buses (the slack bus) aren't scaled: the solution sets their MW.
+    Gens on swing_buses (the slack bus) are left out of both cases: the solution sets their MW, and swing balancing
+    deals with what they carry.
     """
     load, load_report = load_targets(epc['Load'], case['Load'])
-    gen, gen_report = gen_targets(epc['Gen'], case['Gen'][~case['Gen']['BusNum'].isin(swing_buses)])
+    off_swing = lambda df: df[~df['BusNum'].isin(swing_buses)]
+    gen, gen_report = gen_targets(off_swing(epc['Gen']), off_swing(case['Gen']))
     return {'Gen': gen, 'Load': load}, {'area_load': load_report, 'area_gen': gen_report}
 
 def open_load_cleanup(case_load: pd.DataFrame) -> pd.DataFrame:

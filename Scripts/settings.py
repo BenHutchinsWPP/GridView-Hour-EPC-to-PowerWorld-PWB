@@ -26,7 +26,29 @@ RUN_DEFAULTS = {
     'balance_swing': True,
 }
 MODES = ('area', 'topology')
+# Tables a section may add to. Other dict attributes (STATUS, LOAD_FIELDS, ...) are code, not settings.
+MAPS = {(area, 'UNIT_GENTYPE'), (area, 'FUEL_GENTYPE')}
+# Code letter sets / maps: compared against upper-cased codes.
+CODE_KEYS = {(area, 'UNIT_GENTYPE'), (area, 'FUEL_GENTYPE'), (area, 'MANUAL_UNIT_TYPES')}
 FUEL = 'fuel'   # In [area.unit_gentype]: decide by the fuel type.
+
+def _check_type(fp, what: str, default, value, allow_int: bool = False):
+    """The value must be of the default's kind: bool, number, text, list (for lists and sets) or table."""
+    def kind(v):
+        if isinstance(v, bool):
+            return 'true/false'
+        if isinstance(v, (int, float)):
+            return 'number'
+        if isinstance(v, str):
+            return 'text'
+        if isinstance(v, (list, set, tuple)):
+            return 'list'
+        if isinstance(v, dict):
+            return 'table'
+        return None     # e.g. None: anything goes.
+    want, got = kind(default), kind(value)
+    if want is not None and got != want and not (allow_int and got == 'number'):
+        raise ValueError(f'{fp}: {what} must be {want}, not {value!r}')
 
 def load(fp: Path = DEFAULT_FP) -> dict:
     """Applies the file's module settings, and returns the [run] settings (defaults filled in)."""
@@ -37,6 +59,8 @@ def load(fp: Path = DEFAULT_FP) -> dict:
             unknown = set(values) - set(RUN_DEFAULTS)
             if unknown:
                 raise ValueError(f'{fp}: unknown [run] settings: {sorted(unknown)}')
+            for key, value in values.items():
+                _check_type(fp, f'[run] {key}', RUN_DEFAULTS[key], value, allow_int=key == 'swing_bus')
             run.update(values)
             continue
         if section not in MODULES:
@@ -47,6 +71,11 @@ def load(fp: Path = DEFAULT_FP) -> dict:
             if not hasattr(module, name):
                 raise ValueError(f'{fp}: unknown setting [{section}] {key}')
             current = getattr(module, name)
+            if isinstance(current, dict) and (module, name) not in MAPS:
+                raise ValueError(f'{fp}: [{section}] {key} is not a setting')
+            _check_type(fp, f'[{section}] {key}', current, value)
+            if (module, name) in CODE_KEYS:
+                value = {k.upper(): v for k, v in value.items()} if isinstance(value, dict) else [v.upper() for v in value]
             if isinstance(current, dict):
                 # Tables add to / override the default map, rather than replace it.
                 value = {**current, **{k: (None if v == FUEL else v) for k, v in value.items()}}
@@ -56,7 +85,7 @@ def load(fp: Path = DEFAULT_FP) -> dict:
 
     if run['mode'] not in MODES:
         raise ValueError(f'{fp}: [run] mode must be one of {MODES}, not {run["mode"]!r}')
-    if not (run['swing_bus'] in ('slack', 'max_fault_duty') or isinstance(run['swing_bus'], int)):
+    if not (run['swing_bus'] in ('slack', 'max_fault_duty') or type(run['swing_bus']) is int):
         raise ValueError(f"{fp}: [run] swing_bus must be 'slack', 'max_fault_duty' or a bus number")
     gen_types = set(area.GEN_TYPES)
     bad = {v for m in (area.UNIT_GENTYPE, area.FUEL_GENTYPE) for v in m.values() if v is not None and v not in gen_types}

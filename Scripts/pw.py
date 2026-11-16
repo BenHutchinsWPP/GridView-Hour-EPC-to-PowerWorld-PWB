@@ -44,6 +44,9 @@ def get_df(SimAuto, table: str, fields: dict[str,type], filter_group: str = '') 
         if typ in [int, float]:
             # Handle numeric types with coerce for empty strings.
             df[field] = pd.to_numeric(df[field], errors='coerce')
+            if typ is float:
+                # Whole-number values would otherwise come back as int64, which float values can't later be written into.
+                df[field] = df[field].astype(float)
         else:
             df[field] = df[field].astype(typ).str.strip()
     return df

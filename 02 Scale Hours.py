@@ -24,10 +24,12 @@ dummy_bus_fp = cur_dir / 'Prepared' / 'DummyBus.aux'
 out_dir = cur_dir / 'Output'
 
 def topology_targets(SimAuto, gv_fp) -> tuple[dict, dict]:
+    pw.open_case(SimAuto, pw_fp)
+    slack = area.slack_buses(SimAuto)
     targets = topo.compute_pw_targets(SimAuto, gv_fp, pw_fp, dummy_bus_fp)
-    # Don't adjust the giant swing.
+    # Don't adjust the giant swing, or (without one) the gens on the slack bus.
     gen_df = targets['Gen']
-    swing = gen_df['ID'] == prep.SWING_ID
+    swing = (gen_df['ID'] == prep.SWING_ID) | (gen_df['BusNum'].isin(slack) & (not run['create_giant_swing']))
     gen_df.loc[swing, 'Status_Target'] = 'Closed'
     scale.exclude(gen_df, swing, 'Swing Unit')
     return targets, {}
