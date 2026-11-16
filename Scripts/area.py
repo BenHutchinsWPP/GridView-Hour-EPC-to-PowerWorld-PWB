@@ -178,6 +178,7 @@ def load_targets(epc_load: pd.DataFrame, case_load: pd.DataFrame) -> tuple[pd.Da
 
     for c in ['IMW', 'IMvar', 'ZMW', 'ZMvar', 'DistMWInput', 'DistMvarInput']:
         df[f'{c}_Target'] = 0.0
+    df['Planned MW'] = df['SMW_Target']             # What the plan placed. Never rescaled: areas() measures the balances against it.
     df['Status_Target'] = df['Status']
     df['DistStatus_Target'] = 'Open'
     for c in [*scale.STATUS['Load'], *scale.SCALED['Load']]:
@@ -367,6 +368,7 @@ def gen_targets(epc_gen: pd.DataFrame, case_gen: pd.DataFrame) -> tuple[pd.DataF
         status, mw, bucket_method[bucket] = dispatch_bucket(rows, t, bucket[1], epc_online)
         df.loc[rows.index, 'Status_Target'] = status
         df.loc[rows.index, 'MWSetPoint_Target'] = mw.where(status == 'Closed', 0.0)
+    df['Planned MW'] = df['MWSetPoint_Target']      # What the plan placed. Never rescaled: areas() measures the balances against it.
 
     df['MWSetPoint'] = df['MWSetPoint'].where(closed(df), 0.0)   # Open units are at 0 MW, as the engine expects.
     df['Status_Seed'] = df['Status']
@@ -423,29 +425,113 @@ def open_load_cleanup(case_load: pd.DataFrame) -> pd.DataFrame:
     df = case_load[~closed(case_load) & (conforming(case_load) | SCALE_NONCONFORMING) & ((case_load['DistStatus'] == 'Closed') | (case_load['DistMWInput'] != 0) | (case_load['DistMvarInput'] != 0))]
     return df.assign(DistStatus='Open', DistMWInput=0.0, DistMvarInput=0.0)
 
-def achieved(final: dict[str, pd.DataFrame], reports: dict[str, pd.DataFrame], swing_buses=()) -> dict[str, pd.DataFrame]:
-    """
-    Adds what the scaled case holds (`final`: read_case() of it, after scaling) to the area reports.
-    Gens on swing_buses are left out, as build_targets() leaves them out of the targets.
-    """
-    load = final['Load'][closed(final['Load']) & (conforming(final['Load']) | SCALE_NONCONFORMING)]
-    final_split = pd.concat([sign_totals(load[LOAD_P].sum(axis=1), load['AreaNumber'], 'MW'),
-                             sign_totals(load[LOAD_Q].sum(axis=1), load['AreaNumber'], 'Mvar')], axis=1)
-    area_load = reports['area_load'].copy()
-    for c in final_split:
-        area_load[f'Final {c}'] = area_load['AreaNumber'].map(final_split[c]).fillna(0.0)
-        area_load[f'Final Error {c}'] = area_load[f'Final {c}'] - area_load[f'Target {c}']
-    for c in ('MW', 'Mvar'):
-        area_load[f'Final {c}'] = area_load[f'Final {c} +'] + area_load[f'Final {c} -']
-        area_load[f'Final Error {c}'] = area_load[f'Final {c}'] - area_load[f'Target {c}']
+AREAS_COLUMNS = ['AreaNumber', 'Group', 'Seed MW', 'Target MW', 'Unmet MW', 'Not Reached MW', 'Balance MW', 'Final MW', 'Error MW',
+                 'Target Mvar', 'Final Mvar', 'Online Seed', 'Online Final', 'Note']
+LEDGER_TOL_MW = 1.0     # A row's Final further than this from its ledger is noted as unexplained.
 
-    gen = scalable_gens(final['Gen'])
-    gen = gen[closed(gen) & ~gen['BusNum'].isin(swing_buses)]
-    got = gen.groupby(['AreaNumber', classify_gen_type(gen).rename('GenType')])['MWSetPoint'].sum().rename('Final MW')
-    area_gen = reports['area_gen'].merge(got.reset_index(), on=['AreaNumber', 'GenType'], how='outer')
-    area_gen = area_gen.fillna({c: 0.0 for c in area_gen.columns if c not in ('AreaNumber', 'GenType', 'Method')})
-    area_gen['Final Error MW'] = area_gen['Final MW'] - area_gen['Target MW']
-    return {'area_load': area_load, 'area_gen': area_gen}
+def _by_group(df: pd.DataFrame, value, group=None) -> pd.Series:
+    """Sum of `value` (aligned to df's rows) by (AreaNumber, Group). Group: GenType of a gen table, else 'Load'."""
+    if group is None:
+        group = pd.Series('Load', index=df.index)
+    frame = pd.DataFrame({'AreaNumber': df['AreaNumber'].to_numpy(), 'Group': np.asarray(group, dtype=object),
+                          'v': np.asarray(value, dtype=float)})
+    if frame.empty:
+        return pd.Series(dtype=float, index=pd.MultiIndex.from_arrays([[], []], names=['AreaNumber', 'Group']))
+    return frame.groupby(['AreaNumber', 'Group'])['v'].sum()
+
+def _gen_group(df: pd.DataFrame) -> pd.Series:
+    return classify_gen_type(df) if len(df) else pd.Series(dtype=object)
+
+def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame], targets: dict[str, pd.DataFrame] | None = None,
+          balance_tables=(), swing_buses=()) -> pd.DataFrame:
+    """
+    The `areas` sheet: a row per (AreaNumber, Group), Group a GenType or 'Load' (AREAS_COLUMNS). The ledger per row:
+        Final = Target - Unmet - Not Reached + Balance
+    Not Reached: over the main scaling's rows, end-of-run target less end-of-run value (excluded, diverged, held units).
+    Balance: what swing balancing moved onto the group = the midrun part (end-of-run `_Target` less Planned MW, main rows:
+    midrun balances rescale the main targets) + the final part (value less seed in each final balance's table).
+    final: read_case() of the scaled case, or None before scaling (Final columns blank). targets: the main tables after
+    scaling (None: nothing reached or balanced). balance_tables: balance_targets() tables of the final balance rounds,
+    after scaling (balance_swing(..., tables=)). Gens on swing_buses are left out, as in build_targets().
+    """
+    key = ['AreaNumber', 'Group']
+    plan = pd.concat([reports['area_gen'].rename(columns={'GenType': 'Group'}),
+                      reports['area_load'].rename(columns={'Seed Loads': 'Seed Online'}).assign(Group='Load')]).set_index(key)
+    parts: dict[str, pd.Series] = {}
+
+    p_of = lambda df, cols: df[cols].sum(axis=1)
+    if targets is not None:
+        g, l = targets['Gen'], targets['Load']
+        gg = _gen_group(g)
+        not_reached = (_by_group(g, g['MWSetPoint_Target'] - g['MWSetPoint'], gg)
+                       .add(_by_group(l, p_of(l, [f'{c}_Target' for c in LOAD_P]) - p_of(l, LOAD_P)), fill_value=0.0))
+        end_target = (_by_group(g, g['MWSetPoint_Target'], gg).add(_by_group(l, p_of(l, [f'{c}_Target' for c in LOAD_P])), fill_value=0.0))
+        planned = _by_group(g, g['Planned MW'], gg).add(_by_group(l, l['Planned MW']), fill_value=0.0)
+        parts['Not Reached MW'] = not_reached
+        parts['Balance MW'] = end_target.sub(planned, fill_value=0.0)        # The midrun part.
+    for t in balance_tables:
+        g, l = t['Gen'], t['Load']
+        g = g[~g['BusNum'].isin(swing_buses)]       # Left out of Final MW too (a second slack bus beside the giant swing).
+        parts['Balance MW'] = (parts.get('Balance MW', pd.Series(dtype=float))
+                               .add(_by_group(g, g['MWSetPoint'] - g['MWSetPoint_Seed'], _gen_group(g)), fill_value=0.0)
+                               .add(_by_group(l, p_of(l, LOAD_P) - l['P_Seed']), fill_value=0.0))
+    if final is not None:
+        load = final['Load'][closed(final['Load']) & (conforming(final['Load']) | SCALE_NONCONFORMING)]
+        gen = scalable_gens(final['Gen'])
+        gen = gen[closed(gen) & ~gen['BusNum'].isin(swing_buses)]
+        parts['Final MW'] = _by_group(gen, gen['MWSetPoint'], _gen_group(gen)).add(_by_group(load, p_of(load, LOAD_P)), fill_value=0.0)
+        parts['Final Mvar'] = _by_group(load, p_of(load, LOAD_Q))
+        parts['Online Final'] = _by_group(gen, 1.0, _gen_group(gen)).add(_by_group(load, 1.0), fill_value=0.0)
+
+    index = plan.index
+    for s in parts.values():
+        index = index.union(s.index)
+    index = index.sort_values()
+    out = pd.DataFrame(index=index)
+    for c in ('Seed MW', 'Target MW', 'Unmet MW', 'Target Mvar', 'Seed Online'):
+        out[c] = plan[c].reindex(index) if c in plan else np.nan
+    out[['Seed MW', 'Target MW', 'Unmet MW']] = out[['Seed MW', 'Target MW', 'Unmet MW']].fillna(0.0)
+    out.loc[out.index.get_level_values('Group') != 'Load', 'Target Mvar'] = np.nan
+    for c in ('Not Reached MW', 'Balance MW'):
+        out[c] = parts[c].reindex(index, fill_value=0.0) if c in parts else 0.0
+    out = out.rename(columns={'Seed Online': 'Online Seed'})
+    out['Online Seed'] = out['Online Seed'].fillna(0.0)
+    for c in ('Final MW', 'Final Mvar', 'Online Final'):
+        out[c] = parts[c].reindex(index, fill_value=0.0) if final is not None else np.nan
+    out.loc[out.index.get_level_values('Group') != 'Load', 'Final Mvar'] = np.nan
+    out['Error MW'] = out['Final MW'] - out['Target MW']
+    ledger = out['Target MW'] - out['Unmet MW'] - out['Not Reached MW'] + out['Balance MW']
+    out['Note'] = _area_notes(out, plan.reindex(index), ledger)
+    return out.reset_index()[AREAS_COLUMNS]
+
+def _area_notes(out: pd.DataFrame, plan: pd.DataFrame, ledger: pd.Series) -> list[str]:
+    notes = []
+    for i, k in enumerate(out.index):
+        o, p, n = out.iloc[i], plan.iloc[i], []
+        target, unmet = o['Target MW'], o['Unmet MW']
+        if k[1] == 'Load':
+            if target != 0 and p.get('Seed Online', 0) == 0:
+                n.append('no PWB units')
+            nonc = p.get('Seed Non-conforming MW', 0)
+            if pd.notna(nonc) and nonc != 0:
+                n.append(f'non-conforming left as is: {nonc:.1f} MW')
+        else:
+            units = p.get('All Units MWMax', 0) or p.get('Seed Online', 0)
+            if target != 0 and not units:
+                n.append('no PWB units')
+            elif target == 0 and o['Seed MW'] != 0:
+                n.append('no EPC target')
+            elif abs(unmet) > 1e-6:
+                n.append('capped at MWMax')
+            if p.get('Method') == 'Capacity' and target != 0 and units:
+                n.append('committed by capacity rules')
+            basis = p.get('Basis MW', 0)
+            if p.get('Method') == 'Scaled' and basis and 0 < (target - unmet) / basis < LOW_FACTOR_WARNING:
+                n.append(f'scaled to {(target - unmet) / basis:.0%} of basis')
+        if pd.notna(o['Final MW']) and abs(o['Final MW'] - ledger.iloc[i]) > LEDGER_TOL_MW:
+            n.append(f"unexplained {o['Final MW'] - ledger.iloc[i]:.1f} MW")
+        notes.append('; '.join(n))
+    return notes
 
 def compute_targets(SimAuto, gv_fp, pw_fp) -> tuple[dict, dict]:
     """Opens the EPC and the PWB, and returns build_targets() of their loads & gens. Closes the case."""
@@ -537,34 +623,45 @@ def mw_changes(moved: dict[str, pd.DataFrame]) -> dict[str, float]:
     return {'Gen MW Change': (moved['Gen']['MWSetPoint'] - moved['Gen']['MWSetPoint_Seed']).sum(),
             'Load MW Change': (moved['Load'][LOAD_P].sum(axis=1) - moved['Load']['P_Seed']).sum()}
 
-def balance_swing(SimAuto, scaled: dict[str, pd.DataFrame] | None = None) -> dict[str, pd.DataFrame]:
+def balance_swing(SimAuto, scaled: dict[str, pd.DataFrame] | None = None, tables: list | None = None) -> list[scale.Run]:
     """
     With the case open: moves what is left on the swing onto the whole case's gen and load, half each (see
-    balance_targets()), round after round until it is within BALANCE_TOL_MW. Returns the log sheets.
+    balance_targets()), round after round until it is within BALANCE_TOL_MW. Returns a scale.Run per round that ran
+    (`balance<N>`; the swing after a round is the next round's, or the end swing).
     scaled: the main scaling's tables, so units it held back or excluded are left alone here too (balance_skips()).
+    tables: if a list, each round's balance_targets() tables (after scaling) are appended to it, for areas().
     """
     slack = prep.slack_buses(SimAuto)
-    rounds, sheets = [], {}
+    runs: list[scale.Run] = []
+    exhausted = True
     for i in range(BALANCE_MAX_ROUNDS):
         final = read_case(SimAuto)
         swing, swing_buses = swing_mw(final['Gen'], slack)
         print(f'----- Balancing round {i + 1}: swing at {swing:.1f} MW -----')
         if abs(swing) < BALANCE_TOL_MW:
+            exhausted = False
             break
         targets = balance_targets(final, swing, swing_buses, balance_skips(SimAuto, final, scaled))
+        if tables is not None:
+            tables.append(targets)
+        run = scale.Run(f'balance{i + 1}', moved=targets, before=swing)
+        runs.append(run)
         try:
-            log = scale.iterate_to_gen_load_targets(SimAuto, targets, label=f'Final balance {i + 1}', initial_step=scale.MAX_STEP)
+            run.log = scale.iterate_to_gen_load_targets(SimAuto, targets, label=f'Final balance {i + 1}', initial_step=scale.MAX_STEP)
         except pw.SimAutoError as e:
             # Keep the hour: the case is solved at the last good checkpoint, and `targets` holds what was applied.
             print(f'WARNING: Final balance {i + 1} stopped: {e}')
-            sheets.update({f'balance{i + 1}_{name}': df for name, df in getattr(e, 'log', {}).items() if len(df)})
-            rounds.append({'Round': i + 1, 'Swing MW': swing, 'Swing Buses': str(swing_buses), **mw_changes(targets), 'Error': str(e)})
+            run.log, run.note = getattr(e, 'log', {}), f'stopped: {e}'
+            exhausted = False
             break
-        rounds.append({'Round': i + 1, 'Swing MW': swing, 'Swing Buses': str(swing_buses), **mw_changes(targets)})
-        sheets.update({f'balance{i + 1}_{name}': df for name, df in log.items() if len(df)})
     swing, _ = swing_mw(read_case(SimAuto)['Gen'], slack)
-    rounds.append({'Round': 'End', 'Swing MW': swing})
-    return {'balance_df': pd.DataFrame(rounds), **sheets}
+    for run, nxt in zip(runs, runs[1:]):
+        run.after = nxt.before
+    if runs:
+        runs[-1].after = swing
+        if exhausted:
+            runs[-1].note = '; '.join(filter(None, [runs[-1].note, 'stopped at max rounds']))
+    return runs
 
 def rescale_targets(targets: dict[str, pd.DataFrame], moved: dict[str, pd.DataFrame]):
     """
@@ -578,13 +675,13 @@ def rescale_targets(targets: dict[str, pd.DataFrame], moved: dict[str, pd.DataFr
 
 def midrun_balancer(SimAuto):
     """
-    Returns (after_step, log, sheets) for scale.iterate_to_gen_load_targets(). After each step, if the swing is outside
+    Returns (after_step, runs) for scale.iterate_to_gen_load_targets(). After each step, if the swing is outside
     its band (swing_band()), moves it onto the whole case's gen and load, half each (balance_targets()), and keeps that in
     the scaling still to come (rescale_targets()). If a balance leaves the swing outside the band (e.g. gens at MWMax),
     the band is widened to where it got to, plus a margin (BALANCE_TRIGGER_MW, or 10% of the band if that's 0), so the
     next balance waits until the swing has moved that much further. The swing itself is never moved.
     A balance aims the swing at 0 MW, or at the nearest point a quarter of the band inside its edges if 0 is not there.
-    log: a row per balance. sheets: the scaling logs of the balances (`midrun<N>_<name>`), filled in as they run.
+    runs: a scale.Run per balance (`midrun<N>`), filled in as they run.
     """
     slack = prep.slack_buses(SimAuto)
     lo, hi = swing_band(pw.get_df(SimAuto, 'Gen', GEN_FIELDS), slack)
@@ -597,8 +694,7 @@ def midrun_balancer(SimAuto):
     else:
         aim = float(np.clip(0.0, lo, hi))
     state = {'lo': lo, 'hi': hi}
-    log: list[dict] = []
-    sheets: dict[str, pd.DataFrame] = {}
+    runs: list[scale.Run] = []
 
     def after_step(SimAuto, targets, progress):
         gen = pw.get_df(SimAuto, 'Gen', GEN_FIELDS)
@@ -608,25 +704,27 @@ def midrun_balancer(SimAuto):
         print(f'----- Swing at {swing:.1f} MW, outside {state["lo"]:.0f} to {state["hi"]:.0f} MW: balancing half on gen, half on load -----')
         final = {'Load': pw.get_df(SimAuto, 'Load', LOAD_FIELDS), 'Gen': gen}
         moved = balance_targets(final, swing - aim, swing_buses, balance_skips(SimAuto, final, targets))
-        label = f'Balance {len(log) + 1} (main scaling at {progress} of {scale.RESOLUTION})'
-        error = ''
+        label = f'Balance {len(runs) + 1} (main scaling at {progress} of {scale.RESOLUTION})'
+        run = scale.Run(f'midrun{len(runs) + 1}', moved=moved, before=swing, at=f'{progress} of {scale.RESOLUTION}')
+        runs.append(run)
+        notes = []
         try:
-            nested = scale.iterate_to_gen_load_targets(SimAuto, moved, label=label, initial_step=scale.MAX_STEP)
-            sheets.update({f'midrun{len(log) + 1}_{name}': df for name, df in nested.items() if len(df)})
+            run.log = scale.iterate_to_gen_load_targets(SimAuto, moved, label=label, initial_step=scale.MAX_STEP)
         except pw.SimAutoError as e:
             # Keep the hour: the case is solved at the last good checkpoint, and `moved` holds what was applied.
             print(f'WARNING: {label} stopped: {e}')
-            sheets.update({f'midrun{len(log) + 1}_{name}': df for name, df in getattr(e, 'log', {}).items() if len(df)})
-            error = str(e)
+            run.log = getattr(e, 'log', {})
+            notes.append(f'stopped: {e}')
         rescale_targets(targets, moved)
         after, _ = swing_mw(pw.get_df(SimAuto, 'Gen', GEN_FIELDS), slack)
+        run.after = after
         if not lo <= after <= hi:
             finite = np.isfinite(lo) and np.isfinite(hi)
             margin = BALANCE_TRIGGER_MW or (0.1 * (hi - lo) if finite else 0.0)
             state['lo'], state['hi'] = min(lo, after - margin), max(hi, after + margin)
+            notes.append(f'band widened to {state["lo"]:.0f}..{state["hi"]:.0f} MW')
         else:
             state['lo'], state['hi'] = lo, hi
-        log.append({'Swing MW Before': swing, 'Swing MW After': after, **mw_changes(moved),
-                    'Next Band Low MW': state['lo'], 'Next Band High MW': state['hi'], 'Error': error})
+        run.note = '; '.join(notes)
 
-    return after_step, log, sheets
+    return after_step, runs

@@ -160,16 +160,6 @@ def test_statcom_skips_buses_which_already_have_one():
     assert scale.create_statcom_on_lowestv_bus(sa, skip_buses=[]) == (2, True)
     assert sa.applied[('Gen', '2')]['GenStatus'] == 'Closed'                    # Created Closed, in one trial.
 
-def test_merge_network_changes():
-    log = {'statcom_bus_df': pd.DataFrame({'BusNum': [5], 'Closed': [True]}),
-           'midrun1_statcom_bus_df': pd.DataFrame({'BusNum': [6], 'Closed': [False]}),
-           'balance2_dropped_branch_df': pd.DataFrame({'ObjectID': ['b1']}),
-           'dropped_branch_df': pd.DataFrame({'ObjectID': []}), 'step_df': pd.DataFrame({'From': [0]})}
-    merged = scale.merge_network_changes(log)
-    assert merged['statcom_bus_df'].to_dict('list') == {'BusNum': [5, 6], 'Closed': [True, False], 'Run': ['main', 'midrun1']}
-    assert merged['dropped_branch_df'].to_dict('list') == {'ObjectID': ['b1'], 'Run': ['balance2']}
-    assert sorted(merged) == ['dropped_branch_df', 'statcom_bus_df', 'step_df']
-
 def test_exclude_keeps_first_reason():
     df = targets_df(ObjectID=['g1', 'g2'], BusNum=[1, 2])
     scale.exclude(df, df.index == 'g1', 'Swing Unit')
@@ -365,19 +355,8 @@ def test_gen_targets_leave_dc_ties_alone():
     assert df.index.tolist() == ['g1'] and df.loc['g1', 'MWSetPoint_Target'] == 60
     assert report['GenType'].tolist() == ['Thermal']
 
-def test_achieved_reads_the_final_case_and_open_load_cleanup():
+def test_open_load_cleanup():
     case = loads([('l1', 1, 'Closed', 100.0, 0.0, 0.0, 10.0), ('lo', 1, 'Open', 50.0, 0.0, 0.0, 0.0)])
-    epc = loads([('l1', 1, 'Closed', 80.0, 0.0, 0.0, 8.0)])
-    case_gen = gens([('h1', 1, '1', 'Closed', 'HY', 10.0, 100.0, 0.0), ('xx', 1, 'xx', 'Closed', '', 900.0, 2e4, -2e4)]).assign(FuelTypeCode=['', 'MWH'])
-    epc_gen = gens([('h1', 1, '1', 'Closed', 'HY', 40.0, 100.0, 0.0)])
-    _, reports = area.build_targets({'Load': epc, 'Gen': epc_gen}, {'Load': case, 'Gen': case_gen})
-    # The final case stopped short: 70 MW of load (the open load doesn't count), 30 MW of hydro, swing not counted.
-    final = {'Load': case.assign(SMW=[70.0, 999.0]), 'Gen': case_gen.assign(MWSetPoint=[30.0, 900.0])}
-    a = area.achieved(final, reports)
-    load = a['area_load'].set_index('AreaNumber')
-    assert load.loc[1, 'Final MW'] == 70 and load.loc[1, 'Final Error MW'] == -10
-    assert load.loc[1, 'Final MW +'] == 70 and load.loc[1, 'Final Error MW +'] == -10 and load.loc[1, 'Final MW -'] == 0
-    assert a['area_gen'][['GenType', 'Final MW', 'Final Error MW']].values.tolist() == [['Hydro', 30.0, -10.0]]
     cleanup = area.open_load_cleanup(case)
     assert cleanup['ObjectID'].tolist() == ['lo'] and cleanup['DistMWInput'].tolist() == [0.0]
     assert len(area.open_load_cleanup(case.assign(AGC='NO'))) == 0     # Non-conforming: untouched.
@@ -544,10 +523,6 @@ def test_build_targets_leaves_slack_bus_gens_out_of_both_cases():
     targets, reports = area.build_targets({'Load': loads([]), 'Gen': case}, {'Load': loads([]), 'Gen': case}, swing_buses=[5])
     assert targets['Gen'].index.tolist() == ['g1'] and targets['Gen'].loc['g1', 'MWSetPoint_Target'] == 80
     assert reports['area_gen']['Method'].tolist() == ['Scaled'] and reports['area_gen']['Unmet MW'].tolist() == [0.0]
-    # The read-back leaves them out too: the case matches, so there is no error. (Counting them would give +300 MW.)
-    final = {'Load': loads([]), 'Gen': case}
-    assert area.achieved(final, reports, swing_buses=[5])['area_gen'][['Final MW', 'Final Error MW']].values.tolist() == [[80.0, 0.0]]
-    assert area.achieved(final, reports)['area_gen']['Final Error MW'].tolist() == [300.0]
 
 class SwingSimAuto(FakeSimAuto):
     """
@@ -597,12 +572,12 @@ def test_midrun_balancer_keeps_the_swing_near_zero_and_never_moves_it():
     sa = SwingSimAuto(gen, load)
     # Scale load from 200 to 3200 MW with gens fixed: without balancing, the swing would end at +3000 MW.
     targets = load_ramp_targets()
-    after_step, log, sheets = area.midrun_balancer(sa)
+    after_step, log = area.midrun_balancer(sa)
     scale.iterate_to_gen_load_targets(sa, targets, after_step=after_step)
-    # The scaling log of every balance is kept, as `midrun<N>_<name>`.
-    assert all(f'midrun{n}_step_df' in sheets for n in range(1, len(log) + 1)) and f'midrun{len(log) + 1}_step_df' not in sheets
+    # The scaling log of every balance is kept in its run.
+    assert [r.name for r in log] == [f'midrun{n}' for n in range(1, len(log) + 1)] and all(len(r.log['step_df']) for r in log)
     swing = lambda: area.swing_mw(sa.table('Gen'), [])[0]
-    assert len(log) >= 1 and all(abs(r['Swing MW After']) < abs(r['Swing MW Before']) for r in log)
+    assert len(log) >= 1 and all(abs(r.after) < abs(r.before) for r in log)
     assert abs(swing()) <= area.BALANCE_TRIGGER_MW                      # Balanced as it went.
     assert ('Gen', '99') not in sa.applied                              # The swing unit was never written.
     # The load's target was scaled down by the balances, so the scaling ended where the balance left it.
@@ -632,16 +607,16 @@ def test_swing_band_and_limit_trigger():
         assert area.swing_band(gen, []) == (-np.inf, np.inf)                 # Off.
 
         sa = SwingSimAuto(gen, load)
-        after_step, log, _ = area.midrun_balancer(sa)
+        after_step, log = area.midrun_balancer(sa)
         targets = load_ramp_targets()
         scale.iterate_to_gen_load_targets(sa, targets, after_step=after_step)
         assert log == [] and targets['Load'].loc['l1', 'SMW'] == 3200      # Never balanced.
 
         area.BALANCE_AT_SWING_LIMITS = True                                  # Balance at the swing's MWMax (500 MW).
         sa = SwingSimAuto(gen, load)
-        after_step, log, _ = area.midrun_balancer(sa)
+        after_step, log = area.midrun_balancer(sa)
         scale.iterate_to_gen_load_targets(sa, load_ramp_targets(), after_step=after_step)
-        assert len(log) >= 1 and all(r['Swing MW Before'] > 500 for r in log)
+        assert len(log) >= 1 and all(r.before > 500 for r in log)
         assert area.swing_mw(sa.table('Gen'), [])[0] <= 500
     finally:
         area.BALANCE_TRIGGER_MW, area.BALANCE_AT_SWING_LIMITS = saved
@@ -706,7 +681,7 @@ def test_midrun_balance_keeps_gens_within_mwmax():
     with saved_settings():
         area.BALANCE_TRIGGER_MW = 20.0
         targets, _ = area.build_targets({'Gen': epc_gen, 'Load': epc_load}, area.read_case(sa), swing_buses=[99])
-        after_step, log, _ = area.midrun_balancer(sa)
+        after_step, log = area.midrun_balancer(sa)
         scale.iterate_to_gen_load_targets(sa, targets, after_step=after_step)
         area.balance_swing(sa)
     assert len(log) >= 1
@@ -751,9 +726,9 @@ def test_decommit_skips_a_unit_which_cannot_go_and_tries_the_next():
 def test_balance_df_counts_the_whole_load_change():
     gen, load = swing_case()
     sa = SwingSimAuto(gen, load.assign(IMW=100.0))      # 300 MW of load against 200 MW of gen: the swing is at +100.
-    first = area.balance_swing(sa)['balance_df'].iloc[0]
-    assert abs(first['Swing MW'] - 100) < 1e-9
-    assert abs(first['Load MW Change'] + 50) < 1e-6 and abs(first['Gen MW Change'] - 50) < 1e-6   # Half each, I part included.
+    first = scale.runs_sheet(area.balance_swing(sa)).iloc[0]
+    assert first['Run'] == 'balance1' and abs(first['Swing MW Before'] - 100) < 1e-9
+    assert abs(first['Load MW Moved'] + 50) < 1e-6 and abs(first['Gen MW Moved'] - 50) < 1e-6   # Half each, I part included.
 
 def test_iterate_raises_when_the_case_does_not_solve():
     class Diverges(FakeSimAuto):
@@ -852,14 +827,17 @@ def test_step_02_area_mode_end_to_end():
         sa = CaseSimAuto({'h1.epc': (epc_gen, epc_load), 'Prepared.pwb': (gen, load)}, slack=[99])
         step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')
         assert (step.out_dir / 'h1.pwb').exists()
-        sheets = pd.read_excel(step.out_dir / 'h1_03_ScaleLog.xlsx', sheet_name=None)
-        assert {'area_load', 'area_gen', 'step_df', 'balance_df', 'midrun_balance_df'} <= set(sheets)
-        assert (step.out_dir / 'h1_01_Target.xlsx').exists()
+        sheets = pd.read_excel(step.out_dir / 'h1_Log.xlsx', sheet_name=None)
+        assert set(sheets) == {'areas', 'exceptions', 'runs'}
+        assert sheets['runs']['Run'].iloc[0] == 'main'
+        assert sorted(fp.name for fp in step.out_dir.glob('*.xlsx')) == ['h1_Log.xlsx']
     out = sa.saved['h1.pwb']
     assert ('Gen', '99') not in sa.applied                                      # The swing was never written.
     assert abs(out['Gen'].loc['xx', 'MW']) < area.BALANCE_TOL_MW                # Balanced to ~0 MW.
     assert (out['Load']['DistStatus'] == 'Open').all() and (out['Load']['Status'] == 'Closed').all()
-    assert sheets['area_gen'].set_index('GenType')['Target MW'].to_dict() == {'Hydro': 50.0, 'Thermal': 150.0}
+    areas = sheets['areas'].set_index('Group')
+    assert areas['Target MW'].to_dict() == {'Hydro': 50.0, 'Load': 300.0, 'Thermal': 150.0}
+    assert areas['Final MW'].notna().all()
 
 def test_step_02_topology_mode_end_to_end():
     gen, load = two_cases()
@@ -870,8 +848,9 @@ def test_step_02_topology_mode_end_to_end():
         step.run['balance_swing'] = False      # Exact EPC values.
         sa = CaseSimAuto({'h1.epc': (epc_gen, epc_load), 'Prepared.pwb': (gen, load)}, slack=[99, 2])   # h1 is on a slack bus.
         step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')
-        log = pd.read_excel(step.out_dir / 'h1_03_ScaleLog.xlsx', sheet_name=None)
-        assert 'area_gen' not in log and 'step_df' in log
+        log = pd.read_excel(step.out_dir / 'h1_Log.xlsx', sheet_name=None)
+        assert set(log) == {'exceptions', 'runs'} and list(log['runs']['Run']) == ['main']
+        assert sorted(fp.name for fp in step.out_dir.glob('*.xlsx')) == ['h1_Log.xlsx']
     out = sa.saved['h1.pwb']
     assert out['Gen']['MWSetPoint'].round(6).to_dict() == {'xx': 0.0, 'g1': 150.0, 'h1': 100.0}   # h1: left alone.
     assert out['Load']['SMW'].round(6).tolist() == [300.0]
@@ -884,11 +863,103 @@ def test_slack_bus_gens_are_the_swing_when_there_is_no_giant_swing():
     load = loads([('l1', 1, 'Closed', 200.0, 0.0, 0.0, 20.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
     sa = SwingSimAuto(gen, load, slack=[9])
     assert prep.slack_buses(sa) == [9]
-    after_step, log, _ = area.midrun_balancer(sa)
+    after_step, log = area.midrun_balancer(sa)
     scale.iterate_to_gen_load_targets(sa, load_ramp_targets(), after_step=after_step)
     assert len(log) >= 1 and ('Gen', '9') not in sa.applied
     area.balance_swing(sa)
     assert abs(area.swing_mw(sa.table('Gen'), [9])[0]) < area.BALANCE_TOL_MW and ('Gen', '9') not in sa.applied
+
+def ledger_run(mutate=None, slack=(99,)):
+    """Midrun + final balances, a diverging gen (g3, bus 4) and the areas sheet of the result. slack: slack buses (99 has xx)."""
+    gen = gens([('xx', 1, 'xx', 'Closed', '', 0.0, 2e4, -2e4), ('g1', 1, '1', 'Closed', 'GT', 100.0, 1000.0, 0.0),
+                ('g2', 1, '2', 'Closed', 'HY', 100.0, 1000.0, 0.0), ('g3', 1, '3', 'Closed', 'GT', 100.0, 1000.0, 0.0)]
+               ).assign(BusNum=[99, 1, 2, 4], MW=0.0, NomkV=230.0, BusName='b')
+    load = loads([('l1', 1, 'Closed', 200.0, 0.0, 0.0, 20.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
+    epc_gen = gens([('g1', 1, '1', 'Closed', 'GT', 200.0, 1000.0, 0.0), ('g2', 1, '2', 'Closed', 'HY', 150.0, 1000.0, 0.0),
+                    ('g3', 1, '3', 'Closed', 'GT', 200.0, 1000.0, 0.0)])
+    epc_load = loads([('l1', 1, 'Closed', 3200.0, 0.0, 0.0, 320.0)])
+    sa = SwingSimAuto(gen, load, slack=[b for b in slack if b != 99])
+    sa.bad = {'4'}                                              # Any write to g3 diverges: it is held back.
+    targets, reports = area.build_targets({'Load': epc_load, 'Gen': epc_gen}, {'Load': load, 'Gen': gen}, swing_buses=list(slack))
+    after_step, midrun_log = area.midrun_balancer(sa)
+    scale.iterate_to_gen_load_targets(sa, targets, after_step=after_step)
+    tables = []
+    area.balance_swing(sa, targets, tables=tables)
+    assert midrun_log and tables
+    return area.areas(area.read_case(sa), reports, targets, tables, swing_buses=list(slack)), targets
+
+def test_areas_ledger_holds_with_midrun_and_final_balances_and_a_diverging_gen():
+    out, targets = ledger_run()
+    assert out.columns.tolist() == area.AREAS_COLUMNS and out.groupby(['AreaNumber', 'Group']).size().max() == 1
+    ledger = out['Target MW'] - out['Unmet MW'] - out['Not Reached MW'] + out['Balance MW']
+    assert (abs(out['Final MW'] - ledger) < 1e-6).all(), out
+    row = lambda g: out[out['Group'] == g].iloc[0]
+    assert row('Thermal')['Not Reached MW'] > 0 and row('Thermal')['Balance MW'] != 0     # g3 held at 100 of 200 MW; g1 balanced.
+    assert row('Load')['Balance MW'] != 0 and pd.isna(row('Thermal')['Target Mvar']) and row('Load')['Target Mvar'] == 320
+    assert (out['Note'] == '').all() and (out['Online Final'] > 0).all()
+
+def test_areas_before_scaling_has_blank_final_columns():
+    case = gens([('g1', 1, '1', 'Closed', 'GT', 100.0, 1000.0, 0.0)])
+    epc = gens([('g1', 1, '1', 'Closed', 'GT', 150.0, 1000.0, 0.0), ('s1', 1, '2', 'Closed', 'PV', 40.0, 100.0, 0.0)])
+    targets, reports = area.build_targets({'Load': loads([]), 'Gen': epc}, {'Load': loads([]), 'Gen': case})
+    out = area.areas(None, reports)
+    assert out[['Group', 'Target MW', 'Unmet MW']].values.tolist() == [['Solar', 40.0, 40.0], ['Thermal', 150.0, 0.0]]
+    assert out['Final MW'].isna().all() and (out['Not Reached MW'] == 0).all() and out.loc[0, 'Note'] == 'no PWB units'
+
+# ------------------ exceptions and runs sheets ------------------
+def exceptions_run():
+    """ledger_run's case, with the runs collected: main, midrun balances, final balances."""
+    gen = gens([('xx', 1, 'xx', 'Closed', '', 0.0, 2e4, -2e4), ('g1', 1, '1', 'Closed', 'GT', 100.0, 1000.0, 0.0),
+                ('g2', 1, '2', 'Closed', 'HY', 100.0, 1000.0, 0.0), ('g3', 1, '3', 'Closed', 'GT', 100.0, 1000.0, 0.0)]
+               ).assign(BusNum=[99, 1, 2, 4], MW=0.0, NomkV=230.0, BusName='b')
+    load = loads([('l1', 1, 'Closed', 200.0, 0.0, 0.0, 20.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
+    epc_gen = gens([('g1', 1, '1', 'Closed', 'GT', 200.0, 1000.0, 0.0), ('g2', 1, '2', 'Closed', 'HY', 150.0, 1000.0, 0.0),
+                    ('g3', 1, '3', 'Closed', 'GT', 200.0, 1000.0, 0.0)])
+    epc_load = loads([('l1', 1, 'Closed', 3200.0, 0.0, 0.0, 320.0)])
+    sa = SwingSimAuto(gen, load)
+    sa.bad = {'4'}                                              # Any write to g3 diverges: held in main, then excluded.
+    targets, reports = area.build_targets({'Load': epc_load, 'Gen': epc_gen}, {'Load': load, 'Gen': gen}, swing_buses=[99])
+    after_step, midruns = area.midrun_balancer(sa)
+    main = scale.Run('main', scale.iterate_to_gen_load_targets(sa, targets, after_step=after_step))
+    return sa, targets, [main, *midruns, *area.balance_swing(sa, targets)]
+
+def test_exceptions_and_runs_sheets_have_fixed_columns_and_one_row_per_element_and_run():
+    sa, targets, runs = exceptions_run()
+    ex, rs = scale.exceptions(runs, targets, area.read_case(sa)), scale.runs_sheet(runs)
+    assert ex.columns.tolist() == scale.EXCEPTION_COLUMNS and rs.columns.tolist() == scale.RUN_COLUMNS
+    assert not ex.duplicated(['Table', 'ObjectID']).any()
+    assert rs['Run'].tolist() == [r.name for r in runs] and rs['Run'].iloc[0] == 'main' and len(rs) >= 3
+    assert all(n.startswith(('main', 'midrun', 'balance')) and '_' not in n for n in rs['Run'])
+    g3 = ex[ex['ObjectID'] == 'g3'].iloc[0]                     # Excluded in main (still held at the end): one row, Thermal group.
+    assert g3['Table'] == 'Gen' and g3['Group'] == 'Thermal' and g3['AreaNumber'] == 1 and g3['Reason'].startswith('main: ')
+    assert g3['Final MW'] == 100.0 and g3['Target MW'] == 200.0 and g3['Seed MW'] == 100.0
+    assert ex['ObjectID'].tolist() == ['g3'] and rs['Steps'].iloc[0] > 0 and rs['Diverged Steps'].iloc[0] >= 0
+    assert rs['Gen MW Moved'].iloc[0] != rs['Gen MW Moved'].iloc[0] and rs['Gen MW Moved'].iloc[1] != 0   # Main blank, balance filled.
+
+def test_exceptions_join_reasons_from_main_and_a_balance_and_name_the_balance():
+    sa, targets, runs = exceptions_run()
+    bal = runs[-1].moved
+    bal['Gen'].loc['g3', 'ExclusionReason'] = 'Voltage'         # Pretend the last balance excluded g3 too (and g1 for the first time).
+    bal['Gen'].loc['g1', 'ExclusionReason'] = 'Voltage'
+    runs[-1].log = {'gen': bal['Gen'][bal['Gen']['ExclusionReason'] != ''], 'load': bal['Load'].iloc[:0]}
+    ex = scale.exceptions(runs, targets, area.read_case(sa)).set_index('ObjectID')
+    assert ex.loc['g1', 'Reason'] == f'{runs[-1].name}: Voltage'
+    assert ex.loc['g3', 'Reason'] == f'main: {targets["Gen"].loc["g3", "ExclusionReason"]}; {runs[-1].name}: Voltage'
+
+def test_exceptions_list_network_changes_and_target_status_misses():
+    log = {'statcom_bus_df': pd.DataFrame({'BusNum': [5, 6], 'Closed': [True, False]}), 'dropped_branch_df': pd.DataFrame({'ObjectID': ['b1']}),
+           'gen': targets_df(ObjectID=['sw'], BusNum=[1]).assign(ExclusionReason='Swing Unit')}
+    runs = [scale.Run('main', {'dropped_branch_df': pd.DataFrame({'ObjectID': ['b1']}), 'gen': log['gen']}), scale.Run('midrun3', {'statcom_bus_df': log['statcom_bus_df']})]
+    targets = {'Gen': targets_df(ObjectID=['sw', 'g1'], BusNum=[1, 2], Status_Target='Closed', MWSetPoint_Seed=[0.0, 1.0], MWSetPoint_Target=[0.0, 5.0],
+                                 MWSetPoint=[0.0, 5.0]).assign(ExclusionReason=['Swing Unit', '']),
+               'Load': targets_df(ObjectID=[], BusNum=[])}
+    final = {'Gen': pd.DataFrame({'ObjectID': ['sw', 'g1'], 'Status': ['Open', 'Open'], 'MWSetPoint': [0.0, 0.0]}), 'Load': pd.DataFrame({'ObjectID': []})}
+    ex = scale.exceptions(runs, targets, final)
+    assert ex[['Table', 'ObjectID', 'Reason']].values.tolist() == [
+        ['Gen', 'g1', 'not on target status'], ['STATCOM', '5 SC', 'midrun3: STATCOM added'],
+        ['STATCOM', '6 SC', 'midrun3: STATCOM tried, rolled back (not in the case)'], ['Branch', 'b1', 'main: branch opened (collapse)']]
+    assert pd.isna(ex.loc[3, 'AreaNumber']) and ex.loc[0, 'Final Status'] == 'Open' and ex.loc[0, 'Target MW'] == 5.0   # No Swing Unit row.
+    assert scale.exceptions([], None, None).columns.tolist() == scale.EXCEPTION_COLUMNS and len(scale.runs_sheet([])) == 0
 
 # ------------------ settings ------------------
 def test_repo_settings_file_loads():
@@ -947,9 +1018,9 @@ def test_midrun_balance_aims_inside_the_band():
     with saved_settings():
         area.BALANCE_TRIGGER_MW, area.BALANCE_AT_SWING_LIMITS = 1000.0, True
         sa = SwingSimAuto(gen, load)
-        after_step, log, _ = area.midrun_balancer(sa)
+        after_step, log = area.midrun_balancer(sa)
         scale.iterate_to_gen_load_targets(sa, load_ramp_targets(), after_step=after_step)
-    assert len(log) >= 1 and abs(log[0]['Swing MW After'] - 200.0) < 1.0
+    assert len(log) >= 1 and abs(log[0].after - 200.0) < 1.0
 
 def test_final_balance_keeps_the_hour_when_a_round_fails():
     gen, load = swing_case()
@@ -960,11 +1031,10 @@ def test_final_balance_keeps_the_hour_when_a_round_fails():
     saved = scale.iterate_to_gen_load_targets
     scale.iterate_to_gen_load_targets = fails
     try:
-        sheets = area.balance_swing(sa)
+        runs = area.balance_swing(sa)
     finally:
         scale.iterate_to_gen_load_targets = saved
-    rounds = sheets['balance_df']
-    assert rounds['Error'].iloc[0].startswith('Could not solve') and rounds['Round'].iloc[-1] == 'End'
+    assert [r.name for r in runs] == ['balance1'] and runs[0].note.startswith('stopped: Could not solve') and runs[0].after == runs[0].after
 
 def test_step_02_saves_the_case_when_the_log_cannot_be_written():
     gen, load = two_cases()
@@ -973,7 +1043,7 @@ def test_step_02_saves_the_case_when_the_log_cannot_be_written():
         sa = CaseSimAuto({'h1.epc': (gen, load), 'Prepared.pwb': (gen, load)}, slack=[99])
         real = pw.write_excel
         def locked(fp, sheets):
-            if fp.name.endswith('_03_ScaleLog.xlsx'):
+            if fp.name.endswith('_Log.xlsx') and fp.exists():     # Open in Excel at the final write.
                 raise PermissionError(fp)
             return real(fp, sheets)
         step.pw.write_excel = locked
@@ -997,7 +1067,7 @@ def test_adjust_shunts_takes_no_checkpoint_when_nothing_changes():
 def test_midrun_balance_failure_keeps_the_hour_and_its_network_log():
     gen, load = swing_case()
     sa = SwingSimAuto(gen, load)
-    after_step, log, sheets = area.midrun_balancer(sa)
+    after_step, log = area.midrun_balancer(sa)
     run = scale.iterate_to_gen_load_targets
     def balance_fails(SimAuto, targets, **kwargs):
         e = pw.SimAutoError('Could not solve the original input case.')
@@ -1010,8 +1080,10 @@ def test_midrun_balance_failure_keeps_the_hour_and_its_network_log():
     finally:
         scale.iterate_to_gen_load_targets = run
     assert targets['Load'].loc['l1', 'Progress'] == scale.RESOLUTION                 # The main scaling finished.
-    assert log and log[0]['Error'].startswith('Could not solve')
-    assert sheets['midrun1_statcom_bus_df']['BusNum'].tolist() == [7]               # The STATCOM it added is listed.
+    assert log and log[0].note.startswith('stopped: Could not solve')
+    assert log[0].log['statcom_bus_df']['BusNum'].tolist() == [7]                   # The STATCOM it added is listed.
+    ex = scale.exceptions(log, None, None)
+    assert ex[['Table', 'ObjectID', 'BusNum', 'Reason']].values.tolist() == [['STATCOM', '7 SC', 7, 'midrun1: STATCOM added']]
 
 def test_balance_starts_at_the_largest_step():
     log = scale.iterate_to_gen_load_targets(FakeSimAuto(), scaling_targets(gen_status='Closed')[0], initial_step=scale.MAX_STEP)
@@ -1041,12 +1113,115 @@ def test_final_balance_leaves_units_the_main_scaling_excluded():
 def test_midrun_balance_leaves_units_the_main_scaling_excluded():
     gen, load = swing_case()
     sa = SwingSimAuto(gen, load)
-    after_step, log, _ = area.midrun_balancer(sa)
+    after_step, log = area.midrun_balancer(sa)
     targets = load_ramp_targets()
     targets['Gen']['ExclusionReason'] = 'PVQV'                                     # g1: excluded by the main scaling.
     scale.iterate_to_gen_load_targets(sa, targets, after_step=after_step)
     out = sa.table('Gen').set_index('ObjectID')
     assert log and out.loc['g1', 'MWSetPoint'] == 100.0 and out.loc['g2', 'MWSetPoint'] > 100.0
+
+def test_merge_reports_merges_hour_logs():
+    spec = importlib.util.spec_from_file_location('merge_reports', Path(__file__).resolve().parents[1] / '03 Merge Reports.py')
+    merge_reports = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(merge_reports)
+    with tempfile.TemporaryDirectory() as d:
+        out_dir = Path(d) / 'Output'
+        out_dir.mkdir()
+        areas_a = pd.DataFrame({'AreaNumber': [1, 1], 'Group': ['Load', 'Coal'], 'Unmet MW': [1.0, 0.0], 'Not Reached MW': [0.5, 0.0],
+                                'Balance MW': [2.0, 3.0], 'Error MW': [-4.0, 1.0]}).reindex(columns=area.AREAS_COLUMNS)
+        exc_a = pd.DataFrame({'Table': ['Gen', 'STATCOM'], 'ObjectID': ['g1', 'SC1']}).reindex(columns=scale.EXCEPTION_COLUMNS)
+        runs_a = pd.DataFrame({'Run': ['main', 'balance1'], 'Swing MW After': [10.0, 25.0]}).reindex(columns=scale.RUN_COLUMNS)
+        pw.write_excel(out_dir / 'HourA_Log.xlsx', {'areas': areas_a, 'exceptions': exc_a, 'runs': runs_a})
+        runs_b = pd.DataFrame({'Run': ['main'], 'Swing MW After': [7.0]}).reindex(columns=scale.RUN_COLUMNS)
+        pw.write_excel(out_dir / 'HourB_Log.xlsx', {'areas': pd.DataFrame(columns=area.AREAS_COLUMNS),
+                                                    'exceptions': pd.DataFrame(), 'runs': runs_b})
+        target = merge_reports.merge(out_dir)
+        sheets = pd.read_excel(target, sheet_name=None)
+    assert set(sheets) == {'hours', 'areas', 'exceptions', 'runs'}, set(sheets)
+    for name in ('areas', 'exceptions', 'runs'):
+        assert sheets[name].columns[0] == 'Hour', name
+    assert len(sheets['hours']) == 2
+    hours = sheets['hours'].set_index('Hour')
+    assert hours.loc['HourA', 'Final Swing MW'] == 25.0 and hours.loc['HourB', 'Final Swing MW'] == 7.0
+    assert (hours.loc['HourA', 'Balance Gen MW'], hours.loc['HourA', 'Balance Load MW']) == (3.0, 2.0)
+    assert hours.loc['HourA', 'Worst Error MW'] == -4.0
+    assert hours.loc['HourA', 'Exceptions Gen/Load'] == 1 and hours.loc['HourA', 'Exceptions STATCOM'] == 1
+    assert hours.loc['HourB', 'Exceptions Gen/Load'] == 0
+
+def test_step_02_console_is_one_summary_line_per_hour():
+    import contextlib, io
+    gen, load = two_cases()
+    epc_gen = gens([('e1', 1, '1', 'Closed', 'GT', 150.0, 1000.0, 0.0), ('e2', 1, '2', 'Closed', 'HY', 50.0, 1000.0, 0.0)]).assign(BusNum=[1, 2], MW=0.0, NomkV=230.0, BusName='b')
+    epc_load = loads([('e1', 1, 'Closed', 300.0, 0.0, 0.0, 30.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
+    buf = io.StringIO()
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        step = load_step_02(Path(d), 'area')
+        sa = CaseSimAuto({'h1.epc': (epc_gen, epc_load), 'Prepared.pwb': (gen, load)}, slack=[99])
+        with contextlib.redirect_stdout(buf):
+            step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')
+    lines = buf.getvalue().splitlines()
+    summaries = [l for l in lines if 'swing' in l and 'exceptions' in l]
+    assert len(summaries) == 1 and summaries[0].startswith('h1: swing') and 'worst error area' in summaries[0], lines
+    assert not any('Attempting to set' in l or 'Could not set this' in l or 'Opened:' in l for l in lines), lines
+    assert any('Main scaling: 0 -> ' in l and 'of 100' in l for l in lines), lines
+
+def test_areas_ledger_holds_with_a_second_slack_bus():
+    # Bus 2 (hydro g2) is a slack bus beside the giant swing: left out of the areas, its balance moves must be too.
+    out, _ = ledger_run(slack=(99, 2))
+    ledger = out['Target MW'] - out['Unmet MW'] - out['Not Reached MW'] + out['Balance MW']
+    assert (abs(out['Final MW'] - ledger) < 1e-6).all(), out
+
+def test_step_02_log_without_balancing_has_the_end_swing():
+    import contextlib, io
+    gen, load = two_cases()
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        step = load_step_02(Path(d), 'area')
+        step.run['balance_swing'] = False
+        sa = CaseSimAuto({'h1.epc': (gen, load), 'Prepared.pwb': (gen, load)}, slack=[99])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')
+        runs = pd.read_excel(step.out_dir / 'h1_Log.xlsx', sheet_name='runs')
+    assert runs['Run'].tolist() == ['main'] and pd.notna(runs['Swing MW After'].iloc[-1])
+    assert 'swing nan' not in out.getvalue()
+
+def test_step_02_plan_left_by_a_failed_hour_has_nothing_reached_yet():
+    gen, load = two_cases()
+    epc_gen = gens([('e1', 1, '1', 'Closed', 'GT', 150.0, 1000.0, 0.0)]).assign(BusNum=[1], MW=0.0, NomkV=230.0, BusName='b')
+    epc_load = loads([('e1', 1, 'Closed', 300.0, 0.0, 0.0, 30.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
+    def fails(*args, **kwargs):
+        raise pw.SimAutoError('Could not solve the original input case.')
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        step = load_step_02(Path(d), 'area')
+        sa = CaseSimAuto({'h1.epc': (epc_gen, epc_load), 'Prepared.pwb': (gen, load)}, slack=[99])
+        saved = step.scale.iterate_to_gen_load_targets
+        step.scale.iterate_to_gen_load_targets = fails
+        try:
+            step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')
+            assert False
+        except pw.SimAutoError:
+            pass
+        finally:
+            step.scale.iterate_to_gen_load_targets = saved
+        plan = pd.read_excel(step.out_dir / 'h1_Log.xlsx', sheet_name='areas')
+    assert (plan['Not Reached MW'] == 0).all() and (plan['Balance MW'] == 0).all() and plan['Final MW'].isna().all()
+
+def test_step_02_keeps_the_saved_case_when_its_log_cannot_be_built():
+    gen, load = two_cases()
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        step = load_step_02(Path(d), 'area')
+        sa = CaseSimAuto({'h1.epc': (gen, load), 'Prepared.pwb': (gen, load)}, slack=[99])
+        real = step.area.areas
+        def broken(final, *args, **kwargs):
+            if final is not None:
+                raise ValueError('bug in the log')
+            return real(final, *args, **kwargs)
+        step.area.areas = broken
+        try:
+            step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')   # Must not raise.
+        finally:
+            step.area.areas = real
+    assert 'h1.pwb' in sa.saved
 
 if __name__ == '__main__':
     tests = [f for name, f in dict(globals()).items() if name.startswith('test_')]

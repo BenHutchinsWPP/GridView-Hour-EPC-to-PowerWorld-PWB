@@ -113,26 +113,26 @@ def set_df_bisect(SimAuto, table: str, df: pd.DataFrame, fields: list[str], solv
     if len(df) == 0:
         return []
 
-    print(f'Attempting to set {len(df)} {table} parameters at once.')
     with trial(SimAuto, solves=solves) as t:
         set_df(SimAuto, table, df, fields)
     if t.ok:
         return []
 
     if len(df) == 1:
-        print(f'Could not set this {table}:')
-        print(df)
         return [df.index[0]]
 
-    print('Failed to set parameters on all elements at the same time. Bisecting into half the list size.')
     mid = len(df) // 2
     return set_df_bisect(SimAuto, table, df.iloc[:mid], fields, solves) + set_df_bisect(SimAuto, table, df.iloc[mid:], fields, solves)
+
+print_opened = True    # Step 02 turns this off: it opens the seed three times an hour.
+print_solve_errors = True   # Step 02 turns this off: its step lines say which steps diverged.
 
 def open_case(SimAuto, fp):
     if not Path(fp).exists():
         raise FileNotFoundError(fp)
     chk(SimAuto.OpenCase(str(fp)), f'OpenCase {fp}')
-    print(f'Opened: {str(fp)}')
+    if print_opened:
+        print(f'Opened: {str(fp)}')
 
 def save_case(SimAuto, fp, case_format = 'PWB22'):
     if not Path(fp).parent.exists():
@@ -146,7 +146,8 @@ def solve(SimAuto) -> bool:
 
     # Error string. Return early with False if it didn't solve.
     if result[0] != '':
-        print(result[0])
+        if print_solve_errors:
+            print(result[0])
         return False
     run(SimAuto, 'EnterMode(EDIT);')
 

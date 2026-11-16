@@ -12,6 +12,8 @@ cur_dir = Path(__file__).parent
 
 # At import, not under __main__: multiprocessing workers re-import this module, and need the settings too.
 run = settings.load()
+# Quiet the three opens an hour (step 01 keeps the line).
+pw.print_opened = pw.print_solve_errors = False
 
 # ------------------ Inputs ------------------
 gv_dir = cur_dir / 'HourEPCs'
@@ -22,49 +24,84 @@ dummy_bus_fp = cur_dir / 'Prepared' / 'DummyBus.aux'
 # ------------------ Outputs ------------------
 out_dir = cur_dir / 'Output'
 
-def create_case(SimAuto, gv_fp, out_fp):
-    print('targets')
-    if run['mode'] == 'topology':
-        targets, reports = topo.compute_pw_targets(SimAuto, gv_fp, pw_fp, dummy_bus_fp), {}
-    else:
-        targets, reports = area.compute_targets(SimAuto, gv_fp, pw_fp)
-    pw.write_excel(out_dir / (gv_fp.stem + '_01_Target.xlsx'), {**reports, **{table.lower(): df for table, df in targets.items()}})
+def summary_line(hour, log, area_mode):
+    """The hour's one-line result, from the sheets of its log."""
+    runs, exc = log['runs'], log['exceptions']
+    swing = runs['Swing MW After'].iloc[-1] if len(runs) else float('nan')
+    n_statcom, n_branch = int((exc['Table'] == 'STATCOM').sum()), int((exc['Table'] == 'Branch').sum())
+    n_exc = len(exc) - n_statcom - n_branch
+    line = f'{hour}: swing {swing:.1f} MW; {n_exc} exceptions; {n_statcom} STATCOMs, {n_branch} branches opened'
+    if area_mode:
+        err = log['areas']['Error MW'].abs()
+        if err.notna().any():
+            worst = log['areas'].loc[err.idxmax()]
+            line += f'; worst error area {worst["AreaNumber"]} {worst["Group"]} {worst["Error MW"]:.0f} MW'
+    return line
 
+def create_case(SimAuto, gv_fp, out_fp):
+    area_mode = run['mode'] != 'topology'
+    if area_mode:
+        targets, reports = area.compute_targets(SimAuto, gv_fp, pw_fp)
+    else:
+        targets, reports = topo.compute_pw_targets(SimAuto, gv_fp, pw_fp, dummy_bus_fp), {}
+    pretest = []
     if run['pretest_gens']:
-        print('test_gen_targets_parallel')
         gen_df = targets['Gen'] = scale.test_gen_targets_parallel(pw_fp, targets['Gen'])
-        pw.write_excel(out_dir / (gv_fp.stem + '_02_TargetTest.xlsx'), {'gen': gen_df})
         # Exclude generation changes which do not solve successfully on their own.
         scale.exclude(gen_df, ~gen_df['Success'], 'Individual Gen Test Diverged')
+        # Only for the plan written below: the main run's log lists these rows again, once scaling has run.
+        pretest = [scale.Run('pretest', {'gen': gen_df[~gen_df['Success']]})]
+    log_fp = out_dir / (gv_fp.stem + '_Log.xlsx')
 
-    print('iterate_to_gen_load_targets')
+    def build_log(runs, final, balance_tables=(), swing_buses=(), exception_runs=()):
+        log = {'exceptions': scale.exceptions([*exception_runs, *runs], targets, final), 'runs': scale.runs_sheet(runs)}
+        if area_mode:
+            # Before scaling (final None) nothing has been reached or balanced yet: the plan alone.
+            scaled = targets if final is not None else None
+            log = {'areas': area.areas(final, reports, scaled, balance_tables, swing_buses), **log}
+        return log
+
+    # The plan first, so that a failure during the hour's long scaling still leaves it.
+    try:
+        pw.write_excel(log_fp, build_log([], None, exception_runs=pretest))
+    except Exception as e:     # Never lose the hour over its log.
+        print(f'WARNING: could not write {log_fp.name} (open in Excel?): {e!r}.')
+
     scale.report_gen_load_balance(targets)
     pw.open_case(SimAuto, pw_fp)
-    if run['mode'] == 'area':
+    if area_mode:
         # Open loads aren't scaled, but their distributed generation is set Open & 0 too.
         case_load = pw.get_df(SimAuto, 'Load', area.LOAD_FIELDS)
         pw.set_df(SimAuto, 'Load', area.open_load_cleanup(case_load), ['BusNum', 'ID', 'DistStatus', 'DistMWInput', 'DistMvarInput'])
     pvqv = pd.read_csv(pvqv_fp) if run['use_pvqv'] else None
+    balance_tables = []
+    slack = prep.slack_buses(SimAuto)
+    swing = lambda: area.swing_mw(pw.get_df(SimAuto, 'Gen', area.GEN_FIELDS), slack)[0]
+    before = swing()
+    midrun_runs = []
     if run['balance_swing']:
         # Balance the swing whenever it drifts far during scaling, and again at the end.
-        after_step, midrun_log, midrun_sheets = area.midrun_balancer(SimAuto)
+        after_step, midrun_runs = area.midrun_balancer(SimAuto)
         log = scale.iterate_to_gen_load_targets(SimAuto, targets, pvqv, after_step)
-        log['midrun_balance_df'] = pd.DataFrame(midrun_log)
-        log.update(midrun_sheets)
-        log.update(area.balance_swing(SimAuto, targets))
     else:
         log = scale.iterate_to_gen_load_targets(SimAuto, targets, pvqv)
-    if reports:
-        # Read back from PowerWorld, so the report shows what the case holds rather than what the scaling meant to do.
-        log = {**area.achieved(area.read_case(SimAuto), reports, prep.slack_buses(SimAuto)), **log}
+    # Main last of the runs during scaling (its midrun balances happened inside it), so its After is where scaling left
+    # the swing; the final balance rounds follow. The last row's After is where the swing ended.
+    runs = [*midrun_runs, scale.Run('main', log, before=before, after=swing())]
+    if run['balance_swing']:
+        runs += area.balance_swing(SimAuto, targets, tables=balance_tables)
+    # Read back from PowerWorld, so the log shows what the case holds rather than what the scaling meant to do.
+    final = area.read_case(SimAuto) if area_mode else {t: pw.get_df(SimAuto, t, f) for t, f in topo.TARGET_FIELDS.items()}
+    swing_buses = prep.slack_buses(SimAuto)
     if not pw.solve(SimAuto):
         print('WARNING: the case does not solve at the end of scaling. Saved as it is.')
-    # Save the case first: a log which can't be written (e.g. open in Excel) mustn't cost the solved hour.
+    # Save the case first: a log which can't be built or written (e.g. open in Excel) mustn't cost the solved hour.
     pw.save_case(SimAuto, out_fp, run['case_format'])
-    log_fp = out_dir / (gv_fp.stem + '_03_ScaleLog.xlsx')
     try:
-        pw.write_excel(log_fp, scale.merge_network_changes(log))
-    except OSError as e:
+        log = build_log(runs, final, balance_tables, swing_buses)
+        print(summary_line(gv_fp.stem, log, area_mode))
+        pw.write_excel(log_fp, log)
+    except Exception as e:     # Never lose the hour over its log.
         print(f'WARNING: could not write {log_fp.name} (open in Excel?): {e!r}. The case was saved; '
               f'delete {out_fp.name} to rerun this hour with its log.')
 
@@ -76,11 +113,13 @@ if(__name__=='__main__'):
         raise SystemExit(f'use_pvqv needs {pvqv_fp}: run step 01 with compute_pvqv = true.')
     # Created here, not at import: multiprocessing workers re-import this module.
     SimAuto = pw.connect()
-    for gv_fp in sorted(gv_dir.glob('*.epc')):
+    gv_fps = sorted(gv_dir.glob('*.epc'))
+    for n, gv_fp in enumerate(gv_fps, 1):
         out_fp = out_dir / (gv_fp.stem + '.pwb')
         if out_fp.exists():
             print(f'Skipping {gv_fp.name}: {out_fp.name} already exists. Delete it to re-run.')
             continue
+        print(f'=== {gv_fp.name} ({n} of {len(gv_fps)}) ===')
         # Keep going with the remaining hours if one fails.
         try:
             create_case(SimAuto, gv_fp, out_fp)

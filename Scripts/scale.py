@@ -10,8 +10,10 @@ Gens and loads are handled by the same code. Their working tables ("targets") ar
     HeldReason       '' while the row is scaled. Otherwise, why it is held back for now (it is retried later).
     ExclusionReason  '' while the row is scaled or held. Otherwise, why it was excluded for good.
 """
+from dataclasses import dataclass, field
 from pathlib import Path
 import multiprocessing as mp
+import numpy as np
 import pandas as pd
 from . import pw, prep
 
@@ -109,7 +111,7 @@ def test_gen_targets_parallel(pw_fp: Path, gen_df: pd.DataFrame) -> pd.DataFrame
     return pd.concat(results).sort_values(by='Success')
 
 def report_gen_load_balance(targets: dict[str,pd.DataFrame]) -> pd.DataFrame:
-    """Prints total gen, dist gen & load MW for the base and target cases, and warns if the target imbalance is high."""
+    """Prints seed and target gen and load MW in one line, and warns if the target imbalance is high."""
     gen_df, load_df = targets['Gen'], targets['Load']
     def totals(suffix):
         gen_mw = gen_df['MWSetPoint' + suffix].sum()
@@ -121,13 +123,13 @@ def report_gen_load_balance(targets: dict[str,pd.DataFrame]) -> pd.DataFrame:
         {'Base Case': totals(''), 'Target Case': totals('_Target')}
         ,index=['Gen MW', 'Dist Gen MW', 'Load MW', 'Gen + Dist Gen - Load']
     )
-    print(total_delta_df.round(0))
+    base, target = total_delta_df['Base Case'], total_delta_df['Target Case']
+    print(f'Seed gen {base["Gen MW"]:,.0f} / load {base["Load MW"]:,.0f} MW; '
+          f'target gen {target["Gen MW"]:,.0f} / load {target["Load MW"]:,.0f} MW')
 
     base_total_delta, target_total_delta = total_delta_df.iloc[-1]
     if abs(target_total_delta) > 1.5 * abs(base_total_delta):
-        print('-----------------------------------------------------------------------------------')
         print('WARNING: Gen/Load imbalance in the target case is high. This may cause instability.')
-        print('-----------------------------------------------------------------------------------')
 
     return total_delta_df
 
@@ -179,7 +181,7 @@ def apply_or_exclude(SimAuto, table: str, df: pd.DataFrame, new_df: pd.DataFrame
     failed = apply_rows(SimAuto, table, df, new_df)
     exclude(df, df.index.isin(failed), reason)
 
-def close_all_related_gen_load(SimAuto, targets):
+def close_all_related_gen_load(SimAuto, targets, label='Main scaling'):
     """
     Closes included gens & loads which are open now but closed in the target, at 0 MW / 0 Mvar.
     Does nothing (and prints nothing) when no status changes, as in a balance.
@@ -193,10 +195,10 @@ def close_all_related_gen_load(SimAuto, targets):
             new_df.loc[to_close, status] = 'Closed'
             changed |= to_close
         if changed.any():
-            print(f'close_all_related_gen_load(): closing {changed.sum()} {table} at 0 MW.')
+            print(f'{label}: closing {changed.sum()} {table.lower()}s in at 0 MW')
         apply_or_exclude(SimAuto, table, df, new_df[changed], 'Diverged closing at 0 MW')
 
-def set_gen_load_status(SimAuto, targets):
+def set_gen_load_status(SimAuto, targets, label='Main scaling'):
     """
     Sets included gens & loads to their final target statuses. Rows which diverge are excluded.
     Only rows whose status changes are written, so a balance (no status changes) writes and solves nothing.
@@ -210,7 +212,7 @@ def set_gen_load_status(SimAuto, targets):
         changed = pd.concat([new_df[s] != df.loc[new_df.index, s] for s in STATUS[table]], axis=1).any(axis=1)
         new_df = new_df[changed]
         if len(new_df):
-            print(f'set_gen_load_status(): {len(new_df)} {table} change status.')
+            print(f'{label}: {len(new_df)} {table.lower()}s change status')
         apply_or_exclude(SimAuto, table, df, new_df, 'Diverged setting final status')
 
 def mark_start(targets):
@@ -245,7 +247,7 @@ def rescale(df: pd.DataFrame, factor: pd.Series, cols: list[str], cap: pd.Series
             df.loc[f.index, name] = new
 
 # ------------------ Voltage support ------------------
-def create_statcom_on_lowestv_bus(SimAuto, skip_buses):
+def create_statcom_on_lowestv_bus(SimAuto, skip_buses, label='Main scaling'):
     """
     If there is a bus with voltage lower than STATCOM_VPU, adds a STATCOM to the lowest voltage bus.
     Returns None if no bus needs one, otherwise (bus number, whether the STATCOM closed in successfully).
@@ -272,7 +274,6 @@ def create_statcom_on_lowestv_bus(SimAuto, skip_buses):
 
     min_row = filtered_df.loc[filtered_df['Vpu'].idxmin()]
     number = int(min_row['Number'])
-    print(f'Adding statcom to: {number}, kV={min_row["BusNomVolt"]}, Vpu={min_row["Vpu"]}')
 
     # Create a STATCOM, Closed. Roll back if it doesn't solve.
     statcom_dict = {
@@ -294,12 +295,11 @@ def create_statcom_on_lowestv_bus(SimAuto, skip_buses):
     with pw.trial(SimAuto) as t:
         with pw.creating(SimAuto):
             pw.set_df(SimAuto, 'Gen', statcom_df, list(statcom_dict))
-    if not t.ok:
-        print('WARNING: Did not solve with the STATCOM in. Rolled back change.')
+    print(f'{label}: STATCOM on bus {number} ({min_row["Vpu"]:.2f} pu): {"closed" if t.ok else "rolled back"}')
 
     return (number, t.ok)
 
-def drop_collapsed_sections(SimAuto) -> list[str]:
+def drop_collapsed_sections(SimAuto, label='Main scaling') -> list[str]:
     """
     Disconnects network sections which are beginning to show collapse.
     I.e. opens branches connecting from buses with OK voltage (>COLLAPSE_VPU) to buses with awful voltage (<COLLAPSE_VPU).
@@ -311,15 +311,15 @@ def drop_collapsed_sections(SimAuto) -> list[str]:
         return []
 
     dropped = filtered_df['ObjectID'].unique().tolist()
-    print(f'Dropping branches to collapsed network sections: {dropped}')
     with pw.trial(SimAuto) as t:
         pw.set_df(SimAuto, 'Branch', filtered_df.assign(Status='Open'), ['ObjectID', 'Status'])
         result = SimAuto.RunScriptCommand('ClearSmallIslands;')
         if result[0]:
             print(f'WARNING: ClearSmallIslands: {result[0]}')
     if not t.ok:
-        print('WARNING: Did not solve after dropping branches. Rolled back change.')
+        print(f'{label}: opening {len(dropped)} branches into collapsed sections: rolled back')
         return []
+    print(f'{label}: opened {len(dropped)} branches into collapsed sections')
     return dropped
 
 # ------------------ Scaling ------------------
@@ -374,19 +374,133 @@ def retry_held(SimAuto, targets, label: str):
         mask = held(df)
         df.loc[mask, 'ExclusionReason'] = df.loc[mask, 'HeldReason']
 
-NETWORK_CHANGE_SHEETS = ('statcom_bus_df', 'dropped_branch_df')
+# ------------------ Run collection ------------------
+@dataclass
+class Run:
+    """
+    One scaling run, for the `exceptions` and `runs` sheets.
+    name: 'main', 'midrun<N>' or 'balance<N>'. log: what iterate_to_gen_load_targets() returned (or the error's `.log`).
+    moved: a balance's balance_targets() tables, after scaling (None for the main run). before / after: the swing's MW
+    around the run (NaN: not measured). at: a midrun balance's main progress, e.g. '50 of 100'. note: short flags.
+    """
+    name: str
+    log: dict = field(default_factory=dict)
+    moved: dict | None = None
+    before: float = np.nan
+    after: float = np.nan
+    at: str = ''
+    note: str = ''
 
-def merge_network_changes(log: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+EXCEPTION_COLUMNS = ['Table', 'ObjectID', 'AreaNumber', 'Group', 'BusNum', 'Seed MW', 'Target MW', 'Final MW', 'Final Status', 'Reason']
+RUN_COLUMNS = ['Run', 'At', 'Swing MW Before', 'Swing MW After', 'Gen MW Moved', 'Load MW Moved', 'Steps', 'Diverged Steps', 'Note']
+_P = ['SMW', 'IMW', 'ZMW']
+
+def _by_id(df: pd.DataFrame) -> pd.DataFrame:
+    return df.set_index('ObjectID') if 'ObjectID' in df.columns else df
+
+def _mw(table: str, df: pd.DataFrame, suffix: str = '') -> pd.Series:
+    """Gen MWSetPoint, or Load SMW + IMW + ZMW (the columns present), each with `suffix`."""
+    if table == 'Gen':
+        return df[f'MWSetPoint{suffix}']
+    return df[[f'{c}{suffix}' for c in _P if f'{c}{suffix}' in df.columns]].sum(axis=1)
+
+def _element_info(table: str, df: pd.DataFrame) -> dict:
+    """{ObjectID: AreaNumber, Group, BusNum, Seed MW, Target MW} of a targets table (blank where the table lacks it)."""
+    if not len(df):
+        return {}
+    from . import area      # Not at import: area imports this module.
+    nan = pd.Series(np.nan, index=df.index)
+    if table == 'Gen':
+        seed = df['MWSetPoint_Seed'] if 'MWSetPoint_Seed' in df else nan
+        group = area.classify_gen_type(df) if {'UnitTypeCode', 'FuelTypeCode'} <= set(df.columns) else pd.Series('', index=df.index)
+        target = df['Planned MW'] if 'Planned MW' in df else df['MWSetPoint_Target'] if 'MWSetPoint_Target' in df else nan
+    else:
+        seed = df['P_Seed'] if 'P_Seed' in df else _mw(table, df, '_Seed') if f'{_P[0]}_Seed' in df else nan
+        group = pd.Series('Load', index=df.index)
+        target = df['Planned MW'] if 'Planned MW' in df else _mw(table, df, '_Target') if f'{_P[0]}_Target' in df else nan
+    frame = pd.DataFrame({'AreaNumber': df['AreaNumber'] if 'AreaNumber' in df else nan, 'Group': group,
+                          'BusNum': df['BusNum'] if 'BusNum' in df else nan, 'Seed MW': seed, 'Target MW': target})
+    return frame.to_dict('index')
+
+def exceptions(runs: list[Run], targets: dict[str, pd.DataFrame] | None = None, final: dict[str, pd.DataFrame] | None = None) -> pd.DataFrame:
     """
-    The scale log with every run's STATCOMs and dropped branches in one sheet each, so none are missed in review.
-    Balances keep theirs as `<run>_statcom_bus_df` etc.; these become rows with Run = '<run>' ('main' for the main scaling).
+    The `exceptions` sheet (EXCEPTION_COLUMNS): a row per gen, load, STATCOM or opened branch not left on plan.
+    Reason: '<run>: <reason>' for each run which excluded it or changed the network, joined by '; ' in run order.
+    Gens/loads whose final status differs from their target (main `targets`) with no other reason get 'not on target status'.
+    The swing ('Swing Unit') is left out. targets: the main scaling's tables (Seed, Target; None: blank). final: read_case()
+    tables of the scaled case, with ObjectID, Status and MW (None: Final columns blank).
     """
-    log = dict(log)
-    for name in NETWORK_CHANGE_SHEETS:
-        runs = {k: log.pop(k) for k in list(log) if k == name or k.endswith('_' + name)}
-        parts = [df.assign(Run=k.removesuffix(name).rstrip('_') or 'main') for k, df in runs.items() if len(df)]
-        log[name] = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
-    return log
+    reasons: dict[tuple, list[str]] = {}
+    network: dict[tuple, dict] = {}
+    for run in runs:
+        for table in ('Gen', 'Load'):
+            df = run.log.get(table.lower())
+            if df is None or not len(df):
+                continue
+            for oid, reason in df['ExclusionReason'].items():
+                if reason and reason != 'Swing Unit':
+                    reasons.setdefault((table, oid), []).append(f'{run.name}: {reason}')
+        sc = run.log.get('statcom_bus_df')
+        if sc is not None and 'BusNum' in sc.columns:
+            for bus, closed in zip(sc['BusNum'], sc['Closed']):
+                key = ('STATCOM', f'{bus} {STATCOM_ID}')
+                reasons.setdefault(key, []).append(f'{run.name}: ' + ('STATCOM added' if closed else 'STATCOM tried, rolled back (not in the case)'))
+                network[key] = {'BusNum': bus, 'Final Status': 'Closed' if closed else ''}
+        br = run.log.get('dropped_branch_df')
+        if br is not None and 'ObjectID' in br.columns:
+            for oid in br['ObjectID']:
+                reasons.setdefault(('Branch', oid), []).append(f'{run.name}: branch opened (collapse)')
+                network[('Branch', oid)] = {'Final Status': 'Open'}
+
+    finals = {t: _by_id(df) for t, df in (final or {}).items()}
+    info: dict[str, dict] = {}
+    for table in ('Gen', 'Load'):
+        sources = [] if targets is None or table not in targets else [targets[table]]
+        sources += [r.log[table.lower()] for r in runs if table.lower() in r.log]
+        info[table] = {}
+        for df in sources:
+            for oid, v in _element_info(table, df).items():
+                info[table].setdefault(oid, v)
+        if targets is not None and table in targets and table in finals and 'Status_Target' in targets[table]:
+            t, f = targets[table], finals[table]
+            common = t.index.intersection(f.index)
+            off = (t.loc[common, 'Status_Target'] != f.loc[common, 'Status']) & (t.loc[common, 'ExclusionReason'] != 'Swing Unit')
+            for oid in common[off.to_numpy()]:
+                reasons.setdefault((table, oid), ['not on target status'])
+
+    rows = []
+    for key in sorted(reasons, key=lambda k: ('Gen', 'Load', 'STATCOM', 'Branch').index(k[0])):
+        table, oid = key
+        row = {'Table': table, 'ObjectID': oid, 'AreaNumber': pd.NA, 'Group': '', 'BusNum': pd.NA, 'Seed MW': np.nan,
+               'Target MW': np.nan, 'Final MW': np.nan, 'Final Status': '', **network.get(key, {}), **info.get(table, {}).get(oid, {})}
+        if table in finals and oid in finals[table].index:
+            f = finals[table].loc[[oid]]
+            row['Final MW'], row['Final Status'] = float(_mw(table, f).iloc[0]), f['Status'].iloc[0]
+        row['Reason'] = '; '.join(dict.fromkeys(reasons[key]))
+        rows.append(row)
+    out = pd.DataFrame(rows, columns=EXCEPTION_COLUMNS)
+    for c in ('AreaNumber', 'BusNum'):
+        out[c] = pd.to_numeric(out[c]).astype('Int64')
+    for c in ('Seed MW', 'Target MW', 'Final MW'):
+        out[c] = out[c].astype(float)
+    return out
+
+def runs_sheet(runs: list[Run]) -> pd.DataFrame:
+    """The `runs` sheet (RUN_COLUMNS): a row per scaling run. MW moved: balances only (area.mw_changes())."""
+    from . import area
+    rows = []
+    for run in runs:
+        moved = area.mw_changes(run.moved) if run.moved is not None else {}
+        steps = run.log.get('step_df')
+        has = steps is not None and 'Result' in steps.columns
+        rows.append({'Run': run.name, 'At': run.at, 'Swing MW Before': run.before, 'Swing MW After': run.after,
+                     'Gen MW Moved': moved.get('Gen MW Change', np.nan), 'Load MW Moved': moved.get('Load MW Change', np.nan),
+                     'Steps': len(steps) if has else 0, 'Diverged Steps': int((steps['Result'] != 'Solved').sum()) if has else 0,
+                     'Note': run.note})
+    out = pd.DataFrame(rows, columns=RUN_COLUMNS)
+    for c in ('Swing MW Before', 'Swing MW After', 'Gen MW Moved', 'Load MW Moved'):
+        out[c] = out[c].astype(float)
+    return out
 
 def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None, label='Main scaling',
                                 initial_step=None) -> dict[str,pd.DataFrame]:
@@ -413,7 +527,7 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None,
         for df in targets.values():
             exclude(df, df['BusNum'].isin(pvqv_buses), 'PVQV')
     hold_voltage(targets, bus_vpu(SimAuto))
-    close_all_related_gen_load(SimAuto, targets)
+    close_all_related_gen_load(SimAuto, targets, label)
     mark_start(targets)
 
     prep.adjust_shunts(SimAuto)     # Leaves the case solved: each change is kept only if it solves.
@@ -440,7 +554,6 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None,
         while progress < RESOLUTION:
             step = min(step, RESOLUTION - progress)
             goal = progress + step
-            print(f'----- {label}: {progress} -> {goal} of {RESOLUTION} -----')
             new = {table: at_progress(table, df[scaling(df)], goal) for table, df in targets.items()}
             with pw.trial(SimAuto, solves=STEP_SOLVES) as t:
                 for table, new_df in new.items():
@@ -450,13 +563,12 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None,
                     targets[table].loc[new_df.index, new_df.columns] = new_df
                 result = 'Solved'
             elif step > 1:
-                print('Did not solve. Halving the step.')
+                print(f'{label}: {progress} -> {goal} of {RESOLUTION}: diverged, halving')
                 log(progress, goal, 'Diverged, halved step')
                 failed_step = failed_step or step
                 step //= 2
                 continue
             else:
-                print('Did not solve at the smallest step. Bisecting to find the gens/loads which diverge, and holding them back.')
                 for table, new_df in new.items():
                     df = targets[table]
                     hold(df, df.index.isin(apply_rows(SimAuto, table, df, new_df, STEP_SOLVES)), 'Diverged during scaling')
@@ -465,9 +577,12 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None,
 
             prep.adjust_shunts(SimAuto)
             hold_voltage(targets, bus_vpu(SimAuto))
+            held_now = sum(int(held(df).sum()) for df in targets.values())
+            outcome = result.lower() + (f' ({held_now} held)' if held_now else '')
+            print(f'{label}: {start} -> {goal} of {RESOLUTION}: {outcome}')
             if DROP_COLLAPSED:
-                dropped_branches += drop_collapsed_sections(SimAuto)
-            statcom = ADD_STATCOMS and create_statcom_on_lowestv_bus(SimAuto, skip_buses=list(statcoms))
+                dropped_branches += drop_collapsed_sections(SimAuto, label)
+            statcom = ADD_STATCOMS and create_statcom_on_lowestv_bus(SimAuto, skip_buses=list(statcoms), label=label)
             if statcom:
                 statcoms[statcom[0]] = statcom[1]
             log(start, goal, result, catch_up(SimAuto, targets, progress, step, bisect=False))
@@ -480,12 +595,12 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None,
             failed_step = None
 
         retry_held(SimAuto, targets, label)
-        set_gen_load_status(SimAuto, targets)
+        set_gen_load_status(SimAuto, targets, label)
     except pw.SimAutoError as e:
         # What this run did so far (STATCOMs, dropped branches) stays in the case: hand its log to the caller.
         e.log = package()
         raise
 
-    print(f'----- {label}: done -----')
+    print(f'{label}: done')
 
     return package()
