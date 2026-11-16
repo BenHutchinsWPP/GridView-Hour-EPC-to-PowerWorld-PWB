@@ -250,6 +250,8 @@ OFF_AT_ZERO_TYPES = {'Wind', 'Solar'}
 # scaling up brings on offline units which are online in the EPC first, then the biggest;
 # scaling down takes off online units which are offline in the EPC first, then the smallest.
 COMMIT_MAX_CF = 0.9
+# Warn when a group is scaled below this fraction of its basis: its units stay online at low output (maybe under MWMin).
+LOW_FACTOR_WARNING = 0.3
 
 def commit(rows: pd.DataFrame, target: float, gen_type: str, epc_online: set) -> pd.Series:
     """
@@ -292,11 +294,13 @@ def commit(rows: pd.DataFrame, target: float, gen_type: str, epc_online: set) ->
 def dispatch_bucket(rows: pd.DataFrame, target: float, gen_type: str, epc_online: set) -> tuple[pd.Series, pd.Series, str]:
     """
     (Status_Target, MWSetPoint_Target, method) of one (area, GenType) bucket's units, from their basis (gen_targets()).
-    'Key basis': the online units' basis MW is scaled by one factor to the target, capped at MWMax (the rest spread over
+    'Scaled': the online units' basis MW is scaled by one factor to the target, capped at MWMax (the rest spread over
     the others). Any MW still left brings offline units online by commit() and shares it over them by capacity.
-    'Capacity': for a bucket with no unit whose key is in the EPC, or nothing to scale (target 0, nothing online, or the
-    opposite sign): units are committed by commit() and share the target in proportion to MWMax (|MWMin| for a negative
-    target), following each GenType's dispatch rules.
+    'Capacity': only when there is nothing to scale (target 0, or no online basis MW in the target's direction):
+    units are committed by commit() and share the target in proportion to MWMax (|MWMin| for a negative target),
+    following each GenType's dispatch rules.
+    (Every group scales from its basis, keys or not: decided by Fable 2026-11-15. The seed dispatch is a solved operating
+    point, scaling it stays close to that, and one rule for all groups is predictable.)
     Units with a basis of the opposite sign (e.g. storage charging in a generating bucket) keep it.
     """
     status = rows['Basis Status'].copy()
@@ -307,7 +311,11 @@ def dispatch_bucket(rows: pd.DataFrame, target: float, gen_type: str, epc_online
     against = basis.where(basis * sign < 0, 0.0)        # Kept as it is.
     want = abs(target - against.sum())
 
-    if target != 0 and along.sum() > 0 and (rows['Method'] == 'Key').any():
+    if target != 0 and along.sum() > 0:
+        factor = want / along.sum()
+        if factor < LOW_FACTOR_WARNING:
+            print(f'WARNING: area {rows["AreaNumber"].iloc[0]} {gen_type} scaled to {factor:.0%} of its basis; '
+                  f'its units stay online at low output.')
         mw = against + sign * proportional_fill(want, along, cap.where(cap > along, along))
         left = want - (mw - against).abs().sum()
         if left > 1e-6 and COMMIT:
@@ -316,7 +324,7 @@ def dispatch_bucket(rows: pd.DataFrame, target: float, gen_type: str, epc_online
             extra = extra[extra].index
             mw[extra] = sign * capacity_share(left, cap[extra])
             status[extra] = 'Closed'
-        return status, mw, 'Key basis'
+        return status, mw, 'Scaled'
 
     if COMMIT:
         status = pd.Series(np.where(commit(rows.assign(Status=status), target, gen_type, epc_online), 'Closed', 'Open'),

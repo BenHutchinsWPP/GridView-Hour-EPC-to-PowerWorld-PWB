@@ -268,7 +268,7 @@ def gens(rows):
     return df.assign(BusNum=1, FuelTypeCode='')
 
 def test_gen_targets():
-    case = gens([('h1', 1, '1', 'Closed', 'HY', 10.0, 100.0, 0.0), ('h2', 1, '2', 'Closed', 'HY', 10.0, 300.0, 0.0),
+    case = gens([('h1', 1, '1', 'Closed', 'HY', 0.0, 100.0, 0.0), ('h2', 1, '2', 'Closed', 'HY', 0.0, 300.0, 0.0),
                  ('w1', 1, '3', 'Closed', 'WT', 0.0, 50.0, 0.0), ('w2', 1, '4', 'Closed', 'WT', 0.0, 50.0, 0.0),
                  ('b1', 1, '5', 'Closed', 'BA', 0.0, 20.0, -20.0), ('b2', 1, '6', 'Closed', 'BA', 0.0, 60.0, -60.0),
                  ('t1', 1, '7', 'Closed', 'GT', 80.0, 100.0, 20.0), ('to', 1, '8', 'Open', 'GT', 0.0, 100.0, 0.0),
@@ -354,7 +354,7 @@ def test_achieved_reads_the_final_case_and_open_load_cleanup():
 def test_area_targets_through_the_engine():
     case = loads([('l1', 1, 'Closed', 60.0, 20.0, 20.0, 10.0), ('l2', 1, 'Closed', 100.0, 0.0, 0.0, 10.0)])
     epc = loads([('e1', 1, 'Closed', 300.0, 0.0, 0.0, 40.0)])
-    case_gen = gens([('h1', 1, '1', 'Closed', 'HY', 10.0, 100.0, 0.0), ('h2', 1, '2', 'Closed', 'HY', 10.0, 300.0, 0.0)])
+    case_gen = gens([('h1', 1, '1', 'Closed', 'HY', 0.0, 100.0, 0.0), ('h2', 1, '2', 'Closed', 'HY', 0.0, 300.0, 0.0)])
     epc_gen = gens([('e1', 1, '1', 'Closed', 'HY', 200.0, 500.0, 0.0)])
     targets, _ = area.build_targets({'Load': epc, 'Gen': epc_gen}, {'Load': case, 'Gen': case_gen})
     sa = FakeSimAuto()
@@ -392,8 +392,10 @@ def thermal_case():
                  ('sc', 1, '5', 'Closed', 'SC', 0.0, 0.0, 0.0)])
 
 def test_thermal_scaling_up_brings_biggest_units_on_first():
-    # No key in the EPC: thermal target 250 MW with 100 MW online, so the biggest (g2) comes on.
-    df, report = area.gen_targets(gens([('e1', 1, '9', 'Closed', 'CC', 250.0, 300.0, 0.0)]), thermal_case())
+    # Nothing to scale (g1 online at 0 MW): the dispatch rules. Target 250 MW with 100 MW online, so the biggest (g2) comes on.
+    case = thermal_case()
+    case.loc[case['ObjectID'] == 'g1', 'MWSetPoint'] = 0.0
+    df, report = area.gen_targets(gens([('e1', 1, '9', 'Closed', 'CC', 250.0, 300.0, 0.0)]), case)
     assert df['Status_Target'].to_dict() == {'g1': 'Closed', 'g2': 'Closed', 'sc': 'Closed'}
     r = report.set_index(['AreaNumber', 'GenType'])
     assert r.loc[(1, 'Thermal'), ['Committed', 'Decommitted', 'Unmet MW', 'Method']].tolist() == [1, 0, 0, 'Capacity']
@@ -407,7 +409,15 @@ def test_key_basis_scales_the_whole_group():
     assert df['MWSetPoint_Target'].to_dict() == {'g1': 62.5, 'g3': 187.5, 'sc': 0.0}
     assert df['Method'].to_dict() == {'g1': 'Seed', 'g3': 'Key', 'sc': 'Seed'}
     r = report.set_index(['AreaNumber', 'GenType'])
-    assert r.loc[(1, 'Thermal'), ['Method', 'Basis MW', 'Key Gens', 'Unmet MW']].tolist() == ['Key basis', 200.0, 1, 0.0]
+    assert r.loc[(1, 'Thermal'), ['Method', 'Basis MW', 'Key Gens', 'Unmet MW']].tolist() == ['Scaled', 200.0, 1, 0.0]
+
+def test_group_with_no_key_scales_from_seed():
+    # Decided by Fable 2026-11-15: no unit's key is in the EPC, so the seed dispatch (60 / 40) is scaled to the 50 MW target.
+    case = gens([('g1', 1, '1', 'Closed', 'GT', 60.0, 100.0, 0.0), ('g2', 1, '2', 'Closed', 'GT', 40.0, 100.0, 0.0),
+                 ('g3', 1, '3', 'Open', 'GT', 0.0, 500.0, 0.0)])
+    df, report = area.gen_targets(gens([('e1', 1, '9', 'Closed', 'GT', 50.0, 300.0, 0.0)]), case)
+    assert df['MWSetPoint_Target'].to_dict() == {'g1': 30.0, 'g2': 20.0} and (df['Status_Target'] == 'Closed').all()
+    assert report['Method'].tolist() == ['Scaled']
 
 def test_key_basis_at_mwmax_commits_more_units():
     # Target 400 from a basis of 200: g1 and g3 reach MWMax (100 + 200); the last 100 MW brings on the biggest offline unit.
@@ -427,7 +437,7 @@ def test_thermal_scaling_down_takes_smallest_units_off_first():
     case = gens([('g1', 1, '1', 'Closed', 'GT', 100.0, 100.0, 0.0), ('g2', 1, '2', 'Closed', 'ST', 200.0, 200.0, 0.0),
                  ('g3', 1, '3', 'Closed', 'CC', 300.0, 300.0, 0.0)])
     epc = gens([('e1', 1, '9', 'Closed', 'GT', 200.0, 300.0, 0.0)])
-    df, _ = area.gen_targets(epc, case)
+    df, _ = area.gen_targets(epc, case.assign(MWSetPoint=0.0))      # Online at 0 MW: nothing to scale, dispatch rules.
     assert df['Status_Target'].to_dict() == {'g1': 'Open', 'g2': 'Open', 'g3': 'Closed'}
     assert df['MWSetPoint_Target'].to_dict() == {'g1': 0.0, 'g2': 0.0, 'g3': 200.0}
     # With a key in the EPC (g1 at 100 MW), the group scales from its basis instead: all stay on, by 280 / 600.
@@ -489,7 +499,7 @@ def test_build_targets_leaves_slack_bus_gens_out_of_both_cases():
     case = gens([('s1', 1, '1', 'Closed', 'GT', 300.0, 500.0, 0.0), ('g1', 1, '2', 'Closed', 'GT', 80.0, 100.0, 0.0)]).assign(BusNum=[5, 6])
     targets, reports = area.build_targets({'Load': loads([]), 'Gen': case}, {'Load': loads([]), 'Gen': case}, swing_buses=[5])
     assert targets['Gen'].index.tolist() == ['g1'] and targets['Gen'].loc['g1', 'MWSetPoint_Target'] == 80
-    assert reports['area_gen']['Method'].tolist() == ['Key basis'] and reports['area_gen']['Unmet MW'].tolist() == [0.0]
+    assert reports['area_gen']['Method'].tolist() == ['Scaled'] and reports['area_gen']['Unmet MW'].tolist() == [0.0]
     # The read-back leaves them out too: the case matches, so there is no error. (Counting them would give +300 MW.)
     final = {'Load': loads([]), 'Gen': case}
     assert area.achieved(final, reports, swing_buses=[5])['area_gen'][['Final MW', 'Final Error MW']].values.tolist() == [[80.0, 0.0]]
