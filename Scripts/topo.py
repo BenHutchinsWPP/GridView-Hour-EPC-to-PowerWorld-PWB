@@ -1,10 +1,11 @@
 """
-Topology mode, step 01: make the PWB seed case match the GridView topology (missing elements, transformer taps,
-branch statuses, distributed generation loads). The preparation both modes share is in prep.py.
+Topology mode: step 01 makes the PWB seed case match the GridView topology (missing elements, transformer taps,
+branch statuses, distributed generation loads). Step 02 targets each gen & load to its own EPC value (build_targets()).
+The preparation both modes share is in prep.py.
 """
 from pathlib import Path
 import pandas as pd
-from . import pw, scale
+from . import prep, pw, scale
 
 # ------------------ Tuning thresholds ------------------
 TAP_THRESHOLD = 0.15            # Transformer taps / nominal kV further than this from 1.0 PU are reset to 1.0.
@@ -426,12 +427,16 @@ def compute_pw_targets(SimAuto, gv_fp: Path, pw_fp: Path, dummy_bus_fp: Path) ->
 
     pw.open_case(SimAuto, pw_fp)
     case = {table: pw.get_df(SimAuto, table, fields) for table, fields in TARGET_FIELDS.items()}
+    slack = prep.slack_buses(SimAuto)
     SimAuto.CloseCase()
 
-    return build_targets(gv, case)
+    return build_targets(gv, case, slack)
 
-def build_targets(gv: dict[str,pd.DataFrame], case: dict[str,pd.DataFrame]) -> dict[str,pd.DataFrame]:
-    """Puts the case's gens & loads side by side with their GridView targets (each element to its own EPC value)."""
+def build_targets(gv: dict[str,pd.DataFrame], case: dict[str,pd.DataFrame], swing_buses=()) -> dict[str,pd.DataFrame]:
+    """
+    Puts the case's gens & loads side by side with their GridView targets (each element to its own EPC value).
+    The swing is never scaled: the giant swing, and any gen on swing_buses (the slack bus). The solution sets their MW.
+    """
     targets = {}
     for table, statuses in scale.STATUS.items():
         gv_df = gv[table]
@@ -454,4 +459,9 @@ def build_targets(gv: dict[str,pd.DataFrame], case: dict[str,pd.DataFrame]) -> d
 
         df['ExclusionReason'] = ''
         targets[table] = df.set_index('ObjectID')
+
+    gen_df = targets['Gen']
+    swing = (gen_df['ID'] == prep.SWING_ID) | gen_df['BusNum'].isin(swing_buses)
+    gen_df.loc[swing, 'Status_Target'] = 'Closed'
+    scale.exclude(gen_df, swing, 'Swing Unit')
     return targets

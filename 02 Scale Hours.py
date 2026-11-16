@@ -6,7 +6,6 @@ mode = "topology": every gen & load to its own EPC value (topo.build_targets()).
 from pathlib import Path
 import traceback
 import pandas as pd
-import win32com.client
 from Scripts import area, prep, pw, scale, settings, topo
 
 cur_dir = Path(__file__).parent
@@ -23,32 +22,12 @@ dummy_bus_fp = cur_dir / 'Prepared' / 'DummyBus.aux'
 # ------------------ Outputs ------------------
 out_dir = cur_dir / 'Output'
 
-def topology_targets(SimAuto, gv_fp) -> tuple[dict, dict]:
-    pw.open_case(SimAuto, pw_fp)
-    slack = area.slack_buses(SimAuto)
-    targets = topo.compute_pw_targets(SimAuto, gv_fp, pw_fp, dummy_bus_fp)
-    # Never touch the swing: the giant swing, or any gen on the slack bus. The solution sets their MW.
-    gen_df = targets['Gen']
-    swing = (gen_df['ID'] == prep.SWING_ID) | gen_df['BusNum'].isin(slack)
-    gen_df.loc[swing, 'Status_Target'] = 'Closed'
-    scale.exclude(gen_df, swing, 'Swing Unit')
-    return targets, {}
-
-def area_targets(SimAuto, gv_fp) -> tuple[dict, dict]:
-    pw.open_case(SimAuto, gv_fp)
-    epc = area.read_case(SimAuto)
-    pw.open_case(SimAuto, pw_fp)
-    case = area.read_case(SimAuto)
-    slack = area.slack_buses(SimAuto)
-    SimAuto.CloseCase()
-    return area.build_targets(epc, case, swing_buses=slack)
-
 def create_case(SimAuto, gv_fp, out_fp):
     print('targets')
     if run['mode'] == 'topology':
-        targets, reports = topology_targets(SimAuto, gv_fp)
+        targets, reports = topo.compute_pw_targets(SimAuto, gv_fp, pw_fp, dummy_bus_fp), {}
     else:
-        targets, reports = area_targets(SimAuto, gv_fp)
+        targets, reports = area.compute_targets(SimAuto, gv_fp, pw_fp)
     pw.write_excel(out_dir / (gv_fp.stem + '_01_Target.xlsx'), {**reports, **{table.lower(): df for table, df in targets.items()}})
 
     if run['pretest_gens']:
@@ -68,15 +47,16 @@ def create_case(SimAuto, gv_fp, out_fp):
     pvqv = pd.read_csv(pvqv_fp) if run['use_pvqv'] else None
     if run['balance_swing']:
         # Balance the swing whenever it drifts far during scaling, and again at the end.
-        after_step, midrun_log = area.midrun_balancer(SimAuto)
+        after_step, midrun_log, midrun_sheets = area.midrun_balancer(SimAuto)
         log = scale.iterate_to_gen_load_targets(SimAuto, targets, pvqv, after_step)
         log['midrun_balance_df'] = pd.DataFrame(midrun_log)
+        log.update(midrun_sheets)
         log.update(area.balance_swing(SimAuto))
     else:
         log = scale.iterate_to_gen_load_targets(SimAuto, targets, pvqv)
     if reports:
         # Read back from PowerWorld, so the report shows what the case holds rather than what the scaling meant to do.
-        log = {**area.achieved(area.read_case(SimAuto), reports), **log}
+        log = {**area.achieved(area.read_case(SimAuto), reports, prep.slack_buses(SimAuto)), **log}
     pw.write_excel(out_dir / (gv_fp.stem + '_03_ScaleLog.xlsx'), log)
     pw.save_case(SimAuto, out_fp, run['case_format'])
 
@@ -85,7 +65,7 @@ def create_case(SimAuto, gv_fp, out_fp):
 if(__name__=='__main__'):
     print(f'Mode: {run["mode"]}')
     # Created here, not at import: multiprocessing workers re-import this module.
-    SimAuto = win32com.client.Dispatch("pwrworld.SimulatorAuto")
+    SimAuto = pw.connect()
     for gv_fp in sorted(gv_dir.glob('*.epc')):
         out_fp = out_dir / (gv_fp.stem + '.pwb')
         if out_fp.exists():

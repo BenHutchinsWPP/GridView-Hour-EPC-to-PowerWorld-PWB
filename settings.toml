@@ -44,6 +44,9 @@ balance_max_rounds = 10
 # or (balance_at_swing_limits) past the swing unit's own MWMax / MWMin. With both, whichever comes first.
 balance_trigger_mw = 1000.0
 balance_at_swing_limits = false
+# Stop before scaling if more than this share of the EPC's generation (|MW|) has no GenType (its unit and fuel codes are
+# blank or unknown): scaling would take the rest of the fleet offline. Map the codes below, or set 1.0 to turn this off.
+max_unknown_share = 0.5
 # The GenTypes. Add one here to give it its own group, then map unit/fuel codes to it below.
 gen_types = ["Solar", "Hydro", "Wind", "Thermal", "Battery Storage", "Unknown"]
 

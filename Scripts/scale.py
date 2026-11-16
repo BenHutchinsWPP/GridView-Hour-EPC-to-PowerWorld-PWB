@@ -1,9 +1,9 @@
 """
-Step 02: scale the prepared case's gens & loads to their targets (from Scripts/area.py).
+Step 02: scale the prepared case's gens & loads to their targets (from Scripts/area.py or Scripts/topo.py, by mode).
 
 Gens and loads are handled by the same code. Their working tables ("targets") are indexed by ObjectID and hold:
     <field>          current value in the case
-    <field>_Target   value to reach (from the GridView hour's area totals)
+    <field>_Target   value to reach (from the GridView hour: area totals, or each element's own value)
     <field>_Seed     value in the prepared case
     <field>_Start    value when scaling started (after closing in, at 0 MW)
     Progress         how far the row has been scaled from start to target, in 1/RESOLUTION units
@@ -72,15 +72,18 @@ def test_gen_targets(pw_fp: Path, gen_df: pd.DataFrame) -> pd.DataFrame:
     """
     Tests each generator target individually, and adds a 'Success' column reporting which individual changes solve.
     """
-    import win32com.client
-    SimAuto = win32com.client.Dispatch("pwrworld.SimulatorAuto")
+    SimAuto = pw.connect()
     pw.open_case(SimAuto, pw_fp)
     if not pw.solve(SimAuto):
         raise pw.SimAutoError(f'Base case does not solve, cannot test gen targets: {pw_fp}')
 
     target_df = gen_df.assign(Status=gen_df['Status_Target'], MWSetPoint=gen_df['MWSetPoint_Target'])
+    ok_rows = included(target_df).tolist()
     success = []
     for i in range(len(target_df)):
+        if not ok_rows[i]:
+            success.append(True)    # Excluded rows (the swing among them) are never written.
+            continue
         # Set case to target value for this specific element, solve, then roll back.
         with pw.trial(SimAuto, keep_changes=False) as t:
             pw.set_df(SimAuto, 'Gen', target_df.iloc[[i]], write_fields('Gen'))
@@ -213,6 +216,23 @@ def at_progress(table: str, df: pd.DataFrame, progress) -> pd.DataFrame:
     for c in SCALED[table]:
         new_df[c] = df[f'{c}_Start'] + (df[f'{c}_Target'] - df[f'{c}_Start']) * new_df['Progress'] / RESOLUTION
     return new_df
+
+def rescale(df: pd.DataFrame, factor: pd.Series, cols: list[str], cap: pd.Series | None = None):
+    """
+    After rows were moved by `factor` (indexed by ObjectID) in the middle of scaling: multiplies their current, start and
+    target values of `cols` in df by it, so at_progress() carries on from where they are instead of undoing the move.
+    cap: optional upper limit (e.g. MWMax) for the targets. A target already above it isn't raised.
+    """
+    f = factor[factor.index.isin(df.index)]
+    for c in cols:
+        for name in (c, f'{c}_Start', f'{c}_Target'):
+            if name not in df.columns:
+                continue
+            new = df.loc[f.index, name] * f
+            if cap is not None and name == f'{c}_Target':
+                old, limit = df.loc[f.index, name], cap.reindex(f.index)
+                new = new.clip(upper=limit.where(limit > old, old))
+            df.loc[f.index, name] = new
 
 # ------------------ Voltage support ------------------
 def create_statcom_on_lowestv_bus(SimAuto, skip_buses):
@@ -354,8 +374,7 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None)
     after_step: optional function(SimAuto, targets), called after each step (e.g. area.midrun_balancer()).
     """
     if not pw.solve(SimAuto):
-        print('Could not solve the original input case!')
-        return {'step_df': pd.DataFrame({"Result": ['Failed to converge base case.']})}
+        raise pw.SimAutoError('Could not solve the original input case.')
 
     for df in targets.values():
         df['HeldReason'] = ''
@@ -371,8 +390,7 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None)
 
     prep.adjust_shunts(SimAuto)
     if not pw.solve(SimAuto):
-        print('Could not solve after adjusting shunts in the original case!')
-        return {'step_df': pd.DataFrame({"Result": ['Failed to converge base case with shunt adjustments.']})}
+        raise pw.SimAutoError('Could not solve after adjusting shunts in the original case.')
 
     progress, step = 0, INITIAL_STEP
     failed_step = None              # The step size which first diverged, before halving.

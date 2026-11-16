@@ -121,14 +121,13 @@ def get_pvqv(SimAuto) -> pd.DataFrame:
 def max_fault_duty_bus(fault_df) -> int:
     return int(fault_df.loc[fault_df['MVA'].idxmax(), 'BusNumber'])
 
-def slack_bus(SimAuto) -> int:
-    """The case's existing swing bus (the first, if there are several)."""
-    bus_df = pw.get_df(SimAuto, 'Bus', {'Number': int, 'Slack': str})
-    return int(bus_df.loc[bus_df['Slack'] == 'YES', 'Number'].iloc[0])
+def slack_buses(SimAuto) -> list[int]:
+    """The case's swing buses."""
+    return pw.get_df(SimAuto, 'Bus', {'Number': int, 'Slack': str}).query("Slack == 'YES'")['Number'].tolist()
 
 def create_giant_swing(SimAuto, bus_num: int) -> pd.DataFrame:
     """
-    Creates a giant swing/slack unit on the given bus, e.g. max_fault_duty_bus() or slack_bus().
+    Creates a giant swing/slack unit on the given bus, e.g. max_fault_duty_bus() or slack_buses()[0].
     """
     # Get current bus information at the swing bus.
     bus_df = pw.get_df(SimAuto, 'Bus', {'Number': int, 'Name': str, 'NomkV': float, 'Vpu': float})

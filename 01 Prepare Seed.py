@@ -3,7 +3,6 @@ Step 01: prepare the seed PWB for scaling. Settings: settings.toml.
 mode = "topology" also makes the seed match the GridView topology (this needs the EPCs).
 """
 from pathlib import Path
-import win32com.client
 from Scripts import pw, prep, settings, topo
 
 cur_dir = Path(__file__).parent
@@ -39,7 +38,7 @@ if(__name__=='__main__'):
             raise SystemExit(f'No GridView EPC found in {str(gv_dir)}')
         print(f'GV Input: {str(gv_fps[0])}')
 
-    SimAuto = win32com.client.Dispatch("pwrworld.SimulatorAuto")
+    SimAuto = pw.connect()
     log = {}
     step = iter(range(1, 100))
 
@@ -48,12 +47,14 @@ if(__name__=='__main__'):
         pw.save_case(SimAuto, fp, run['case_format'])
         return fp
 
-    def try_step(step_name, fn):
-        """Runs fn; rolls it back if the case no longer solves."""
+    def try_step(step_name, fn, required=False):
+        """Runs fn; rolls it back if the case no longer solves. required: stop instead of going on without it."""
         with pw.trial(SimAuto) as t:
             result = fn()
         if not t.ok:
             print(f'WARNING: Did not solve after {step_name} !!! Rolled back.')
+            if required:
+                raise SystemExit(f'The case did not solve after {step_name}, so it was rolled back. Fix that, or set create_giant_swing = false.')
         return result
 
     if topology:
@@ -106,9 +107,9 @@ if(__name__=='__main__'):
             fault_df.to_csv(fault_fp, index=False)
             swing_bus = prep.max_fault_duty_bus(fault_df)
         elif swing_bus == 'slack':
-            swing_bus = prep.slack_bus(SimAuto)
+            swing_bus = prep.slack_buses(SimAuto)[0]
         print(f'create_giant_swing on bus {swing_bus}')
-        log['swing'] = try_step('create_giant_swing()', lambda: prep.create_giant_swing(SimAuto, swing_bus))
+        log['swing'] = try_step('create_giant_swing()', lambda: prep.create_giant_swing(SimAuto, swing_bus), required=True)
     fp = save('create_giant_swing' if run['create_giant_swing'] else 'disable_area_agc')
 
     if topology:

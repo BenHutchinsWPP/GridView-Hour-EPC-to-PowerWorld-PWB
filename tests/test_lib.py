@@ -2,8 +2,11 @@
 Tests for the parts of Scripts/ which don't need PowerWorld. Runs on any OS.
     python tests/test_lib.py      (or: pytest tests)
 """
+import importlib.util
 import re
 import sys
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -390,10 +393,10 @@ def test_thermal_scaling_down_takes_smallest_units_off_first():
     assert df['Status_Target'].to_dict() == {'g1': 'Open', 'g2': 'Open', 'g3': 'Closed'}
     assert df['MWSetPoint_Target'].to_dict() == {'g1': 0.0, 'g2': 0.0, 'g3': 200.0}
     # g1 is online in the EPC: g2 (offline in the EPC) goes off first instead, and g1 stays.
-    epc = gens([('g1', 1, '1', 'Closed', 'GT', 100.0, 100.0, 0.0), ('e1', 1, '9', 'Closed', 'GT', 100.0, 300.0, 0.0)])
+    epc = gens([('g1', 1, '1', 'Closed', 'GT', 100.0, 100.0, 0.0), ('e1', 1, '9', 'Closed', 'GT', 180.0, 300.0, 0.0)])
     df, _ = area.gen_targets(epc, case)
     assert df['Status_Target'].to_dict() == {'g1': 'Closed', 'g2': 'Open', 'g3': 'Closed'}
-    assert df['MWSetPoint_Target'].to_dict() == {'g1': 50.0, 'g2': 0.0, 'g3': 150.0}
+    assert df['MWSetPoint_Target'].round(6).to_dict() == {'g1': 70.0, 'g2': 0.0, 'g3': 210.0}
 
 def test_commitment_off_keeps_seed_statuses():
     case = gens([('g1', 1, '1', 'Closed', 'GT', 50.0, 100.0, 0.0), ('g2', 1, '2', 'Open', 'GT', 0.0, 400.0, 0.0)])
@@ -449,14 +452,20 @@ def test_build_targets_leaves_slack_bus_gens_out_of_both_cases():
     targets, reports = area.build_targets({'Load': loads([]), 'Gen': case}, {'Load': loads([]), 'Gen': case}, swing_buses=[5])
     assert targets['Gen'].index.tolist() == ['g1'] and targets['Gen'].loc['g1', 'MWSetPoint_Target'] == 80
     assert reports['area_gen']['Method'].tolist() == ['Matched keys'] and reports['area_gen']['Unmet MW'].tolist() == [0.0]
+    # The read-back leaves them out too: the case matches, so there is no error. (Counting them would give +300 MW.)
+    final = {'Load': loads([]), 'Gen': case}
+    assert area.achieved(final, reports, swing_buses=[5])['area_gen'][['Final MW', 'Final Error MW']].values.tolist() == [[80.0, 0.0]]
+    assert area.achieved(final, reports)['area_gen']['Final Error MW'].tolist() == [300.0]
 
 class SwingSimAuto(FakeSimAuto):
     """
     A case with gens & loads on their own buses, and the giant swing (ID xx, bus 99) carrying load minus generation.
+    `slack`: bus numbers which report Slack = YES. Gens on them carry the imbalance too (so they are the swing when there is no xx).
     Written rows (keyed by bus) overlay the starting tables; StoreState/RestoreState work on them as in FakeSimAuto.
     """
-    def __init__(self, gen, load):
+    def __init__(self, gen, load, slack=()):
         super().__init__()
+        self.slack = set(slack)
         self.base = {'Gen': gen.set_index('BusNum', drop=False), 'Load': load.set_index('BusNum', drop=False)}
 
     def table(self, name):
@@ -471,7 +480,8 @@ class SwingSimAuto(FakeSimAuto):
             ld = self.table('Load')
             p = ld.loc[ld['Status'] == 'Closed', ['SMW', 'IMW', 'ZMW']].sum().sum()
             df['MW'] = df['MWSetPoint']
-            df.loc[df['ID'] == 'xx', 'MW'] = p - df.loc[on & (df['ID'] != 'xx'), 'MWSetPoint'].sum()
+            sw = (df['ID'] == 'xx') | df['BusNum'].isin(self.slack)
+            df.loc[sw, 'MW'] = p - df.loc[on & ~sw, 'MWSetPoint'].sum()
         return df
 
     def GetParametersMultipleElementRect(self, table, fields, filter_group):
@@ -479,8 +489,9 @@ class SwingSimAuto(FakeSimAuto):
             return ('', [[str(v) for v in row] for row in self.table(table)[fields].itertuples(index=False)])
         if table == 'Bus':
             buses = sorted(set(self.base['Gen']['BusNum']) | set(self.base['Load']['BusNum']))
-            values = {'Vpu': '1.0', 'IslandNumber': '1', 'BusIsStarBus:1': 'NO', 'BusNomVolt': '230', 'Slack': 'NO'}
-            return ('', [[str(n) if f in ('Busnum', 'Number') else values.get(f, '0') for f in fields] for n in buses])
+            values = {'Vpu': '1.0', 'IslandNumber': '1', 'BusIsStarBus:1': 'NO', 'BusNomVolt': '230'}
+            return ('', [[str(n) if f in ('Busnum', 'Number') else 'YES' if f == 'Slack' and n in self.slack else values.get(f, 'NO' if f == 'Slack' else '0')
+                          for f in fields] for n in buses])
         return ('', [])
 
 def swing_case():
@@ -493,14 +504,11 @@ def test_midrun_balancer_keeps_the_swing_near_zero_and_never_moves_it():
     gen, load = swing_case()
     sa = SwingSimAuto(gen, load)
     # Scale load from 200 to 3200 MW with gens fixed: without balancing, the swing would end at +3000 MW.
-    targets = {'Gen': targets_df(ObjectID=['g1'], BusNum=[1], ID='1', Status='Closed', Status_Target='Closed',
-                                 MWSetPoint=[100.0], MWSetPoint_Target=[100.0]),
-               'Load': targets_df(ObjectID=['l1'], BusNum=[3], ID='1', Status='Closed', Status_Target='Closed',
-                                  DistStatus='Open', DistStatus_Target='Open', AreaNumber=1,
-                                  **{c: [v] for c, v in zip(scale.SCALED['Load'], [200.0, 20.0, 0, 0, 0, 0, 0, 0])},
-                                  **{f'{c}_Target': [v] for c, v in zip(scale.SCALED['Load'], [3200.0, 320.0, 0, 0, 0, 0, 0, 0])})}
-    after_step, log = area.midrun_balancer(sa)
+    targets = load_ramp_targets()
+    after_step, log, sheets = area.midrun_balancer(sa)
     scale.iterate_to_gen_load_targets(sa, targets, after_step=after_step)
+    # The scaling log of every balance is kept, as `midrun<N>_<name>`.
+    assert all(f'midrun{n}_step_df' in sheets for n in range(1, len(log) + 1)) and f'midrun{len(log) + 1}_step_df' not in sheets
     swing = lambda: area.swing_mw(sa.table('Gen'), [])[0]
     assert len(log) >= 1 and all(abs(r['Swing MW After']) < abs(r['Swing MW Before']) for r in log)
     assert abs(swing()) <= area.BALANCE_TRIGGER_MW                      # Balanced as it went.
@@ -532,14 +540,14 @@ def test_swing_band_and_limit_trigger():
         assert area.swing_band(gen, []) == (-np.inf, np.inf)                 # Off.
 
         sa = SwingSimAuto(gen, load)
-        after_step, log = area.midrun_balancer(sa)
+        after_step, log, _ = area.midrun_balancer(sa)
         targets = load_ramp_targets()
         scale.iterate_to_gen_load_targets(sa, targets, after_step=after_step)
         assert log == [] and targets['Load'].loc['l1', 'SMW'] == 3200      # Never balanced.
 
         area.BALANCE_AT_SWING_LIMITS = True                                  # Balance at the swing's MWMax (500 MW).
         sa = SwingSimAuto(gen, load)
-        after_step, log = area.midrun_balancer(sa)
+        after_step, log, _ = area.midrun_balancer(sa)
         scale.iterate_to_gen_load_targets(sa, load_ramp_targets(), after_step=after_step)
         assert len(log) >= 1 and all(r['Swing MW Before'] > 500 for r in log)
         assert area.swing_mw(sa.table('Gen'), [])[0] <= 500
@@ -562,12 +570,245 @@ def test_rescale_targets():
                'Load': targets_df(ObjectID=['l1'], **{c: [10.0] for c in ['SMW', 'SMvar', 'IMW', 'IMvar', 'ZMW', 'ZMvar']},
                                   **{f'{c}_Start': [10.0] for c in ['SMW', 'SMvar', 'IMW', 'IMvar', 'ZMW', 'ZMvar']},
                                   **{f'{c}_Target': [20.0] for c in ['SMW', 'SMvar', 'IMW', 'IMvar', 'ZMW', 'ZMvar']})}
-    moved = {'Gen': targets_df(ObjectID=['g1', 'gx'], MWSetPoint=[60.0, 5.0], MWSetPoint_Seed=[50.0, 4.0]),
+    moved = {'Gen': targets_df(ObjectID=['g1', 'gx'], MWSetPoint=[60.0, 5.0], MWSetPoint_Seed=[50.0, 4.0], MWMax=[500.0, 500.0]),
              'Load': targets_df(ObjectID=['l1'], SMW=[24.0], IMW=[0.0], ZMW=[0.0], P_Seed=[30.0])}
     area.rescale_targets(targets, moved)
     assert targets['Gen'].loc['g1', ['MWSetPoint', 'MWSetPoint_Start', 'MWSetPoint_Target']].tolist() == [60.0, 0.0, 120.0]
     assert targets['Gen'].loc['g2', 'MWSetPoint_Target'] == 10.0                    # Not moved.
     assert targets['Load'].loc['l1', ['SMvar', 'SMvar_Start', 'SMvar_Target']].tolist() == [8.0, 8.0, 16.0]
+
+# ------------------ review fixes ------------------
+@contextmanager
+def saved_settings():
+    """Module settings (upper-case globals) as they are now, put back afterwards."""
+    saved = {(m, k): v for m in settings.MODULES.values() for k, v in vars(m).items() if k.isupper()}
+    try:
+        yield
+    finally:
+        for (m, k), v in saved.items():
+            setattr(m, k, v)
+
+def test_nonconforming_is_decided_by_key():
+    # l2 is non-conforming in the PWB only. The EPC's l2 (500 MW) must not be loaded onto l1.
+    case = loads([('l1', 1, 'Closed', 100.0, 0.0, 0.0, 0.0), ('l2', 1, 'Closed', 500.0, 0.0, 0.0, 0.0)]).assign(AGC=['YES', 'NO'])
+    epc = loads([('l1', 1, 'Closed', 100.0, 0.0, 0.0, 0.0), ('l2', 1, 'Closed', 500.0, 0.0, 0.0, 0.0)])
+    targets, reports = area.build_targets({'Load': epc, 'Gen': gens([])}, {'Load': case, 'Gen': gens([])})
+    assert targets['Load'].index.tolist() == ['l1'] and targets['Load'].loc['l1', 'SMW_Target'] == 100
+    r = reports['area_load'].iloc[0]
+    assert (r['Target MW'], r['Planned MW'], r['Seed Non-conforming MW'], r['EPC Non-conforming MW']) == (100, 100, 500, 500)
+
+def test_rescale_caps_gen_targets_at_mwmax():
+    df = targets_df(ObjectID=['a', 'b', 'c'], MWSetPoint=[50.0, 50.0, 50.0], MWSetPoint_Start=[0.0, 0.0, 0.0], MWSetPoint_Target=[100.0, 100.0, 130.0])
+    scale.rescale(df, pd.Series({'a': 1.2, 'b': 1.2, 'c': 1.2}), ['MWSetPoint'], cap=pd.Series({'a': 110.0, 'b': 1000.0, 'c': 120.0}))
+    assert df['MWSetPoint_Target'].round(6).tolist() == [110.0, 120.0, 130.0]   # c was already above its MWMax: not raised.
+    assert df['MWSetPoint'].round(6).tolist() == [60.0] * 3                     # Current values are not capped.
+
+def test_midrun_balance_keeps_gens_within_mwmax():
+    # Solar s1 (MWMax 100) has 150 MW to place in the EPC: planned at MWMax, 50 MW unmet, which loads the swing.
+    gen = gens([('xx', 9, 'xx', 'Closed', '', 0.0, 2e4, -2e4), ('s1', 1, '1', 'Closed', 'PV', 10.0, 100.0, 0.0),
+                ('t1', 1, '1', 'Closed', 'GT', 100.0, 1000.0, 0.0)]).assign(BusNum=[99, 1, 2], MW=0.0, NomkV=230.0, BusName='b')
+    load = loads([('l1', 1, 'Closed', 110.0, 0.0, 0.0, 10.0)]).assign(BusNum=3, NomkV=230.0, BusName='b', DistStatus='Open', DistMWInput=0.0, DistMvarInput=0.0)
+    epc_gen = gens([('e1', 1, '1', 'Closed', 'PV', 150.0, 200.0, 0.0), ('e2', 1, '2', 'Closed', 'GT', 450.0, 1000.0, 0.0)]).assign(BusNum=[1, 2])
+    epc_load = loads([('e1', 1, 'Closed', 600.0, 0.0, 0.0, 60.0)])
+    sa = SwingSimAuto(gen, load)
+    with saved_settings():
+        area.BALANCE_TRIGGER_MW = 20.0
+        targets, _ = area.build_targets({'Gen': epc_gen, 'Load': epc_load}, area.read_case(sa), swing_buses=[99])
+        after_step, log, _ = area.midrun_balancer(sa)
+        scale.iterate_to_gen_load_targets(sa, targets, after_step=after_step)
+        area.balance_swing(sa)
+    assert len(log) >= 1
+    final = sa.table('Gen').set_index('ObjectID')
+    assert final.loc['s1', 'MWSetPoint'] <= final.loc['s1', 'MWMax'] + 1e-9
+    assert (targets['Gen']['MWSetPoint_Target'] <= targets['Gen']['MWMax'] + 1e-9).all()
+
+def test_blank_epc_codes_stop_the_run_before_scaling():
+    case = gens([('w1', 1, '1', 'Closed', 'WT', 40.0, 50.0, 0.0), ('t1', 1, '2', 'Closed', 'GT', 80.0, 100.0, 0.0), ('h1', 1, '3', 'Closed', 'HY', 80.0, 100.0, 0.0)])
+    epc = case.assign(UnitTypeCode='', ObjectID=['a', 'b', 'c'])
+    try:
+        area.gen_targets(epc, case)
+        assert False
+    except ValueError as e:
+        assert '200 MW' in str(e) and 'unit_gentype' in str(e) and 'fuel_gentype' in str(e)
+    # 40% of the MW has no type: under the limit.
+    epc = epc.assign(UnitTypeCode=['', 'GT', 'HY'], MWSetPoint=[80.0, 60.0, 60.0])
+    df, _ = area.gen_targets(epc, case)
+    assert len(df) == 3
+    with saved_settings():
+        area.MAX_UNKNOWN_SHARE = 1.0   # Off.
+        area.gen_targets(epc.assign(UnitTypeCode=''), case)
+
+def test_target_zero_takes_every_committed_unit_offline():
+    rng = np.random.default_rng(0)
+    for _ in range(300):
+        caps = np.round(rng.uniform(1, 900, rng.integers(2, 12)), rng.integers(0, 3))
+        rows = gens([(f'g{i}', 1, str(i), 'Closed', 'GT', 1.0, c, 0.0) for i, c in enumerate(caps)])
+        assert not area.commit(rows, 0.0, 'Thermal', set()).any(), caps.tolist()
+    case = gens([('t1', 1, '1', 'Closed', 'GT', 10.0, 431.58, 0.0), ('t2', 1, '2', 'Closed', 'ST', 10.0, 556.86, 0.0), ('t3', 1, '3', 'Closed', 'CC', 10.0, 99.99, 0.0)])
+    df, _ = area.gen_targets(gens([]), case)
+    assert (df['Status_Target'] == 'Open').all()
+    # Storage keeps its seed status at 0, and a unit with no capacity is left alone.
+    rows = gens([('b1', 1, '1', 'Closed', 'BA', 5.0, 50.0, -50.0), ('c1', 1, '2', 'Closed', 'SC', 0.0, 0.0, 0.0)])
+    assert area.commit(rows, 0.0, 'Thermal', set()).tolist() == [False, True]
+
+def test_decommit_skips_a_unit_which_cannot_go_and_tries_the_next():
+    # Need 520 MW. A (500) is first in line (offline in the EPC) but removing it leaves 100. B (50) can go; C can't.
+    rows = gens([('A', 1, '1', 'Closed', 'GT', 1.0, 500.0, 0.0), ('B', 1, '2', 'Closed', 'GT', 1.0, 50.0, 0.0), ('C', 1, '3', 'Closed', 'GT', 1.0, 50.0, 0.0)])
+    assert area.commit(rows, 468.0, 'Thermal', {'B', 'C'}).tolist() == [True, False, True]
+
+def test_balance_df_counts_the_whole_load_change():
+    gen, load = swing_case()
+    sa = SwingSimAuto(gen, load.assign(IMW=100.0))      # 300 MW of load against 200 MW of gen: the swing is at +100.
+    first = area.balance_swing(sa)['balance_df'].iloc[0]
+    assert abs(first['Swing MW'] - 100) < 1e-9
+    assert abs(first['Load MW Change'] + 50) < 1e-6 and abs(first['Gen MW Change'] - 50) < 1e-6   # Half each, I part included.
+
+def test_iterate_raises_when_the_case_does_not_solve():
+    class Diverges(FakeSimAuto):
+        def diverged(self):
+            return True
+    targets, _ = scaling_targets(gen_status='Closed')
+    for sa in (Diverges(),):
+        try:
+            scale.iterate_to_gen_load_targets(sa, targets)
+            assert False
+        except pw.SimAutoError:
+            pass
+    # Fine at the start, diverges once the shunts have been adjusted.
+    sa, state = FakeSimAuto(), {'broken': False}
+    sa.diverged = lambda: state['broken']
+    saved = prep.adjust_shunts
+    prep.adjust_shunts = lambda SimAuto: state.update(broken=True)
+    try:
+        scale.iterate_to_gen_load_targets(sa, scaling_targets(gen_status='Closed')[0])
+        assert False
+    except pw.SimAutoError as e:
+        assert 'shunt' in str(e)
+    finally:
+        prep.adjust_shunts = saved
+
+def test_test_gen_targets_only_writes_included_rows():
+    class Recording(FakeSimAuto):
+        writes = []
+        def OpenCase(self, fp):
+            return ('',)
+        def CloseCase(self):
+            return ('',)
+        def ChangeParametersMultipleElementRect(self, table, fields, rows):
+            self.writes += [row[0] for row in rows]
+            return super().ChangeParametersMultipleElementRect(table, fields, rows)
+    sa = Recording()
+    gen = targets_df(ObjectID=['g1', 'sw'], BusNum=[1, 9], ID=['1', 'xx'], Status=['Closed', 'Closed'], Status_Target='Closed',
+                     MWSetPoint=[10.0, 0.0], MWSetPoint_Target=[20.0, 0.0])
+    scale.exclude(gen, gen.index == 'sw', 'Swing Unit')
+    saved, pw.connect = pw.connect, lambda: sa
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            fp = Path(d) / 'x.pwb'
+            fp.write_text('')
+            out = scale.test_gen_targets(fp, gen)
+    finally:
+        pw.connect = saved
+    assert sa.writes == ['1'] and out['Success'].tolist() == [True, True]
+
+def test_topology_targets_never_scale_the_swing():
+    common = dict(BusName='A', NomkV=230.0)
+    case_gen = pd.DataFrame({'ObjectID': ['g1', 'g2', 'sw'], 'BusNum': [1, 2, 99], 'ID': ['1', '1', 'xx'], 'Status': 'Closed', 'MWSetPoint': [10.0, 5.0, 300.0], **common})
+    gv_gen = pd.DataFrame({'ObjectID': ['g1', 'g2'], 'BusNum': [1, 2], 'ID': '1', 'Status': ['Closed', 'Open'], 'MWSetPoint': [20.0, 0.0], **common})
+    load = pd.DataFrame({'ObjectID': ['l1'], 'BusNum': 1, 'ID': '1', 'Status': 'Closed', 'SMW': 50.0, 'SMvar': 5.0, 'IMW': 0.0, 'IMvar': 0.0, 'ZMW': 0.0, 'ZMvar': 0.0, 'DistStatus': 'Closed', 'DistMWInput': 3.0, 'DistMvarInput': 1.0, **common})
+    gen = topo.build_targets({'Gen': gv_gen, 'Load': load}, {'Gen': case_gen, 'Load': load}, swing_buses=[2])['Gen']
+    # The giant swing, and the gen on the slack bus (bus 2), are excluded and kept Closed even though the EPC has g2 Open.
+    assert gen['ExclusionReason'].tolist() == ['', 'Swing Unit', 'Swing Unit']
+    assert gen['Status_Target'].tolist() == ['Closed', 'Closed', 'Closed']
+    assert topo.build_targets({'Gen': gv_gen, 'Load': load}, {'Gen': case_gen, 'Load': load})['Gen']['ExclusionReason'].tolist() == ['', '', 'Swing Unit']
+
+class CaseSimAuto(SwingSimAuto):
+    """SwingSimAuto which also opens and saves cases: `cases` maps a file name to its (gen, load) tables."""
+    def __init__(self, cases, slack=()):
+        super().__init__(*next(iter(cases.values())), slack=slack)
+        self.cases, self.saved = cases, {}
+
+    def OpenCase(self, fp):
+        gen, load = self.cases[Path(fp).name]
+        self.base = {'Gen': gen.set_index('BusNum', drop=False), 'Load': load.set_index('BusNum', drop=False)}
+        self.applied, self.states = {}, {}
+        return ('',)
+
+    def SaveCase(self, fp, case_format, overwrite):
+        self.saved[Path(fp).name] = {'Gen': self.table('Gen').set_index('ObjectID'), 'Load': self.table('Load').set_index('ObjectID')}
+        Path(fp).write_text('')
+        return ('',)
+
+    def CloseCase(self):
+        return ('',)
+
+def load_step_02(folder: Path, mode: str):
+    """'02 Scale Hours.py' (not importable by name), pointed at `folder`. SimAuto isn't connected: no win32com needed."""
+    spec = importlib.util.spec_from_file_location('step_02', Path(__file__).resolve().parents[1] / '02 Scale Hours.py')
+    step = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(step)
+    step.run['mode'] = mode
+    step.gv_dir, step.out_dir = folder / 'HourEPCs', folder / 'Output'
+    step.pw_fp, step.pvqv_fp, step.dummy_bus_fp = folder / 'Prepared.pwb', folder / 'pvqv.csv', folder / 'DummyBus.aux'
+    for d in (step.gv_dir, step.out_dir):
+        d.mkdir()
+    for fp in (step.pw_fp, step.gv_dir / 'h1.epc'):
+        fp.write_text('')
+    return step
+
+def two_cases():
+    """The PWB: giant swing xx (bus 99), g1 thermal, h1 hydro, load l1. The EPC: other keys in area mode; the same in topology mode."""
+    gen = gens([('xx', 1, 'xx', 'Closed', '', 0.0, 2e4, -2e4), ('g1', 1, '1', 'Closed', 'GT', 100.0, 1000.0, 0.0),
+                ('h1', 1, '1', 'Closed', 'HY', 100.0, 1000.0, 0.0)]).assign(BusNum=[99, 1, 2], MW=0.0, NomkV=230.0, BusName='b')
+    load = loads([('l1', 1, 'Closed', 200.0, 0.0, 0.0, 20.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
+    return gen, load
+
+def test_step_02_area_mode_end_to_end():
+    gen, load = two_cases()
+    epc_gen = gens([('e1', 1, '1', 'Closed', 'GT', 150.0, 1000.0, 0.0), ('e2', 1, '2', 'Closed', 'HY', 50.0, 1000.0, 0.0)]).assign(BusNum=[1, 2], MW=0.0, NomkV=230.0, BusName='b')
+    epc_load = loads([('e1', 1, 'Closed', 300.0, 0.0, 0.0, 30.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        step = load_step_02(Path(d), 'area')
+        sa = CaseSimAuto({'h1.epc': (epc_gen, epc_load), 'Prepared.pwb': (gen, load)}, slack=[99])
+        step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')
+        assert (step.out_dir / 'h1.pwb').exists()
+        sheets = pd.read_excel(step.out_dir / 'h1_03_ScaleLog.xlsx', sheet_name=None)
+        assert {'area_load', 'area_gen', 'step_df', 'balance_df', 'midrun_balance_df'} <= set(sheets)
+        assert (step.out_dir / 'h1_01_Target.xlsx').exists()
+    out = sa.saved['h1.pwb']
+    assert ('Gen', '99') not in sa.applied                                      # The swing was never written.
+    assert abs(out['Gen'].loc['xx', 'MW']) < area.BALANCE_TOL_MW                # Balanced to ~0 MW.
+    assert (out['Load']['DistStatus'] == 'Open').all() and (out['Load']['Status'] == 'Closed').all()
+    assert sheets['area_gen'].set_index('GenType')['Target MW'].to_dict() == {'Hydro': 50.0, 'Thermal': 150.0}
+
+def test_step_02_topology_mode_end_to_end():
+    gen, load = two_cases()
+    epc_gen = gen.assign(MWSetPoint=[0.0, 150.0, 50.0]).iloc[1:]
+    epc_load = load.assign(SMW=300.0)
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        step = load_step_02(Path(d), 'topology')
+        step.run['balance_swing'] = False      # Exact EPC values.
+        sa = CaseSimAuto({'h1.epc': (epc_gen, epc_load), 'Prepared.pwb': (gen, load)}, slack=[99, 2])   # h1 is on a slack bus.
+        step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')
+        log = pd.read_excel(step.out_dir / 'h1_03_ScaleLog.xlsx', sheet_name=None)
+        assert 'area_gen' not in log and 'step_df' in log
+    out = sa.saved['h1.pwb']
+    assert out['Gen']['MWSetPoint'].round(6).to_dict() == {'xx': 0.0, 'g1': 150.0, 'h1': 100.0}   # h1: left alone.
+    assert out['Load']['SMW'].round(6).tolist() == [300.0]
+    assert ('Gen', '99') not in sa.applied and ('Gen', '2') not in sa.applied   # The swing was never written.
+
+def test_slack_bus_gens_are_the_swing_when_there_is_no_giant_swing():
+    # Bus 9 is the slack bus: its unit carries the imbalance, and neither balance writes to it.
+    gen = gens([('s1', 1, '1', 'Closed', 'GT', 100.0, 1000.0, 0.0), ('g1', 1, '2', 'Closed', 'GT', 100.0, 1000.0, 0.0),
+                ('g2', 1, '3', 'Closed', 'HY', 100.0, 1000.0, 0.0)]).assign(BusNum=[9, 1, 2], MW=0.0, NomkV=230.0, BusName='b')
+    load = loads([('l1', 1, 'Closed', 200.0, 0.0, 0.0, 20.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
+    sa = SwingSimAuto(gen, load, slack=[9])
+    assert prep.slack_buses(sa) == [9]
+    after_step, log, _ = area.midrun_balancer(sa)
+    scale.iterate_to_gen_load_targets(sa, load_ramp_targets(), after_step=after_step)
+    assert len(log) >= 1 and ('Gen', '9') not in sa.applied
+    area.balance_swing(sa)
+    assert abs(area.swing_mw(sa.table('Gen'), [9])[0]) < area.BALANCE_TOL_MW and ('Gen', '9') not in sa.applied
 
 # ------------------ settings ------------------
 def test_repo_settings_file_loads():
@@ -579,7 +820,7 @@ def test_repo_settings_file_loads():
         for (m, k), v in saved.items():
             setattr(m, k, v)
 
-def test_settings_apply_and_reject(tmp_path=None):
+def test_settings_apply_and_reject():
     import tempfile
     saved = (scale.EXCLUDE_VMIN, dict(area.UNIT_GENTYPE), set(area.ALL_ON_TYPES), list(area.GEN_TYPES))
     with tempfile.TemporaryDirectory() as d:

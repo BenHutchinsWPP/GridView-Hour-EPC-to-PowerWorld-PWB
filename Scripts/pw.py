@@ -32,6 +32,11 @@ def chk(SimAutoOutput, what: str):
     else:
         return SimAutoOutput[1:]
 
+def connect():
+    """Starts PowerWorld through SimAuto (Windows only: pywin32 is imported here, so nothing else needs it to import)."""
+    import win32com.client
+    return win32com.client.Dispatch("pwrworld.SimulatorAuto")
+
 def run(SimAuto, command: str):
     """Runs a script command."""
     return chk(SimAuto.RunScriptCommand(command), command)
