@@ -5,6 +5,7 @@ Tests for the parts of Scripts/ which don't need PowerWorld. Runs on any OS.
 import re
 import sys
 from pathlib import Path
+import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -490,6 +491,53 @@ def test_midrun_balancer_keeps_the_swing_near_zero_and_never_moves_it():
     assert targets['Load'].loc['l1', 'SMW_Target'] < 3200 and abs(targets['Load'].loc['l1', 'SMW'] - targets['Load'].loc['l1', 'SMW_Target']) < 1e-6
     area.balance_swing(sa)
     assert abs(swing()) < area.BALANCE_TOL_MW and ('Gen', '99') not in sa.applied
+
+def load_ramp_targets():
+    """Load 200 -> 3200 MW with gens fixed: without balancing, the swing would end at +3000 MW."""
+    return {'Gen': targets_df(ObjectID=['g1'], BusNum=[1], ID='1', Status='Closed', Status_Target='Closed',
+                              MWSetPoint=[100.0], MWSetPoint_Target=[100.0]),
+            'Load': targets_df(ObjectID=['l1'], BusNum=[3], ID='1', Status='Closed', Status_Target='Closed',
+                               DistStatus='Open', DistStatus_Target='Open', AreaNumber=1,
+                               **{c: [v] for c, v in zip(scale.SCALED['Load'], [200.0, 20.0, 0, 0, 0, 0, 0, 0])},
+                               **{f'{c}_Target': [v] for c, v in zip(scale.SCALED['Load'], [3200.0, 320.0, 0, 0, 0, 0, 0, 0])})}
+
+def test_swing_band_and_limit_trigger():
+    gen, load = swing_case()
+    gen.loc[gen['ID'] == 'xx', ['MWMax', 'MWMin']] = [500.0, -300.0]
+    saved = area.BALANCE_TRIGGER_MW, area.BALANCE_AT_SWING_LIMITS
+    try:
+        area.BALANCE_TRIGGER_MW, area.BALANCE_AT_SWING_LIMITS = 1000.0, True
+        assert area.swing_band(gen, []) == (-300.0, 500.0)                   # The narrower of the two.
+        area.BALANCE_TRIGGER_MW = 0.0
+        assert area.swing_band(gen, []) == (-300.0, 500.0)
+        area.BALANCE_AT_SWING_LIMITS = False
+        assert area.swing_band(gen, []) == (-np.inf, np.inf)                 # Off.
+
+        sa = SwingSimAuto(gen, load)
+        after_step, log = area.midrun_balancer(sa)
+        targets = load_ramp_targets()
+        scale.iterate_to_gen_load_targets(sa, targets, after_step=after_step)
+        assert log == [] and targets['Load'].loc['l1', 'SMW'] == 3200      # Never balanced.
+
+        area.BALANCE_AT_SWING_LIMITS = True                                  # Balance at the swing's MWMax (500 MW).
+        sa = SwingSimAuto(gen, load)
+        after_step, log = area.midrun_balancer(sa)
+        scale.iterate_to_gen_load_targets(sa, load_ramp_targets(), after_step=after_step)
+        assert len(log) >= 1 and all(r['Swing MW Before'] > 500 for r in log)
+        assert area.swing_mw(sa.table('Gen'), [])[0] <= 500
+    finally:
+        area.BALANCE_TRIGGER_MW, area.BALANCE_AT_SWING_LIMITS = saved
+
+def test_giant_swing_uses_the_mw_limit_settings():
+    sa = FakeSimAuto()
+    saved = prep.SWING_MW_MAX, prep.SWING_MW_MIN
+    try:
+        prep.SWING_MW_MAX, prep.SWING_MW_MIN = 800.0, -100.0
+        prep.create_giant_swing(sa, 1)
+    finally:
+        prep.SWING_MW_MAX, prep.SWING_MW_MIN = saved
+    row = sa.applied[('Gen', '1')]
+    assert (row['MWMax'], row['MWMin'], row['ID']) == ('800.0', '-100.0', 'xx')
 
 def test_rescale_targets():
     targets = {'Gen': targets_df(ObjectID=['g1', 'g2'], MWSetPoint=[50.0, 10.0], MWSetPoint_Start=[0.0, 10.0], MWSetPoint_Target=[100.0, 10.0]),

@@ -359,19 +359,34 @@ def achieved(final: dict[str, pd.DataFrame], reports: dict[str, pd.DataFrame]) -
 # ------------------ Swing balancing ------------------
 BALANCE_TOL_MW = 1.0        # Stop balancing once the swing is within this of 0 MW...
 BALANCE_MAX_ROUNDS = 10     # ...or after this many rounds (losses move with each round, so it takes a few).
-BALANCE_TRIGGER_MW = 1000.0 # While scaling: balance once the swing is further than this from 0 MW (midrun_balancer()).
+# While scaling (midrun_balancer()), balance once the swing goes outside its band:
+BALANCE_TRIGGER_MW = 1000.0         # further than this from 0 MW (0: not used)...
+BALANCE_AT_SWING_LIMITS = False     # ...or past the swing unit's own MWMax / MWMin (summed, if several).
 
 
-def swing_mw(gen: pd.DataFrame, slack_buses) -> tuple[float, list]:
-    """
-    MW on the swing, and the swing's bus numbers. The swing is the giant swing (ID prep.SWING_ID) if the case has one
-    Closed, else every Closed gen on a slack bus.
-    """
+def swing_units(gen: pd.DataFrame, slack_buses) -> pd.DataFrame:
+    """The giant swing (ID prep.SWING_ID) if the case has one Closed, else every Closed gen on a slack bus."""
     on = gen[closed(gen)]
     swing = on[on['ID'] == prep.SWING_ID]
-    if len(swing) == 0:
-        swing = on[on['BusNum'].isin(slack_buses)]
+    return swing if len(swing) else on[on['BusNum'].isin(slack_buses)]
+
+def swing_mw(gen: pd.DataFrame, slack_buses) -> tuple[float, list]:
+    """MW on the swing, and the swing's bus numbers."""
+    swing = swing_units(gen, slack_buses)
     return float(swing['MW'].sum()), sorted(set(swing['BusNum']))
+
+def swing_band(gen: pd.DataFrame, slack_buses) -> tuple[float, float]:
+    """
+    (low, high) MW the swing may sit within while scaling, before midrun_balancer() rebalances: the narrowest of
+    +/- BALANCE_TRIGGER_MW (if not 0) and the swing's MWMin / MWMax (if BALANCE_AT_SWING_LIMITS).
+    """
+    lo, hi = -np.inf, np.inf
+    if BALANCE_TRIGGER_MW:
+        lo, hi = -BALANCE_TRIGGER_MW, BALANCE_TRIGGER_MW
+    if BALANCE_AT_SWING_LIMITS:
+        swing = swing_units(gen, slack_buses)
+        lo, hi = max(lo, float(swing['MWMin'].sum())), min(hi, float(swing['MWMax'].sum()))
+    return lo, hi
 
 def balance_targets(final: dict[str, pd.DataFrame], swing: float, swing_buses) -> dict[str, pd.DataFrame]:
     """
@@ -453,28 +468,37 @@ def rescale_targets(targets: dict[str, pd.DataFrame], moved: dict[str, pd.DataFr
 
 def midrun_balancer(SimAuto):
     """
-    Returns (after_step, log) for scale.iterate_to_gen_load_targets(). After each step, if the swing is further than
-    BALANCE_TRIGGER_MW from 0, moves it onto the whole case's gen and load, half each (balance_targets()), and keeps
-    that in the scaling still to come (rescale_targets()). If a balance leaves the swing over the trigger (e.g. gens at
-    MWMax), the next one waits until the swing has moved another BALANCE_TRIGGER_MW. The swing itself is never moved.
+    Returns (after_step, log) for scale.iterate_to_gen_load_targets(). After each step, if the swing is outside its
+    band (swing_band()), moves it onto the whole case's gen and load, half each (balance_targets()), and keeps that in
+    the scaling still to come (rescale_targets()). If a balance leaves the swing outside the band (e.g. gens at MWMax),
+    the band is widened to where it got to, plus a margin (BALANCE_TRIGGER_MW, or 10% of the band if that's 0), so the
+    next balance waits until the swing has moved that much further. The swing itself is never moved.
     """
     slack = slack_buses(SimAuto)
-    state = {'trigger': BALANCE_TRIGGER_MW}
+    lo, hi = swing_band(read_case(SimAuto)['Gen'], slack)
+    if not (np.isfinite(lo) or np.isfinite(hi)):
+        print('Midrun balancing off: balance_trigger_mw is 0 and balance_at_swing_limits is false.')
+    state = {'lo': lo, 'hi': hi}
     log: list[dict] = []
 
     def after_step(SimAuto, targets):
         swing, swing_buses = swing_mw(read_case(SimAuto)['Gen'], slack)
-        if abs(swing) <= state['trigger']:
+        if state['lo'] <= swing <= state['hi']:
             return
-        print(f'----- Swing at {swing:.1f} MW: balancing half on gen, half on load -----')
+        print(f'----- Swing at {swing:.1f} MW, outside {state["lo"]:.0f} to {state["hi"]:.0f} MW: balancing half on gen, half on load -----')
         moved = balance_targets(read_case(SimAuto), swing, swing_buses)
         scale.iterate_to_gen_load_targets(SimAuto, moved)
         rescale_targets(targets, moved)
         after, _ = swing_mw(read_case(SimAuto)['Gen'], slack)
-        state['trigger'] = max(BALANCE_TRIGGER_MW, abs(after) + BALANCE_TRIGGER_MW)
+        if not lo <= after <= hi:
+            finite = np.isfinite(lo) and np.isfinite(hi)
+            margin = BALANCE_TRIGGER_MW or (0.1 * (hi - lo) if finite else 0.0)
+            state['lo'], state['hi'] = min(lo, after - margin), max(hi, after + margin)
+        else:
+            state['lo'], state['hi'] = lo, hi
         log.append({'Swing MW Before': swing, 'Swing MW After': after,
                     'Gen MW Change': (moved['Gen']['MWSetPoint'] - moved['Gen']['MWSetPoint_Seed']).sum(),
                     'Load MW Change': (moved['Load'][LOAD_P].sum(axis=1) - moved['Load']['P_Seed']).sum(),
-                    'Next Trigger MW': state['trigger']})
+                    'Next Band Low MW': state['lo'], 'Next Band High MW': state['hi']})
 
     return after_step, log

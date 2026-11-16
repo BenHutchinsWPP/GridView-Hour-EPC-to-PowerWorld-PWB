@@ -12,6 +12,8 @@ SHUNT_VHIGH = 1.08              # ...or rises above this.
 SHUNT_MAX_ITERATIONS = 10       # Max one-at-a-time shunt switching passes.
 
 SWING_ID = 'xx'     # ID of the giant swing generator.
+SWING_MW_MAX = 20000.0      # Giant swing MW limits. With [area] balance_at_swing_limits, scaling rebalances
+SWING_MW_MIN = -20000.0     # gen & load whenever the swing goes past them.
 
 # ------------------ Shunts ------------------
 def suggested_shunt_status(df: pd.DataFrame, vlow: float, vhigh: float) -> pd.Series:
@@ -145,8 +147,8 @@ def create_giant_swing(SimAuto, bus_num: int) -> pd.DataFrame:
         ,'MvarMax': 6573.70
         ,'MvarMin': -6573.70
         ,'Mvar': 0.00
-        ,'MWMax': 20000.00
-        ,'MWMin': -20000.00
+        ,'MWMax': SWING_MW_MAX
+        ,'MWMin': SWING_MW_MIN
         ,'FuelTypeCode': "MWH"
         ,'UnitTypeEPC': "42"
         ,'Memo': "Giant Swing for Initial Balance"

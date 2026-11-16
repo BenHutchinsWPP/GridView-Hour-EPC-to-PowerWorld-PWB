@@ -37,7 +37,10 @@ off_at_zero_types = ["Wind", "Solar"]   # At a target of 0, these go offline (th
 manual_unit_types = ["DC"]              # Unit types never scaled (adjusted by hand).
 balance_tol_mw = 1.0
 balance_max_rounds = 10
-balance_trigger_mw = 1000.0     # While scaling: balance once the swing is further than this from 0 MW.
+# While scaling, balance once the swing goes outside its band: further than balance_trigger_mw from 0 (0 = not used),
+# or (balance_at_swing_limits) past the swing unit's own MWMax / MWMin. With both, whichever comes first.
+balance_trigger_mw = 1000.0
+balance_at_swing_limits = false
 # The GenTypes. Add one here to give it its own group, then map unit/fuel codes to it below.
 gen_types = ["Solar", "Hydro", "Wind", "Thermal", "Battery Storage", "Unknown"]
 
@@ -65,6 +68,8 @@ final_max_rounds = 20
 # max_workers = 8           # PowerWorld instances for pretest_gens. Left out: the CPU count.
 
 [prep]
+swing_mw_max = 20000.0      # Giant swing MW limits (used by balance_at_swing_limits).
+swing_mw_min = -20000.0
 shunt_vlow = 0.92
 shunt_vhigh = 1.08
 shunt_max_iterations = 10
