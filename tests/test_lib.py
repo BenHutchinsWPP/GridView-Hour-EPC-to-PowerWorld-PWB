@@ -290,12 +290,25 @@ def test_load_targets_scale_positive_and_negative_separately():
     # Mvar +100 / -98 (net +2) against +300 / -50: one net factor would blow up; split by sign it doesn't.
     case = loads([('l1', 1, 'Closed', 100.0, 0.0, 0.0, 100.0), ('l2', 1, 'Closed', 50.0, 0.0, 0.0, -98.0),
                   ('dc', 1, 'Closed', -500.0, 0.0, 0.0, 0.0)])
-    epc = loads([('e1', 1, 'Closed', 300.0, 0.0, 0.0, 300.0), ('e2', 1, 'Closed', -400.0, 0.0, 0.0, -50.0)])
+    # The negative EPC load is the PWB's dc load (same key), so it isn't netted as EPC-only.
+    epc = loads([('e1', 1, 'Closed', 300.0, 0.0, 0.0, 300.0), ('dc', 1, 'Closed', -400.0, 0.0, 0.0, -50.0)])
     df, report = area.load_targets(epc, case)
     assert df['SMW_Target'].to_dict() == {'l1': 200.0, 'l2': 100.0, 'dc': -400.0}
     assert df['SMvar_Target'].to_dict() == {'l1': 300.0, 'l2': -50.0, 'dc': 0.0}
     r = report.iloc[0]
     assert (r['Target MW +'], r['Target MW -'], r['Seed MW +'], r['Seed MW -']) == (300, -400, 150, -500)
+    assert all(abs(r[c]) < 1e-9 for c in report.columns if c.startswith('Unmet'))
+
+def test_epc_only_negative_loads_are_netted_into_the_positive_load():
+    # X1 (-30 MW, -5 Mvar) is only in the EPC: it lowers the area's positive load instead of going to the swing.
+    case = loads([('l1', 1, 'Closed', 80.0, 0.0, 0.0, 10.0), ('n1', 1, 'Closed', -20.0, 0.0, 0.0, 0.0)])
+    epc = loads([('l1', 1, 'Closed', 100.0, 0.0, 0.0, 20.0), ('n1', 1, 'Closed', -10.0, 0.0, 0.0, 0.0),
+                 ('X1', 1, 'Closed', -30.0, 0.0, 0.0, -5.0)])
+    df, report = area.load_targets(epc, case)
+    assert df['SMW_Target'].to_dict() == {'l1': 70.0, 'n1': -10.0}      # n1 is in both cases: matched as a negative load.
+    assert df.loc['l1', 'SMvar_Target'] == 15.0
+    r = report.iloc[0]
+    assert (r['Target MW'], r['Target MW +'], r['Target MW -'], r['EPC-only Netted MW']) == (60, 70, -10, -30)
     assert all(abs(r[c]) < 1e-9 for c in report.columns if c.startswith('Unmet'))
 
 def test_load_targets_mvar_spread_by_mw_when_no_positive_mvar():
@@ -305,8 +318,9 @@ def test_load_targets_mvar_spread_by_mw_when_no_positive_mvar():
     assert df['SMvar_Target'].tolist() == [10.0, 20.0]
 
 def test_load_targets_negative_target_with_no_negative_seed_load_is_unmet():
-    case = loads([('l1', 1, 'Closed', 10.0, 0.0, 0.0, 0.0)])
-    epc = loads([('e1', 1, 'Closed', 20.0, 0.0, 0.0, 0.0), ('e2', 1, 'Closed', -30.0, 0.0, 0.0, 0.0)])
+    # n1 is in both cases (not EPC-only), negative in the EPC but offline in the PWB: nothing negative to place it on.
+    case = loads([('l1', 1, 'Closed', 10.0, 0.0, 0.0, 0.0), ('n1', 1, 'Open', 0.0, 0.0, 0.0, 0.0)])
+    epc = loads([('l1', 1, 'Closed', 20.0, 0.0, 0.0, 0.0), ('n1', 1, 'Closed', -30.0, 0.0, 0.0, 0.0)])
     df, report = area.load_targets(epc, case)
     assert df['SMW_Target'].tolist() == [20.0]
     assert report['Unmet MW -'].tolist() == [-30.0] and report['Unmet MW +'].tolist() == [0.0]

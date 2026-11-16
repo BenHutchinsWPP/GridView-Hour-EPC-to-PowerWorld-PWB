@@ -115,6 +115,20 @@ def sign_totals(value: pd.Series, area: pd.Series, name: str) -> pd.DataFrame:
     return pd.DataFrame({f'{name} +': value.clip(lower=0).groupby(area).sum(),
                          f'{name} -': value.clip(upper=0).groupby(area).sum()})
 
+def epc_only_negative(epc: pd.DataFrame, case_load: pd.DataFrame, col: str) -> pd.Series:
+    """EPC loads with a negative `col` whose key isn't in the PWB (e.g. GridView's X1/X2 distributed generation loads)."""
+    return ~epc['ObjectID'].isin(case_load['ObjectID']) & (epc[col] < 0)
+
+def netted_sign_totals(epc: pd.DataFrame, case_load: pd.DataFrame, col: str, name: str) -> pd.DataFrame:
+    """
+    The EPC's per-area positive and negative totals of `col` (sign_totals()), with EPC-only negative loads netted into
+    the positive total: the PWB has nothing to place them on, so they lower the area's positive load instead.
+    """
+    netted = epc_only_negative(epc, case_load, col)
+    totals = sign_totals(epc[col].where(~netted, 0.0), epc['AreaNumber'], name)
+    totals[f'{name} +'] += epc[col].where(netted, 0.0).groupby(epc['AreaNumber']).sum().reindex(totals.index, fill_value=0.0)
+    return totals
+
 def sign_share(value: pd.Series, area: pd.Series, target_pos: pd.Series, target_neg: pd.Series,
                fallback: pd.Series | None = None) -> pd.Series:
     """
@@ -157,7 +171,7 @@ def load_targets(epc_load: pd.DataFrame, case_load: pd.DataFrame) -> tuple[pd.Da
     df['Method'] = np.where(df['AreaNumber'].isin(matched), 'Matched keys', 'Area scale')
 
     # Area scale: positive and negative load separately, for MW and for Mvar. See sign_share().
-    tgt = pd.concat([sign_totals(epc['P'], epc['AreaNumber'], 'MW'), sign_totals(epc['Q'], epc['AreaNumber'], 'Mvar')], axis=1)
+    tgt = pd.concat([netted_sign_totals(epc, case_load, 'P', 'MW'), netted_sign_totals(epc, case_load, 'Q', 'Mvar')], axis=1)
     seed = pd.concat([sign_totals(df['P'], df['AreaNumber'], 'MW'), sign_totals(df['Q'], df['AreaNumber'], 'Mvar')], axis=1)
     df['SMW_Target'] = sign_share(df['P'], df['AreaNumber'], tgt['MW +'], tgt['MW -'])
     # Mvar of a sign which no seed load in the area has is spread over its zero-Mvar loads in proportion to |MW|.
@@ -190,6 +204,7 @@ def load_targets(epc_load: pd.DataFrame, case_load: pd.DataFrame) -> tuple[pd.Da
         'EPC Loads': epc[closed(epc)].groupby('AreaNumber').size(),
         # e.g. GridView's X1/X2 distributed generation loads, which aren't in the PWB.
         'EPC-only MW': epc[~epc['ObjectID'].isin(case_load['ObjectID'])].groupby('AreaNumber')['P'].sum(),
+        'EPC-only Netted MW': epc['P'].where(epc_only_negative(epc, case_load, 'P'), 0.0).groupby(epc['AreaNumber']).sum(),
     }).fillna(0.0)
     report['Method'] = np.where(report.index.isin(matched), 'Matched keys', 'Area scale')
     report['Unmet MW'] = report['Target MW'] - report['Planned MW']
