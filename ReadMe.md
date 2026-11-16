@@ -255,3 +255,7 @@ Step 02 balances the swing to within 1 MW of 0 (see [Methodology Summary](#metho
 
 ## Future: CaseBridge instead of PowerWorld in the middle
 See [docs/casebridge-route.md](docs/casebridge-route.md).
+
+---
+
+Ben Hutchins (WPP) designed and scoped this application; the implementation was done with an AI-assist.
