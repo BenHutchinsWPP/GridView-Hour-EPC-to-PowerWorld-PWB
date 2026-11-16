@@ -341,7 +341,7 @@ def catch_up(SimAuto, targets, progress: int, step: int, bisect: bool) -> int:
         df.loc[rows.index[df.loc[rows.index, 'Progress'] >= progress], 'HeldReason'] = ''
     return moved
 
-def retry_held(SimAuto, targets):
+def retry_held(SimAuto, targets, label: str):
     """
     Once the rest have reached their targets: retries held gens/loads, bisecting to find those which still diverge.
     Tries one jump to target first, and halves the jump whenever a round moves nothing.
@@ -352,7 +352,7 @@ def retry_held(SimAuto, targets):
         hold_voltage(targets, bus_vpu(SimAuto))
         if not any(held(df).any() for df in targets.values()):
             break
-        print(f'Retrying held gens/loads, {step}/{RESOLUTION} at a time.')
+        print(f'{label}: retrying held gens/loads, {step}/{RESOLUTION} at a time.')
         if catch_up(SimAuto, targets, RESOLUTION, step, bisect=True):
             prep.adjust_shunts(SimAuto)
         elif step > 1:
@@ -363,7 +363,7 @@ def retry_held(SimAuto, targets):
         mask = held(df)
         df.loc[mask, 'ExclusionReason'] = df.loc[mask, 'HeldReason']
 
-def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None) -> dict[str,pd.DataFrame]:
+def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None, label='Main scaling') -> dict[str,pd.DataFrame]:
     """
     Scales included gens & loads from their start to their targets. Returns the scale log sheets.
     Steps are in 1/RESOLUTION units. Each step which solves doubles the next one (up to MAX_STEP),
@@ -371,7 +371,8 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None)
     the gens/loads which diverge are held back at their last good values, and the rest go ahead.
     Held gens/loads (including those on buses outside the voltage band) are retried after each step, and again at the end.
     pvqv_df: optional PVQV sensitivities. If given, gens/loads with a large linear dV estimate are excluded up front.
-    after_step: optional function(SimAuto, targets), called after each step (e.g. area.midrun_balancer()).
+    after_step: optional function(SimAuto, targets, progress), called after each step (e.g. area.midrun_balancer()).
+    label: names this run in the printed progress, to tell a balance's own scaling from the main one.
     """
     if not pw.solve(SimAuto):
         raise pw.SimAutoError('Could not solve the original input case.')
@@ -404,7 +405,7 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None)
     while progress < RESOLUTION:
         step = min(step, RESOLUTION - progress)
         goal = progress + step
-        print(f'----- Scaling {progress} -> {goal} of {RESOLUTION} -----')
+        print(f'----- {label}: {progress} -> {goal} of {RESOLUTION} -----')
         new = {table: at_progress(table, df[scaling(df)], goal) for table, df in targets.items()}
         with pw.trial(SimAuto, solves=STEP_SOLVES) as t:
             for table, new_df in new.items():
@@ -436,17 +437,17 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None)
             statcoms[statcom[0]] = statcom[1]
         log(start, goal, result, catch_up(SimAuto, targets, progress, step, bisect=False))
         if after_step:
-            after_step(SimAuto, targets)
+            after_step(SimAuto, targets, progress)
         if t.ok:
             step = min(step * 2, MAX_STEP)
         elif failed_step:
             step = failed_step      # The gens/loads which diverged are held now, so go back to the larger step.
         failed_step = None
 
-    retry_held(SimAuto, targets)
+    retry_held(SimAuto, targets, label)
     set_gen_load_status(SimAuto, targets)
 
-    print('Reached end of iterate_to_gen_load_targets(). Returning.')
+    print(f'----- {label}: done -----')
 
     # Package the logs for return.
     return {

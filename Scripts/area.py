@@ -538,7 +538,7 @@ def balance_swing(SimAuto) -> dict[str, pd.DataFrame]:
         if abs(swing) < BALANCE_TOL_MW:
             break
         targets = balance_targets(final, swing, swing_buses)
-        log = scale.iterate_to_gen_load_targets(SimAuto, targets)
+        log = scale.iterate_to_gen_load_targets(SimAuto, targets, label=f'Final balance {i + 1}')
         rounds.append({'Round': i + 1, 'Swing MW': swing, 'Swing Buses': str(swing_buses), **mw_changes(targets)})
         sheets.update({f'balance{i + 1}_{name}': df for name, df in log.items() if len(df)})
     else:
@@ -573,14 +573,15 @@ def midrun_balancer(SimAuto):
     log: list[dict] = []
     sheets: dict[str, pd.DataFrame] = {}
 
-    def after_step(SimAuto, targets):
+    def after_step(SimAuto, targets, progress):
         gen = pw.get_df(SimAuto, 'Gen', GEN_FIELDS)
         swing, swing_buses = swing_mw(gen, slack)
         if state['lo'] <= swing <= state['hi']:
             return
         print(f'----- Swing at {swing:.1f} MW, outside {state["lo"]:.0f} to {state["hi"]:.0f} MW: balancing half on gen, half on load -----')
         moved = balance_targets({'Load': pw.get_df(SimAuto, 'Load', LOAD_FIELDS), 'Gen': gen}, swing, swing_buses)
-        nested = scale.iterate_to_gen_load_targets(SimAuto, moved)
+        label = f'Balance {len(log) + 1} (main scaling at {progress} of {scale.RESOLUTION})'
+        nested = scale.iterate_to_gen_load_targets(SimAuto, moved, label=label)
         sheets.update({f'midrun{len(log) + 1}_{name}': df for name, df in nested.items() if len(df)})
         rescale_targets(targets, moved)
         after, _ = swing_mw(pw.get_df(SimAuto, 'Gen', GEN_FIELDS), slack)
