@@ -231,7 +231,7 @@ def test_classify_gen_type():
 def loads(rows):
     """rows: (ObjectID, AreaNumber, Status, SMW, IMW, ZMW, SMvar)."""
     df = pd.DataFrame(rows, columns=['ObjectID', 'AreaNumber', 'Status', 'SMW', 'IMW', 'ZMW', 'SMvar'])
-    return df.assign(BusNum=1, ID='1', IMvar=0.0, ZMvar=0.0, DistStatus='Closed', DistMWInput=5.0, DistMvarInput=1.0)
+    return df.assign(BusNum=1, ID='1', AGC='YES', IMvar=0.0, ZMvar=0.0, DistStatus='Closed', DistMWInput=5.0, DistMvarInput=1.0)
 
 def test_load_targets():
     case = loads([('l1', 1, 'Closed', 60.0, 20.0, 20.0, 10.0), ('l2', 1, 'Closed', 100.0, 0.0, 0.0, 10.0),
@@ -330,6 +330,7 @@ def test_achieved_reads_the_final_case_and_open_load_cleanup():
     assert a['area_gen'][['GenType', 'Final MW', 'Final Error MW']].values.tolist() == [['Hydro', 30.0, -10.0]]
     cleanup = area.open_load_cleanup(case)
     assert cleanup['ObjectID'].tolist() == ['lo'] and cleanup['DistMWInput'].tolist() == [0.0]
+    assert len(area.open_load_cleanup(case.assign(AGC='NO'))) == 0     # Non-conforming: untouched.
 
 def test_area_targets_through_the_engine():
     case = loads([('l1', 1, 'Closed', 60.0, 20.0, 20.0, 10.0), ('l2', 1, 'Closed', 100.0, 0.0, 0.0, 10.0)])
@@ -424,6 +425,23 @@ def test_commitment_headroom_and_all_on_types():
     case = gens([('b1', 1, '1', 'Closed', 'BA', 5.0, 50.0, -50.0), ('b2', 1, '2', 'Open', 'BA', 0.0, 50.0, -50.0)])
     df, _ = area.gen_targets(gens([]), case)
     assert df['Status_Target'].to_dict() == {'b1': 'Closed'} and df['MWSetPoint_Target'].tolist() == [0.0]
+
+def test_nonconforming_loads_are_left_alone():
+    # l2 / e2 are non-conforming (AGC NO): kept at seed value, out of both area totals, out of balancing.
+    case = loads([('l1', 1, 'Closed', 100.0, 0.0, 0.0, 10.0), ('l2', 1, 'Closed', 500.0, 0.0, 0.0, 0.0)]).assign(AGC=['YES', 'NO '])
+    epc = loads([('e1', 1, 'Closed', 150.0, 0.0, 0.0, 15.0), ('e2', 1, 'Closed', 900.0, 0.0, 0.0, 0.0)]).assign(AGC=['YES', 'NO'])
+    targets, reports = area.build_targets({'Load': epc, 'Gen': gens([])}, {'Load': case, 'Gen': gens([])})
+    assert targets['Load'].index.tolist() == ['l1'] and targets['Load'].loc['l1', 'SMW_Target'] == 150
+    r = reports['area_load'].iloc[0]
+    assert (r['Target MW'], r['Seed Non-conforming MW'], r['EPC Non-conforming MW']) == (150, 500, 900)
+    bal = area.balance_targets({'Gen': gens([('g1', 1, '1', 'Closed', 'GT', 100.0, 300.0, 0.0)]), 'Load': case}, 50.0, [])
+    assert bal['Load'].index.tolist() == ['l1']
+    area.SCALE_NONCONFORMING = True
+    try:
+        targets, _ = area.build_targets({'Load': epc, 'Gen': gens([])}, {'Load': case, 'Gen': gens([])})
+        assert targets['Load']['SMW_Target'].sum() == 1050
+    finally:
+        area.SCALE_NONCONFORMING = False
 
 def test_build_targets_leaves_slack_bus_gens_out_of_both_cases():
     # Identical cases: the slack-bus unit's 300 MW is not loaded onto g1, and the area still matches by key.

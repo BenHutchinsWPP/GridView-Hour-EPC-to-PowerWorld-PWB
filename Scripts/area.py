@@ -85,7 +85,7 @@ def classify_gen_type(df: pd.DataFrame) -> pd.Series:
 
 # ------------------ Fields read from each case ------------------
 _KEY = {'ObjectID': str, 'BusNum': int, 'BusName': str, 'NomkV': float, 'ID': str, 'AreaNumber': int}
-LOAD_FIELDS: dict[str, type] = {**_KEY, 'Status': str, 'DistStatus': str, **{c: float for c in scale.SCALED['Load']}}
+LOAD_FIELDS: dict[str, type] = {**_KEY, 'Status': str, 'AGC': str, 'DistStatus': str, **{c: float for c in scale.SCALED['Load']}}
 GEN_FIELDS: dict[str, type] = {**_KEY, 'Status': str, 'MW': float, 'MWSetPoint': float, 'MWMax': float, 'MWMin': float,
                                'UnitTypeCode': str, 'FuelTypeCode': str}
 
@@ -132,6 +132,12 @@ def sign_share(value: pd.Series, area: pd.Series, target_pos: pd.Series, target_
             k_fb = (t / w_sum).where((seed <= 0) & (w_sum > 0), 0.0)
             new += sign * w * area.map(k_fb)
     return new
+
+# Non-conforming loads: PowerWorld's load AGC field is NO (the RAW SCALE flag 0; an EPC's nonc flag 1, presumably).
+SCALE_NONCONFORMING = False     # False: they keep their seed values, and are left out of both cases' area totals.
+
+def conforming(load: pd.DataFrame) -> pd.Series:
+    return load['AGC'].fillna('').astype(str).str.strip().str.upper() != 'NO'
 
 def load_targets(epc_load: pd.DataFrame, case_load: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
@@ -322,19 +328,25 @@ def build_targets(epc: dict[str, pd.DataFrame], case: dict[str, pd.DataFrame], s
     Gens on swing_buses (the slack bus) are left out of both cases: the solution sets their MW, and swing balancing
     deals with what they carry.
     """
-    load, load_report = load_targets(epc['Load'], case['Load'])
+    epc_load, case_load = epc['Load'], case['Load']
+    if not SCALE_NONCONFORMING:
+        epc_load, case_load = epc_load[conforming(epc_load)], case_load[conforming(case_load)]
+    load, load_report = load_targets(epc_load, case_load)
+    nonc = lambda df: df[~conforming(df) & closed(df)].assign(P=lambda d: d[LOAD_P].sum(axis=1)).groupby('AreaNumber')['P'].sum()
+    load_report['Seed Non-conforming MW'] = load_report['AreaNumber'].map(nonc(case['Load'])).fillna(0.0)
+    load_report['EPC Non-conforming MW'] = load_report['AreaNumber'].map(nonc(epc['Load'])).fillna(0.0)
     off_swing = lambda df: df[~df['BusNum'].isin(swing_buses)]
     gen, gen_report = gen_targets(off_swing(epc['Gen']), off_swing(case['Gen']))
     return {'Gen': gen, 'Load': load}, {'area_load': load_report, 'area_gen': gen_report}
 
 def open_load_cleanup(case_load: pd.DataFrame) -> pd.DataFrame:
     """Open loads with distributed generation left on: set it Open & 0 (no effect on the solution)."""
-    df = case_load[~closed(case_load) & ((case_load['DistStatus'] == 'Closed') | (case_load['DistMWInput'] != 0) | (case_load['DistMvarInput'] != 0))]
+    df = case_load[~closed(case_load) & (conforming(case_load) | SCALE_NONCONFORMING) & ((case_load['DistStatus'] == 'Closed') | (case_load['DistMWInput'] != 0) | (case_load['DistMvarInput'] != 0))]
     return df.assign(DistStatus='Open', DistMWInput=0.0, DistMvarInput=0.0)
 
 def achieved(final: dict[str, pd.DataFrame], reports: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     """Adds what the scaled case holds (`final`: read_case() of it, after scaling) to the area reports."""
-    load = final['Load'][closed(final['Load'])]
+    load = final['Load'][closed(final['Load']) & (conforming(final['Load']) | SCALE_NONCONFORMING)]
     got_p = load[LOAD_P].sum(axis=1).groupby(load['AreaNumber']).sum()
     got_q = load[LOAD_Q].sum(axis=1).groupby(load['AreaNumber']).sum()
     area_load = reports['area_load'].assign(**{
@@ -403,7 +415,7 @@ def balance_targets(final: dict[str, pd.DataFrame], swing: float, swing_buses) -
     gen['Status_Target'] = gen['Status']
 
     load = final['Load']
-    load = load[closed(load)].copy()
+    load = load[closed(load) & (conforming(load) | SCALE_NONCONFORMING)].copy()
     p = load[LOAD_P].sum(axis=1)
     load = load[p > 0]
     k_load = 1 - (swing / 2) / p[p > 0].sum() if len(load) else 1.0
