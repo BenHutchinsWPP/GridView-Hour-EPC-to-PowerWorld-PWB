@@ -32,7 +32,9 @@ def adjust_shunts(SimAuto):
     def shunt_changes():
         df = pw.get_df(SimAuto, 'Shunt', {'ObjectID': str, 'MvarNom': float, 'Status': str, 'Vpu': float})
         new_status = suggested_shunt_status(df, SHUNT_VLOW, SHUNT_VHIGH)
-        return df[df['Status'] != new_status].assign(Status=new_status)
+        changed = df['Status'] != new_status
+        # Filter both sides: assigning a full Series to an empty frame makes one blank row per shunt.
+        return df[changed].assign(Status=new_status[changed])
 
     # Adjust all shunts in one go, to get the bulk of the work done.
     with pw.trial(SimAuto):

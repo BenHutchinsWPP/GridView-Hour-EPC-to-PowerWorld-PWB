@@ -103,6 +103,17 @@ def test_suggested_shunt_status():
     df = pd.DataFrame({'MvarNom': [50, 50, -50, -50, 50], 'Status': ['Open', 'Closed', 'Closed', 'Open', 'Open'], 'Vpu': [0.9, 1.1, 0.9, 1.1, 1.0]})
     assert prep.suggested_shunt_status(df, 0.92, 1.08).tolist() == ['Closed', 'Open', 'Open', 'Closed', 'Open']
 
+def test_adjust_shunts_writes_nothing_when_all_in_band():
+    class ShuntSimAuto(FakeSimAuto):
+        def GetParametersMultipleElementRect(self, table, fields, filter_group):
+            if table != 'Shunt':
+                return super().GetParametersMultipleElementRect(table, fields, filter_group)
+            row = {'ObjectID': 'Shunt 1 1', 'MvarNom': '50', 'Status': 'Closed', 'Vpu': '1.0'}
+            return ('', [[row[f] for f in fields]])
+    sa = ShuntSimAuto()
+    prep.adjust_shunts(sa)
+    assert sa.applied == {}     # Was: one blank row per shunt, written by a blank ObjectID.
+
 # ------------------ topo ------------------
 def test_transformer_is_okay_flags_low_fixed_taps():
     df = pd.DataFrame({'Tap': [1.0, 1.0], 'NomkVFrom': 230.0, 'XFNomkVbaseFrom': 230.0, 'NomkVTo': 115.0, 'XFNomkVbaseTo': 115.0,
