@@ -1,21 +1,17 @@
 """
-Step 01: make the PWB seed case match the GridView topology, and prepare it for scaling.
+Topology mode, step 01: make the PWB seed case match the GridView topology (missing elements, transformer taps,
+branch statuses, distributed generation loads). The preparation both modes share is in prep.py.
 """
 from pathlib import Path
 import pandas as pd
-from . import pw
+from . import pw, scale
 
 # ------------------ Tuning thresholds ------------------
 TAP_THRESHOLD = 0.15            # Transformer taps / nominal kV further than this from 1.0 PU are reset to 1.0.
-SHUNT_VLOW = 0.92               # Switch shunts when bus Vpu drops below this...
-SHUNT_VHIGH = 1.08              # ...or rises above this.
-SHUNT_MAX_ITERATIONS = 10       # Max one-at-a-time shunt switching passes.
 
 # Branch types which GridView may drop from EPC exports. Excluded from branch status matching.
 # Check these match BranchDeviceType values in your PowerWorld version.
 UNSUPPORTED_GV_BRANCH_TYPES = ['Breaker', 'Disconnect', 'Fuse', 'Ground Disconnect', 'Load Break Disconnect', 'ZBR']
-
-SWING_ID = 'xx'     # ID of the giant swing generator.
 
 # ------------------ Case data ------------------
 # All the required network-parameters to fully define each object, for copying missing elements.
@@ -346,14 +342,14 @@ def create_distgen_XN_loads(SimAuto, gv_load_df: pd.DataFrame) -> pd.DataFrame:
     return missing_df
 
 # ------------------ Transformer taps ------------------
-def transformer_is_okay(df: pd.DataFrame, threshold: float = TAP_THRESHOLD) -> pd.Series:
+def transformer_is_okay(df: pd.DataFrame) -> pd.Series:
     def near_one(s):
-        return (s - 1.0).abs() < threshold
+        return (s - 1.0).abs() < TAP_THRESHOLD
     return (near_one(df['Tap'])
             & near_one(df['NomkVFrom'] / df['XFNomkVbaseFrom']) & near_one(df['TapFixedFrom'])
             & near_one(df['NomkVTo'] / df['XFNomkVbaseTo']) & near_one(df['TapFixedTo']))
 
-def fix_transformer_taps(SimAuto, threshold = TAP_THRESHOLD):
+def fix_transformer_taps(SimAuto):
     # In GridView, some transformer models may have transformer nominal kV and tap positions which are aggregious errors.
     # GridView doesn't have issues with this (DC Loadflow), but this certainly will cause problems in PowerWorld.
     # If Nominal kV and Tap positions are far out of range, fix them to 1.0 PU based on the bus nominal kV.
@@ -369,7 +365,7 @@ def fix_transformer_taps(SimAuto, threshold = TAP_THRESHOLD):
         ,'Tap': float
     }
     df = pw.get_df(SimAuto, 'Branch', fields, "BranchDeviceType = 'Transformer'")
-    bad_df = df[~transformer_is_okay(df, threshold)]
+    bad_df = df[~transformer_is_okay(df)]
 
     fix_df = bad_df.assign(
         XFNomkVbaseFrom=bad_df['NomkVFrom']
@@ -416,154 +412,46 @@ def set_branch_statuses(SimAuto, left_case_dict, right_case_dict):
     failed = pw.set_df_bisect(SimAuto, 'Branch', changes_df.assign(Status=changes_df['StatusLeft']), ['ObjectID', 'Status'])
     return [status_targets_df, changes_df.loc[failed]]
 
-# ------------------ Shunts ------------------
-def suggested_shunt_status(df: pd.DataFrame, vlow: float, vhigh: float) -> pd.Series:
-    """Switch reactors out / capacitors in on low voltage, and the reverse on high voltage."""
-    reactor, capacitor = df['MvarNom'] < 0, df['MvarNom'] > 0
-    closed, opened = df['Status'] == 'Closed', df['Status'] == 'Open'
-    low, high = df['Vpu'] < vlow, df['Vpu'] > vhigh
+# ------------------ Targets (step 02) ------------------
+TARGET_FIELDS = {
+    table: {'ObjectID': str, 'BusNum': int, 'BusName': str, 'NomkV': float, 'ID': str,
+            **{s: str for s in scale.STATUS[table]}, **{c: float for c in scale.SCALED[table]}}
+    for table in scale.STATUS
+}
 
-    new_status = df['Status'].copy()
-    new_status[(reactor & closed & low) | (capacitor & closed & high)] = 'Open'
-    new_status[(reactor & opened & high) | (capacitor & opened & low)] = 'Closed'
-    return new_status
+def compute_pw_targets(SimAuto, gv_fp: Path, pw_fp: Path, dummy_bus_fp: Path) -> dict[str,pd.DataFrame]:
+    """Returns {'Gen': df, 'Load': df} targets, taking the GridView EPC's gens & loads into the PWB case. See build_targets()."""
+    open_gv_case(SimAuto, gv_fp, dummy_bus_fp)
+    gv = {table: pw.get_df(SimAuto, table, fields) for table, fields in TARGET_FIELDS.items()}
 
-def adjust_shunts(SimAuto, vlow: float = SHUNT_VLOW, vhigh: float = SHUNT_VHIGH, max_iterations: int = SHUNT_MAX_ITERATIONS):
-    """Switches shunts to attempt to get buses back within a voltage band."""
-    def shunt_changes():
-        df = pw.get_df(SimAuto, 'Shunt', {'ObjectID': str, 'MvarNom': float, 'Status': str, 'Vpu': float})
-        new_status = suggested_shunt_status(df, vlow, vhigh)
-        return df[df['Status'] != new_status].assign(Status=new_status)
+    pw.open_case(SimAuto, pw_fp)
+    case = {table: pw.get_df(SimAuto, table, fields) for table, fields in TARGET_FIELDS.items()}
+    SimAuto.CloseCase()
 
-    # Adjust all shunts in one go, to get the bulk of the work done.
-    with pw.trial(SimAuto):
-        pw.set_df(SimAuto, 'Shunt', shunt_changes(), ['ObjectID', 'Status'])
+    return build_targets(gv, case)
 
-    # Adjust 1 shunt at a time, solve, see if any more need adjustment.
-    # This helps fix situations where a bus has several shunts, and only some need to be online.
-    failed: list[str] = []
-    for _ in range(max_iterations):
-        df = shunt_changes()
-        df = df[~df['ObjectID'].isin(failed)]
-        if len(df) == 0:
-            return # Nothing left to do! All shunt voltages within bounds.
-        # Adjust the smallest shunts first
-        row_df = df.sort_values(by='MvarNom', key=abs).iloc[[0]]
-        with pw.trial(SimAuto) as t:
-            pw.set_df(SimAuto, 'Shunt', row_df, ['ObjectID', 'Status'])
-        if not t.ok:
-            failed.append(row_df['ObjectID'].iloc[0])
+def build_targets(gv: dict[str,pd.DataFrame], case: dict[str,pd.DataFrame]) -> dict[str,pd.DataFrame]:
+    """Puts the case's gens & loads side by side with their GridView targets (each element to its own EPC value)."""
+    targets = {}
+    for table, statuses in scale.STATUS.items():
+        gv_df = gv[table]
+        if table == 'Load':
+            # GridView leaves distributed generation in the load table at seed-case values, unused. Target Open & 0 MW.
+            gv_df = gv_df.assign(DistStatus='Open', DistMWInput=0.0, DistMvarInput=0.0)
 
-# ------------------ Fault duty, PVQV, swing ------------------
-def get_fault_duty(SimAuto) -> pd.DataFrame:
-    """
-    Returns a dataframe of fault duty at every bus.
-    Note: deletes any existing Fault objects in the case.
-    """
-    bus_df = pw.get_df(SimAuto, 'Bus', {'ObjectID': str, 'Number': int, 'Name': str, 'NomkV': float})
+        fields = [*statuses, *scale.SCALED[table]]
+        df = case[table].merge(gv_df[['ObjectID', *fields]], on='ObjectID', how='left', suffixes=('', '_Target'))
+        for f in fields:
+            df[f'{f}_Seed'] = df[f]
 
-    fault_df = pd.DataFrame()
-    fault_df['FaultName'] = bus_df['Number'].astype(str) + ' : ' + bus_df['Name'].astype(str) + ' : ' + bus_df['NomkV'].astype(str)
-    fault_df['WhoAmI'] = bus_df['ObjectID']
-    fault_df['CustomInteger:0'] = bus_df['Number']
-    fault_df['FaultType'] = '3PB'
-    fault_df['FaultImpedance'] = 0
-    fault_df['FaultImpedance:1'] = 0
+        # Elements which aren't in the GridView hour are opened.
+        df = df.fillna({**{f'{s}_Target': 'Open' for s in statuses}, **{f'{c}_Target': 0.0 for c in scale.SCALED[table]}})
 
-    with pw.creating(SimAuto):
-        pw.run(SimAuto, 'Delete(Fault);')
-        pw.set_df(SimAuto, 'Fault', fault_df, list(fault_df.columns))
+        # Anything open, now or in the target, is at 0 MW / 0 Mvar.
+        for suffix in ('', '_Target'):
+            for status, zeroed in statuses.items():
+                df.loc[df[status + suffix] == 'Open', [c + suffix for c in zeroed]] = 0.0
 
-    fault_fields = {
-        'FaultName': str
-        ,'WhoAmI': str
-        ,'CustomInteger:0': int
-        ,'FaultType': str
-        ,'FaultImpedance': float
-        ,'FaultImpedance:1': float
-        ,'BusNomVolt': float
-        ,'ABCPhaseI': float
-    }
-
-    pw.run(SimAuto, 'EnterMode(RUN);')
-    pw.run(SimAuto, 'FaultMultiple(NO);')
-
-    result_df = pw.get_df(SimAuto, 'Fault', fault_fields)
-    result_df.rename(columns={"CustomInteger:0": "BusNumber"}, inplace=True)
-    # MVA = sqrt(3) * kV * kA
-    result_df['MVA'] = (3 ** 0.5) * result_df['BusNomVolt'] * result_df['ABCPhaseI']
-
-    # Don't leave thousands of study faults in the saved case.
-    pw.run(SimAuto, 'EnterMode(EDIT);')
-    pw.run(SimAuto, 'Delete(Fault);')
-
-    return result_df
-
-def get_pvqv(SimAuto) -> pd.DataFrame:
-    """
-    Calculates bus voltage MW & MVAR self-sensitivity.
-    Tools -> Sensitivities -> Flow and Voltage Sensitivities -> Self Sensitivity (Tab)
-    """
-    bus_fields = {
-        'Number': int
-        ,'Name': str
-        ,'NomkV': float
-        ,'AreaNumber': int
-        ,'AreaName': str
-        ,'SensdVdPself': float
-        ,'SensdVdQself': float
-        ,'Vpu': float
-    }
-
-    pw.run(SimAuto, 'EnterMode(RUN);')
-    pw.run(SimAuto, 'CalculateVoltSelfSense();')
-    return pw.get_df(SimAuto, 'Bus', bus_fields)
-
-def max_fault_duty_bus(fault_df) -> int:
-    return int(fault_df.loc[fault_df['MVA'].idxmax(), 'BusNumber'])
-
-def slack_bus(SimAuto) -> int:
-    """The case's existing swing bus (the first, if there are several)."""
-    bus_df = pw.get_df(SimAuto, 'Bus', {'Number': int, 'Slack': str})
-    return int(bus_df.loc[bus_df['Slack'] == 'YES', 'Number'].iloc[0])
-
-def create_giant_swing(SimAuto, bus_num: int) -> pd.DataFrame:
-    """
-    Creates a giant swing/slack unit on the given bus, e.g. max_fault_duty_bus() or slack_bus().
-    """
-    # Get current bus information at the swing bus.
-    bus_df = pw.get_df(SimAuto, 'Bus', {'Number': int, 'Name': str, 'NomkV': float, 'Vpu': float})
-    bus_row = bus_df.loc[bus_df['Number'] == bus_num].iloc[0]
-
-    swing_dict = {
-        'BusNum': bus_num
-        ,'BusName': bus_row['Name']
-        ,'NomkV': bus_row['NomkV']
-        ,'ID': SWING_ID
-        ,'VoltSet': bus_row['Vpu']
-        ,'MW': 0.00
-        ,'Status': "Closed"
-        ,'AVR': "YES"
-        ,'AGC': "YES"
-        ,'MvarMax': 6573.70
-        ,'MvarMin': -6573.70
-        ,'Mvar': 0.00
-        ,'MWMax': 20000.00
-        ,'MWMin': -20000.00
-        ,'FuelTypeCode': "MWH"
-        ,'UnitTypeEPC': "42"
-        ,'Memo': "Giant Swing for Initial Balance"
-    }
-    swing_df = pd.DataFrame([swing_dict])
-
-    with pw.creating(SimAuto):
-        pw.set_df(SimAuto, 'Gen', swing_df, list(swing_dict))
-
-    # Disable any other swings, and make this bus the system swing.
-    pw.run(SimAuto, 'SetData(Bus,[Slack],[NO],ALL);')
-    pw.run(SimAuto, f'SetData(Bus,[Number,Slack],[{int(bus_num)}, YES]);')
-
-    # Turn off MW AGC
-    pw.set_df(SimAuto, 'Sim_Solution_Options_Value', pd.DataFrame({'Option':['ChkMWAGC'], 'Value':['NO']}), ['Option', 'Value'])
-
-    return swing_df
+        df['ExclusionReason'] = ''
+        targets[table] = df.set_index('ObjectID')
+    return targets

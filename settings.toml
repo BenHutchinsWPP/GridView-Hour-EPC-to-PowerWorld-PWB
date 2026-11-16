@@ -1,0 +1,75 @@
+# Settings for "01 Prepare Seed.py" and "02 Scale Hours.py". Read by Scripts/settings.py.
+# A setting left out keeps its default (the value in the Scripts/*.py file it belongs to). An unknown name is an error.
+
+[run]
+# "area": match each area's load, and each area's generation by type, by scaling what is in the seed PWB.
+#         Topology isn't matched. Areas whose gens (or loads) have the same keys in both cases match unit by unit.
+# "topology": make the seed match the GridView topology (missing elements, branch statuses), then match every
+#         gen and load to its own EPC value.
+mode = "area"
+case_format = "PWB23"
+
+# Swing. true: add a giant swing generator (ID "xx") to take up the imbalance while scaling.
+# false: use the case's own swing (the gens on its slack bus).
+create_giant_swing = true
+# Where the giant swing goes: "slack" (the case's slack bus), "max_fault_duty" (computes fault duty on every bus: slow),
+# or a bus number.
+swing_bus = "slack"
+# After scaling, move what is left on the swing onto the whole case's gen and load (half each) until it is ~0 MW.
+balance_swing = true
+
+# Seed preparation (step 01).
+adjust_seed_shunts = true
+gen_terminal_voltage_control = true     # Scripts/GenTerminalVoltageControl.aux
+compute_pvqv = true                     # PVQV self-sensitivities, for use_pvqv.
+
+# Scaling (step 02).
+pretest_gens = false    # Test each gen target alone first, in parallel PowerWorld instances; exclude those which diverge.
+use_pvqv = false        # Exclude gens/loads whose linear PVQV voltage change estimate is too large.
+
+[area]
+# Unit commitment per area & GenType: bring gens online / take them offline to suit the target.
+commit = true
+commit_max_cf = 0.9                     # Thermal & Unknown: commit until the target is at most this of online MWMax.
+all_on_types = ["Hydro", "Wind", "Solar", "Battery Storage"]    # Every unit online, all at the same % output.
+off_at_zero_types = ["Wind", "Solar"]   # At a target of 0, these go offline (the other all-on types keep their status).
+manual_unit_types = ["DC"]              # Unit types never scaled (adjusted by hand).
+balance_tol_mw = 1.0
+balance_max_rounds = 10
+# The GenTypes. Add one here to give it its own group, then map unit/fuel codes to it below.
+gen_types = ["Solar", "Hydro", "Wind", "Thermal", "Battery Storage", "Unknown"]
+
+# Overrides of the unit type -> GenType map in Scripts/area.py (UNIT_GENTYPE). "fuel" = decide by the fuel type.
+[area.unit_gentype]
+# PS = "Battery Storage"
+# CP = "Battery Storage"
+
+# Overrides of the fuel type -> GenType map (FUEL_GENTYPE), used when the unit type says "fuel".
+[area.fuel_gentype]
+
+[scale]
+add_statcoms = true         # Add a STATCOM (ID "SC") on the lowest-voltage bus below statcom_vpu.
+drop_collapsed = true       # Open branches into network sections below collapse_vpu.
+exclude_vmin = 0.88         # Hold gens/loads back from scaling while their bus is outside this band.
+exclude_vmax = 1.12
+statcom_vpu = 0.85
+statcom_vnom_min = 50
+collapse_vpu = 0.80
+pvqv_dv_limit = 0.10
+initial_step = 25           # In 1/100ths of the way to the target. Doubles after each step which solves...
+max_step = 100              # ...up to this. Halves after each which diverges, down to 1, then bisects.
+step_solves = 2
+final_max_rounds = 20
+# max_workers = 8           # PowerWorld instances for pretest_gens. Left out: the CPU count.
+
+[prep]
+shunt_vlow = 0.92
+shunt_vhigh = 1.08
+shunt_max_iterations = 10
+
+[topology]
+tap_threshold = 0.15
+unsupported_gv_branch_types = ["Breaker", "Disconnect", "Fuse", "Ground Disconnect", "Load Break Disconnect", "ZBR"]
+
+[pw]
+mva_mismatch_threshold = 1.0    # Max bus MVA mismatch for a solve to count as converged.

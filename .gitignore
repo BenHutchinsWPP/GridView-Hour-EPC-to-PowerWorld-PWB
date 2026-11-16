@@ -20,9 +20,12 @@ HourEPCs/*.epc
 Output/*.pwb
 Output/*.xls*
 Seed/*.pwb
-TopoSeed/*.pwb
-TopoSeed/*.csv
-TopoSeed/*.aux
-TopoSeed/*.xls*
+Prepared/*.pwb
+Prepared/*.csv
+Prepared/*.aux
+Prepared/*.xls*
 
 *pycache*
+
+# docs/ is matched by *.doc* above.
+!docs/

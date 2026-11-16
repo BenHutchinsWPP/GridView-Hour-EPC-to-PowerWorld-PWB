@@ -56,7 +56,7 @@ def set_df(SimAuto, table: str, df: pd.DataFrame, fields: list[str]):
     chk(SimAuto.ChangeParametersMultipleElementRect(table, fields, rows), f'Set {table}')
 
 @contextmanager
-def trial(SimAuto, threshold = MVA_MISMATCH_THRESHOLD, solves: int = 1, keep_changes: bool = True):
+def trial(SimAuto, solves: int = 1, keep_changes: bool = True):
     """
     Checkpoints the case, runs the body, then solves.
     Rolls back to the checkpoint if the case does not solve (or if keep_changes=False).
@@ -71,7 +71,7 @@ def trial(SimAuto, threshold = MVA_MISMATCH_THRESHOLD, solves: int = 1, keep_cha
     t = SimpleNamespace(ok=False)
     try:
         yield t
-        t.ok = all(solve(SimAuto, threshold) for _ in range(solves))
+        t.ok = all(solve(SimAuto) for _ in range(solves))
     finally:
         if not (t.ok and keep_changes):
             run(SimAuto, f'RestoreState(USER, "{name}");')
@@ -126,7 +126,7 @@ def save_case(SimAuto, fp, case_format = 'PWB22'):
     chk(SimAuto.SaveCase(str(fp), case_format, True), f'SaveCase {fp}')
     print(f'Saved: {str(fp)}')
 
-def solve(SimAuto, mva_mismatch_threshold = MVA_MISMATCH_THRESHOLD) -> bool:
+def solve(SimAuto) -> bool:
     run(SimAuto, 'EnterMode(RUN);')
     result = SimAuto.RunScriptCommand('SolvePowerFlow(RECTNEWT);')
 
@@ -139,7 +139,7 @@ def solve(SimAuto, mva_mismatch_threshold = MVA_MISMATCH_THRESHOLD) -> bool:
     # A "solved" case with large mismatches doesn't count.
     df = get_df(SimAuto, 'Bus', {'Busnum':int, 'MismatchP':float, 'MismatchQ':float})
     max_mismatch = ((df['MismatchP']**2.0 + df['MismatchQ']**2.0)**0.5).max()
-    return bool(max_mismatch < mva_mismatch_threshold)
+    return bool(max_mismatch < MVA_MISMATCH_THRESHOLD)
 
 def write_excel(fp: Path, sheets: dict[str,pd.DataFrame]):
     """Writes one sheet per dataframe. A named index (e.g. ObjectID) is written as a column."""

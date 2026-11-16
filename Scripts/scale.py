@@ -1,10 +1,10 @@
 """
-Step 02: scale the TopoSeed case's gens & loads to a GridView hour's targets.
+Step 02: scale the prepared case's gens & loads to their targets (from Scripts/area.py).
 
 Gens and loads are handled by the same code. Their working tables ("targets") are indexed by ObjectID and hold:
     <field>          current value in the case
-    <field>_Target   value in the GridView hour
-    <field>_Seed     value in the TopoSeed case
+    <field>_Target   value to reach (from the GridView hour's area totals)
+    <field>_Seed     value in the prepared case
     <field>_Start    value when scaling started (after closing in, at 0 MW)
     Progress         how far the row has been scaled from start to target, in 1/RESOLUTION units
     HeldReason       '' while the row is scaled. Otherwise, why it is held back for now (it is retried later).
@@ -13,7 +13,7 @@ Gens and loads are handled by the same code. Their working tables ("targets") ar
 from pathlib import Path
 import multiprocessing as mp
 import pandas as pd
-from . import pw, topo
+from . import pw, prep
 
 # ------------------ Tuning thresholds ------------------
 EXCLUDE_VMIN = 0.88             # Hold gens/loads back from scaling on buses below this Vpu...
@@ -27,6 +27,10 @@ INITIAL_STEP = 25               # First step, in 1/RESOLUTION units. Doubles aft
 MAX_STEP = 100                  # Halves after each step which diverges, down to 1. A step which still diverges is bisected.
 STEP_SOLVES = 2                 # Solves a step must pass to count as converged.
 FINAL_MAX_ROUNDS = 20           # Max rounds retrying held gens/loads, once the rest have reached their targets.
+# Solve aids which change the network (not to match GridView, only to keep the case solving).
+# Shunt switching (prep.adjust_shunts) is always on.
+ADD_STATCOMS = True             # Add a STATCOM on the lowest-voltage bus below STATCOM_VPU.
+DROP_COLLAPSED = True           # Open branches into sections below COLLAPSE_VPU.
 MAX_WORKERS = None              # Parallel PowerWorld instances for gen target tests. None = CPU count.
 
 STATCOM_ID = 'SC'   # ID of STATCOMs added during scaling.
@@ -35,18 +39,12 @@ STATCOM_ID = 'SC'   # ID of STATCOMs added during scaling.
 # Per table: each status field, and the MW/Mvar fields which must be 0 while it is Open.
 STATUS = {
     'Gen': {'Status': ['MWSetPoint']},
-    'Load': {'Status': ['SMW', 'SMvar', 'DistMWInput', 'DistMvarInput'], 'DistStatus': ['DistMWInput', 'DistMvarInput']},
+    'Load': {'Status': ['SMW', 'SMvar', 'IMW', 'IMvar', 'ZMW', 'ZMvar', 'DistMWInput', 'DistMvarInput'], 'DistStatus': ['DistMWInput', 'DistMvarInput']},
 }
 # The fields which get scaled.
 SCALED = {table: statuses['Status'] for table, statuses in STATUS.items()}
 # The (MW, Mvar) fields used to estimate voltage change from PVQV sensitivities.
 PVQV_FIELDS = {'Gen': ('MWSetPoint', None), 'Load': ('SMW', 'SMvar')}
-
-TARGET_FIELDS = {
-    table: {'ObjectID': str, 'BusNum': int, 'BusName': str, 'NomkV': float, 'ID': str,
-            **{s: str for s in STATUS[table]}, **{c: float for c in SCALED[table]}}
-    for table in STATUS
-}
 
 def write_fields(table: str) -> list[str]:
     """The fields written back to PowerWorld."""
@@ -70,43 +68,6 @@ def hold(df: pd.DataFrame, mask, reason: str):
     df.loc[pd.Series(mask, index=df.index) & scaling(df), 'HeldReason'] = reason
 
 # ------------------ Targets ------------------
-def compute_pw_targets(SimAuto, gv_fp: Path, pw_fp: Path, dummy_bus_fp: Path) -> dict[str,pd.DataFrame]:
-    """Returns {'Gen': df, 'Load': df} targets, taking the GridView EPC's gens & loads into the PWB case. See build_targets()."""
-    topo.open_gv_case(SimAuto, gv_fp, dummy_bus_fp)
-    gv = {table: pw.get_df(SimAuto, table, fields) for table, fields in TARGET_FIELDS.items()}
-
-    pw.open_case(SimAuto, pw_fp)
-    case = {table: pw.get_df(SimAuto, table, fields) for table, fields in TARGET_FIELDS.items()}
-    SimAuto.CloseCase()
-
-    return build_targets(gv, case)
-
-def build_targets(gv: dict[str,pd.DataFrame], case: dict[str,pd.DataFrame]) -> dict[str,pd.DataFrame]:
-    """Puts the case's gens & loads side by side with their GridView targets."""
-    targets = {}
-    for table, statuses in STATUS.items():
-        gv_df = gv[table]
-        if table == 'Load':
-            # GridView leaves distributed generation in the load table at seed-case values, unused. Target Open & 0 MW.
-            gv_df = gv_df.assign(DistStatus='Open', DistMWInput=0.0, DistMvarInput=0.0)
-
-        fields = [*statuses, *SCALED[table]]
-        df = case[table].merge(gv_df[['ObjectID', *fields]], on='ObjectID', how='left', suffixes=('', '_Target'))
-        for f in fields:
-            df[f'{f}_Seed'] = df[f]
-
-        # Elements which aren't in the GridView hour are opened.
-        df = df.fillna({**{f'{s}_Target': 'Open' for s in statuses}, **{f'{c}_Target': 0.0 for c in SCALED[table]}})
-
-        # Anything open, now or in the target, is at 0 MW / 0 Mvar.
-        for suffix in ('', '_Target'):
-            for status, zeroed in statuses.items():
-                df.loc[df[status + suffix] == 'Open', [c + suffix for c in zeroed]] = 0.0
-
-        df['ExclusionReason'] = ''
-        targets[table] = df.set_index('ObjectID')
-    return targets
-
 def test_gen_targets(pw_fp: Path, gen_df: pd.DataFrame) -> pd.DataFrame:
     """
     Tests each generator target individually, and adds a 'Success' column reporting which individual changes solve.
@@ -150,7 +111,7 @@ def report_gen_load_balance(targets: dict[str,pd.DataFrame]) -> pd.DataFrame:
     def totals(suffix):
         gen_mw = gen_df['MWSetPoint' + suffix].sum()
         dist_mw = load_df['DistMWInput' + suffix].sum()
-        load_mw = load_df['SMW' + suffix].sum()
+        load_mw = sum(load_df[c + suffix].sum() for c in ('SMW', 'IMW', 'ZMW'))
         return [gen_mw, dist_mw, load_mw, gen_mw + dist_mw - load_mw]
 
     total_delta_df = pd.DataFrame(
@@ -168,7 +129,7 @@ def report_gen_load_balance(targets: dict[str,pd.DataFrame]) -> pd.DataFrame:
     return total_delta_df
 
 # ------------------ Exclusions ------------------
-def compute_pvqv_exclusions(targets, pvqv_df, delta_v_limit = PVQV_DV_LIMIT) -> dict[str,pd.DataFrame]:
+def compute_pvqv_exclusions(targets, pvqv_df) -> dict[str,pd.DataFrame]:
     """
     Checks if the proposed delta-P / delta-Q at each bus would cause a linear V change more than the limit.
     Returns {table: buses to exclude from scaling, sorted by |dv|}.
@@ -184,20 +145,20 @@ def compute_pvqv_exclusions(targets, pvqv_df, delta_v_limit = PVQV_DV_LIMIT) -> 
         }).groupby('BusNum', as_index=False).sum()
         bus_df = sens_df.merge(delta_df, left_on='Number', right_on='BusNum', how='inner').drop(columns=['BusNum'])
         bus_df['dv'] = bus_df['SensdVdPself'] * bus_df['dp'] + bus_df['SensdVdQself'] * bus_df['dq']
-        result[table] = bus_df[bus_df['dv'].abs() > delta_v_limit].sort_values(by='dv', key=abs, ascending=False)
+        result[table] = bus_df[bus_df['dv'].abs() > PVQV_DV_LIMIT].sort_values(by='dv', key=abs, ascending=False)
     return result
 
-def voltage_ok(df: pd.DataFrame, vpu_by_bus: pd.Series, v_min = EXCLUDE_VMIN, v_max = EXCLUDE_VMAX) -> pd.Series:
-    return df['BusNum'].map(vpu_by_bus).between(v_min, v_max, inclusive='neither')
+def voltage_ok(df: pd.DataFrame, vpu_by_bus: pd.Series) -> pd.Series:
+    return df['BusNum'].map(vpu_by_bus).between(EXCLUDE_VMIN, EXCLUDE_VMAX, inclusive='neither')
 
 def bus_vpu(SimAuto) -> pd.Series:
     return pw.get_df(SimAuto, 'Bus', {'Number': int, 'Vpu': float}).set_index('Number')['Vpu']
 
-def hold_voltage(targets, vpu_by_bus: pd.Series, v_min = EXCLUDE_VMIN, v_max = EXCLUDE_VMAX):
+def hold_voltage(targets, vpu_by_bus: pd.Series):
     # Once a bus exceeds the vmin/vmax limits, hold its gens/loads back from scaling until it recovers.
     # This avoids voltage collapse related issues during scaling.
     for df in targets.values():
-        hold(df, ~voltage_ok(df, vpu_by_bus, v_min, v_max), 'Voltage')
+        hold(df, ~voltage_ok(df, vpu_by_bus), 'Voltage')
 
 # ------------------ Applying changes ------------------
 def apply_rows(SimAuto, table: str, df: pd.DataFrame, new_df: pd.DataFrame, solves: int = 1) -> list:
@@ -254,9 +215,9 @@ def at_progress(table: str, df: pd.DataFrame, progress) -> pd.DataFrame:
     return new_df
 
 # ------------------ Voltage support ------------------
-def create_statcom_on_lowestv_bus(SimAuto, skip_buses, vpu_min = STATCOM_VPU, vnom_min = STATCOM_VNOM_MIN):
+def create_statcom_on_lowestv_bus(SimAuto, skip_buses):
     """
-    If there is a bus with voltage lower than vpu_min, adds a STATCOM to the lowest voltage bus.
+    If there is a bus with voltage lower than STATCOM_VPU, adds a STATCOM to the lowest voltage bus.
     Returns None if no bus needs one, otherwise (bus number, whether the STATCOM closed in successfully).
     """
     bus_fields: dict[str,type] = {
@@ -269,8 +230,8 @@ def create_statcom_on_lowestv_bus(SimAuto, skip_buses, vpu_min = STATCOM_VPU, vn
     bus_df = pw.get_df(SimAuto, 'Bus', bus_fields)
     filtered_df = bus_df[(bus_df['IslandNumber'] == 1) &
                          (bus_df['BusIsStarBus:1'] == 'NO') &
-                         (bus_df['BusNomVolt'] > vnom_min) &
-                         (bus_df['Vpu'] < vpu_min) &
+                         (bus_df['BusNomVolt'] > STATCOM_VNOM_MIN) &
+                         (bus_df['Vpu'] < STATCOM_VPU) &
                          ~bus_df['Number'].isin(skip_buses)]
     if len(filtered_df) == 0:
         return None
@@ -311,14 +272,14 @@ def create_statcom_on_lowestv_bus(SimAuto, skip_buses, vpu_min = STATCOM_VPU, vn
 
     return (number, t.ok)
 
-def drop_collapsed_sections(SimAuto, vpu = COLLAPSE_VPU) -> list[str]:
+def drop_collapsed_sections(SimAuto) -> list[str]:
     """
     Disconnects network sections which are beginning to show collapse.
-    I.e. opens branches connecting from buses with OK voltage (>vpu) to buses with awful voltage (<vpu).
+    I.e. opens branches connecting from buses with OK voltage (>COLLAPSE_VPU) to buses with awful voltage (<COLLAPSE_VPU).
     Returns the ObjectIDs of branches dropped.
     """
     df = pw.get_df(SimAuto, 'Branch', {'ObjectID': str, 'Status': str, 'BranchVpuHigh': float, 'BranchVpuLow': float})
-    filtered_df = df[(df['Status'] == 'Closed') & (df['BranchVpuHigh'] > vpu) & (df['BranchVpuLow'] < vpu)]
+    filtered_df = df[(df['Status'] == 'Closed') & (df['BranchVpuHigh'] > COLLAPSE_VPU) & (df['BranchVpuLow'] < COLLAPSE_VPU)]
     if len(filtered_df) == 0:
         return []
 
@@ -360,20 +321,20 @@ def catch_up(SimAuto, targets, progress: int, step: int, bisect: bool) -> int:
         df.loc[rows.index[df.loc[rows.index, 'Progress'] >= progress], 'HeldReason'] = ''
     return moved
 
-def retry_held(SimAuto, targets, max_rounds=FINAL_MAX_ROUNDS):
+def retry_held(SimAuto, targets):
     """
     Once the rest have reached their targets: retries held gens/loads, bisecting to find those which still diverge.
     Tries one jump to target first, and halves the jump whenever a round moves nothing.
     Those still held at the end are excluded, left where they got to.
     """
     step = MAX_STEP
-    for _ in range(max_rounds):
+    for _ in range(FINAL_MAX_ROUNDS):
         hold_voltage(targets, bus_vpu(SimAuto))
         if not any(held(df).any() for df in targets.values()):
             break
         print(f'Retrying held gens/loads, {step}/{RESOLUTION} at a time.')
         if catch_up(SimAuto, targets, RESOLUTION, step, bisect=True):
-            topo.adjust_shunts(SimAuto)
+            prep.adjust_shunts(SimAuto)
         elif step > 1:
             step //= 2
         else:
@@ -382,7 +343,7 @@ def retry_held(SimAuto, targets, max_rounds=FINAL_MAX_ROUNDS):
         mask = held(df)
         df.loc[mask, 'ExclusionReason'] = df.loc[mask, 'HeldReason']
 
-def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, initial_step=INITIAL_STEP) -> dict[str,pd.DataFrame]:
+def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None) -> dict[str,pd.DataFrame]:
     """
     Scales included gens & loads from their start to their targets. Returns the scale log sheets.
     Steps are in 1/RESOLUTION units. Each step which solves doubles the next one (up to MAX_STEP),
@@ -407,12 +368,12 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, initial_step=INI
     close_all_related_gen_load(SimAuto, targets)
     mark_start(targets)
 
-    topo.adjust_shunts(SimAuto)
+    prep.adjust_shunts(SimAuto)
     if not pw.solve(SimAuto):
         print('Could not solve after adjusting shunts in the original case!')
         return {'step_df': pd.DataFrame({"Result": ['Failed to converge base case with shunt adjustments.']})}
 
-    progress, step = 0, initial_step
+    progress, step = 0, INITIAL_STEP
     failed_step = None              # The step size which first diverged, before halving.
     step_log = []
     statcoms: dict[int,bool] = {}   # Bus number -> whether the STATCOM closed in successfully.
@@ -447,10 +408,11 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, initial_step=INI
             result = 'Bisected'
         start, progress = progress, goal
 
-        topo.adjust_shunts(SimAuto)
+        prep.adjust_shunts(SimAuto)
         hold_voltage(targets, bus_vpu(SimAuto))
-        dropped_branches += drop_collapsed_sections(SimAuto)
-        statcom = create_statcom_on_lowestv_bus(SimAuto, skip_buses=list(statcoms))
+        if DROP_COLLAPSED:
+            dropped_branches += drop_collapsed_sections(SimAuto)
+        statcom = ADD_STATCOMS and create_statcom_on_lowestv_bus(SimAuto, skip_buses=list(statcoms))
         if statcom:
             statcoms[statcom[0]] = statcom[1]
         log(start, goal, result, catch_up(SimAuto, targets, progress, step, bisect=False))
