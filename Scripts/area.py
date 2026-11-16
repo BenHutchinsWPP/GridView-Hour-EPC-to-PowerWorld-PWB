@@ -359,6 +359,8 @@ def achieved(final: dict[str, pd.DataFrame], reports: dict[str, pd.DataFrame]) -
 # ------------------ Swing balancing ------------------
 BALANCE_TOL_MW = 1.0        # Stop balancing once the swing is within this of 0 MW...
 BALANCE_MAX_ROUNDS = 10     # ...or after this many rounds (losses move with each round, so it takes a few).
+BALANCE_TRIGGER_MW = 1000.0 # While scaling: balance once the swing is further than this from 0 MW (midrun_balancer()).
+
 
 def swing_mw(gen: pd.DataFrame, slack_buses) -> tuple[float, list]:
     """
@@ -395,6 +397,7 @@ def balance_targets(final: dict[str, pd.DataFrame], swing: float, swing_buses) -
     for c in scale.STATUS['Load']:
         load[f'{c}_Target'] = load[c]
     load['SMW_Seed'] = load['SMW']
+    load['P_Seed'] = p[p > 0]
 
     targets = {'Gen': gen, 'Load': load}
     for df in targets.values():
@@ -427,3 +430,51 @@ def balance_swing(SimAuto) -> dict[str, pd.DataFrame]:
         swing, _ = swing_mw(read_case(SimAuto)['Gen'], slack)
     rounds.append({'Round': 'End', 'Swing MW': swing})
     return {'balance_df': pd.DataFrame(rounds), **sheets}
+
+def rescale_targets(targets: dict[str, pd.DataFrame], moved: dict[str, pd.DataFrame]):
+    """
+    After a balance (`moved`: balance_targets() tables, after scaling) in the middle of scaling to `targets`:
+    scales each moved row's current, start and target values in `targets` by the factor it was moved by, so the rest
+    of the scaling keeps the balance instead of undoing it. (Values between start and target scale with them.)
+    """
+    gen = moved['Gen']
+    load = moved['Load']
+    factors = {
+        'Gen': (gen['MWSetPoint'] / gen['MWSetPoint_Seed'], scale.SCALED['Gen']),
+        'Load': (load[LOAD_P].sum(axis=1) / load['P_Seed'], LOAD_P + LOAD_Q),
+    }
+    for table, (f, cols) in factors.items():
+        df = targets[table]
+        f = f[f.index.isin(df.index)]
+        for c in cols:
+            for name in (c, f'{c}_Start', f'{c}_Target'):
+                if name in df.columns:
+                    df.loc[f.index, name] = df.loc[f.index, name] * f
+
+def midrun_balancer(SimAuto):
+    """
+    Returns (after_step, log) for scale.iterate_to_gen_load_targets(). After each step, if the swing is further than
+    BALANCE_TRIGGER_MW from 0, moves it onto the whole case's gen and load, half each (balance_targets()), and keeps
+    that in the scaling still to come (rescale_targets()). If a balance leaves the swing over the trigger (e.g. gens at
+    MWMax), the next one waits until the swing has moved another BALANCE_TRIGGER_MW. The swing itself is never moved.
+    """
+    slack = slack_buses(SimAuto)
+    state = {'trigger': BALANCE_TRIGGER_MW}
+    log: list[dict] = []
+
+    def after_step(SimAuto, targets):
+        swing, swing_buses = swing_mw(read_case(SimAuto)['Gen'], slack)
+        if abs(swing) <= state['trigger']:
+            return
+        print(f'----- Swing at {swing:.1f} MW: balancing half on gen, half on load -----')
+        moved = balance_targets(read_case(SimAuto), swing, swing_buses)
+        scale.iterate_to_gen_load_targets(SimAuto, moved)
+        rescale_targets(targets, moved)
+        after, _ = swing_mw(read_case(SimAuto)['Gen'], slack)
+        state['trigger'] = max(BALANCE_TRIGGER_MW, abs(after) + BALANCE_TRIGGER_MW)
+        log.append({'Swing MW Before': swing, 'Swing MW After': after,
+                    'Gen MW Change': (moved['Gen']['MWSetPoint'] - moved['Gen']['MWSetPoint_Seed']).sum(),
+                    'Load MW Change': (moved['Load'][LOAD_P].sum(axis=1) - moved['Load']['P_Seed']).sum(),
+                    'Next Trigger MW': state['trigger']})
+
+    return after_step, log

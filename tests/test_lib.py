@@ -362,6 +362,7 @@ def test_balance_targets_half_gen_half_load():
     assert t['Gen']['MWSetPoint_Target'].to_dict() == {'g1': 125.0, 'g2': 120.0}  # g2 capped at MWMax.
     assert t['Load']['SMW_Target'].to_dict() == {'l1': 135.0, 'l2': 315.0}
     assert t['Load']['SMvar_Target'].to_dict() == {'l1': 27.0, 'l2': 63.0}
+    assert t['Load']['P_Seed'].to_dict() == {'l1': 150.0, 'l2': 350.0}     # What rescale_targets() divides by.
     assert (t['Load']['Status_Target'] == 'Closed').all()
 
 def test_thermal_scaling_up_brings_biggest_units_on_first():
@@ -429,6 +430,78 @@ def test_build_targets_leaves_slack_bus_gens_out_of_both_cases():
     targets, reports = area.build_targets({'Load': loads([]), 'Gen': case}, {'Load': loads([]), 'Gen': case}, swing_buses=[5])
     assert targets['Gen'].index.tolist() == ['g1'] and targets['Gen'].loc['g1', 'MWSetPoint_Target'] == 80
     assert reports['area_gen']['Method'].tolist() == ['Matched keys'] and reports['area_gen']['Unmet MW'].tolist() == [0.0]
+
+class SwingSimAuto(FakeSimAuto):
+    """
+    A case with gens & loads on their own buses, and the giant swing (ID xx, bus 99) carrying load minus generation.
+    Written rows (keyed by bus) overlay the starting tables; StoreState/RestoreState work on them as in FakeSimAuto.
+    """
+    def __init__(self, gen, load):
+        super().__init__()
+        self.base = {'Gen': gen.set_index('BusNum', drop=False), 'Load': load.set_index('BusNum', drop=False)}
+
+    def table(self, name):
+        df = self.base[name].copy()
+        for (t, key), row in self.applied.items():
+            if t == name:
+                for f, v in row.items():
+                    if f in df.columns:
+                        df.loc[int(key), f] = type(df[f].iloc[0])(v) if f not in ('Status', 'DistStatus', 'ID') else v
+        if name == 'Gen':
+            on = df['Status'] == 'Closed'
+            ld = self.table('Load')
+            p = ld.loc[ld['Status'] == 'Closed', ['SMW', 'IMW', 'ZMW']].sum().sum()
+            df['MW'] = df['MWSetPoint']
+            df.loc[df['ID'] == 'xx', 'MW'] = p - df.loc[on & (df['ID'] != 'xx'), 'MWSetPoint'].sum()
+        return df
+
+    def GetParametersMultipleElementRect(self, table, fields, filter_group):
+        if table in self.base:
+            return ('', [[str(v) for v in row] for row in self.table(table)[fields].itertuples(index=False)])
+        if table == 'Bus':
+            buses = sorted(set(self.base['Gen']['BusNum']) | set(self.base['Load']['BusNum']))
+            values = {'Vpu': '1.0', 'IslandNumber': '1', 'BusIsStarBus:1': 'NO', 'BusNomVolt': '230', 'Slack': 'NO'}
+            return ('', [[str(n) if f in ('Busnum', 'Number') else values.get(f, '0') for f in fields] for n in buses])
+        return ('', [])
+
+def swing_case():
+    gen = gens([('xx', 9, 'xx', 'Closed', '', 0.0, 2e4, -2e4), ('g1', 1, '1', 'Closed', 'GT', 100.0, 1000.0, 0.0),
+                ('g2', 1, '1', 'Closed', 'HY', 100.0, 1000.0, 0.0)]).assign(BusNum=[99, 1, 2], MW=0.0, NomkV=230.0, BusName='b')
+    load = loads([('l1', 1, 'Closed', 200.0, 0.0, 0.0, 20.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
+    return gen, load
+
+def test_midrun_balancer_keeps_the_swing_near_zero_and_never_moves_it():
+    gen, load = swing_case()
+    sa = SwingSimAuto(gen, load)
+    # Scale load from 200 to 3200 MW with gens fixed: without balancing, the swing would end at +3000 MW.
+    targets = {'Gen': targets_df(ObjectID=['g1'], BusNum=[1], ID='1', Status='Closed', Status_Target='Closed',
+                                 MWSetPoint=[100.0], MWSetPoint_Target=[100.0]),
+               'Load': targets_df(ObjectID=['l1'], BusNum=[3], ID='1', Status='Closed', Status_Target='Closed',
+                                  DistStatus='Open', DistStatus_Target='Open', AreaNumber=1,
+                                  **{c: [v] for c, v in zip(scale.SCALED['Load'], [200.0, 20.0, 0, 0, 0, 0, 0, 0])},
+                                  **{f'{c}_Target': [v] for c, v in zip(scale.SCALED['Load'], [3200.0, 320.0, 0, 0, 0, 0, 0, 0])})}
+    after_step, log = area.midrun_balancer(sa)
+    scale.iterate_to_gen_load_targets(sa, targets, after_step=after_step)
+    swing = lambda: area.swing_mw(sa.table('Gen'), [])[0]
+    assert len(log) >= 1 and all(abs(r['Swing MW After']) < abs(r['Swing MW Before']) for r in log)
+    assert abs(swing()) <= area.BALANCE_TRIGGER_MW                      # Balanced as it went.
+    assert ('Gen', '99') not in sa.applied                              # The swing unit was never written.
+    # The load's target was scaled down by the balances, so the scaling ended where the balance left it.
+    assert targets['Load'].loc['l1', 'SMW_Target'] < 3200 and abs(targets['Load'].loc['l1', 'SMW'] - targets['Load'].loc['l1', 'SMW_Target']) < 1e-6
+    area.balance_swing(sa)
+    assert abs(swing()) < area.BALANCE_TOL_MW and ('Gen', '99') not in sa.applied
+
+def test_rescale_targets():
+    targets = {'Gen': targets_df(ObjectID=['g1', 'g2'], MWSetPoint=[50.0, 10.0], MWSetPoint_Start=[0.0, 10.0], MWSetPoint_Target=[100.0, 10.0]),
+               'Load': targets_df(ObjectID=['l1'], **{c: [10.0] for c in ['SMW', 'SMvar', 'IMW', 'IMvar', 'ZMW', 'ZMvar']},
+                                  **{f'{c}_Start': [10.0] for c in ['SMW', 'SMvar', 'IMW', 'IMvar', 'ZMW', 'ZMvar']},
+                                  **{f'{c}_Target': [20.0] for c in ['SMW', 'SMvar', 'IMW', 'IMvar', 'ZMW', 'ZMvar']})}
+    moved = {'Gen': targets_df(ObjectID=['g1', 'gx'], MWSetPoint=[60.0, 5.0], MWSetPoint_Seed=[50.0, 4.0]),
+             'Load': targets_df(ObjectID=['l1'], SMW=[24.0], IMW=[0.0], ZMW=[0.0], P_Seed=[30.0])}
+    area.rescale_targets(targets, moved)
+    assert targets['Gen'].loc['g1', ['MWSetPoint', 'MWSetPoint_Start', 'MWSetPoint_Target']].tolist() == [60.0, 0.0, 120.0]
+    assert targets['Gen'].loc['g2', 'MWSetPoint_Target'] == 10.0                    # Not moved.
+    assert targets['Load'].loc['l1', ['SMvar', 'SMvar_Start', 'SMvar_Target']].tolist() == [8.0, 8.0, 16.0]
 
 # ------------------ settings ------------------
 def test_repo_settings_file_loads():

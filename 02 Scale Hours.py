@@ -27,9 +27,9 @@ def topology_targets(SimAuto, gv_fp) -> tuple[dict, dict]:
     pw.open_case(SimAuto, pw_fp)
     slack = area.slack_buses(SimAuto)
     targets = topo.compute_pw_targets(SimAuto, gv_fp, pw_fp, dummy_bus_fp)
-    # Don't adjust the giant swing, or (without one) the gens on the slack bus.
+    # Never touch the swing: the giant swing, or any gen on the slack bus. The solution sets their MW.
     gen_df = targets['Gen']
-    swing = (gen_df['ID'] == prep.SWING_ID) | (gen_df['BusNum'].isin(slack) & (not run['create_giant_swing']))
+    swing = (gen_df['ID'] == prep.SWING_ID) | gen_df['BusNum'].isin(slack)
     gen_df.loc[swing, 'Status_Target'] = 'Closed'
     scale.exclude(gen_df, swing, 'Swing Unit')
     return targets, {}
@@ -65,10 +65,15 @@ def create_case(SimAuto, gv_fp, out_fp):
         # Open loads aren't scaled, but their distributed generation is set Open & 0 too.
         case_load = pw.get_df(SimAuto, 'Load', area.LOAD_FIELDS)
         pw.set_df(SimAuto, 'Load', area.open_load_cleanup(case_load), ['BusNum', 'ID', 'DistStatus', 'DistMWInput', 'DistMvarInput'])
-    log = scale.iterate_to_gen_load_targets(SimAuto, targets, pd.read_csv(pvqv_fp) if run['use_pvqv'] else None)
-
+    pvqv = pd.read_csv(pvqv_fp) if run['use_pvqv'] else None
     if run['balance_swing']:
+        # Balance the swing whenever it drifts far during scaling, and again at the end.
+        after_step, midrun_log = area.midrun_balancer(SimAuto)
+        log = scale.iterate_to_gen_load_targets(SimAuto, targets, pvqv, after_step)
+        log['midrun_balance_df'] = pd.DataFrame(midrun_log)
         log.update(area.balance_swing(SimAuto))
+    else:
+        log = scale.iterate_to_gen_load_targets(SimAuto, targets, pvqv)
     if reports:
         # Read back from PowerWorld, so the report shows what the case holds rather than what the scaling meant to do.
         log = {**area.achieved(area.read_case(SimAuto), reports), **log}

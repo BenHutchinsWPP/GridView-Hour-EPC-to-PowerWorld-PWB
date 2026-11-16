@@ -35,7 +35,7 @@ Area mode: first draft (2026-11-15), first written in `~/projects/areascale` (br
 `settings.toml`, at the top of the repo, with a comment on each setting. `[run]` holds the switches the two step scripts read:
 - `mode`: `"area"` or `"topology"`.
 - `create_giant_swing`: add a giant swing (`ID`=`xx`), or use the case's own swing (the gens on its slack bus). `swing_bus`: `"slack"`, `"max_fault_duty"` or a bus number.
-- `balance_swing`: move what is left on the swing onto the whole case, half gen and half load, after scaling.
+- `balance_swing`: move MW off the swing onto the whole case, half gen and half load, during scaling whenever the swing drifts past `[area] balance_trigger_mw`, and after scaling until it is ~0 MW. The swing unit itself is never moved, in either mode.
 - `adjust_seed_shunts`, `gen_terminal_voltage_control`, `compute_pvqv`: the seed preparation steps.
 - `pretest_gens`, `use_pvqv`: optional scaling exclusions (both off).
 
@@ -54,7 +54,11 @@ The other sections (`[area]`, `[scale]`, `[prep]`, `[topology]`, `[pw]`) set the
   - **Matched keys.** If an area has exactly the same list of loads (by key) in both cases, each of its loads targets its own EPC value instead (0 where it is Open in the EPC). The same holds for gens, separately. Load statuses aren't changed; with `commit`, gens take their EPC status.
   - What can't be placed (a bucket with no PWB units, a target above the bucket's MWMax, an area with no in-service PWB load of the sign needed) is reported as `Unmet MW` / `Unmet Mvar`, and ends up on the giant swing.
 - Scale the case to the targets with the adaptive stepping engine (see [Iterate to Gen and Load Targets](#iterate-to-gen-and-load-targets)). Gens/loads which diverge are held back and retried, so `Final MW` can differ from the target: check `Final Error MW`. The `Final` columns are read back from PowerWorld after scaling.
-- **Balance the swing** (`balance_swing()` in `Scripts/area.py`, `balance_targets()` in `Scripts/area.py`). Whatever MW is left on the swing (the giant swing `xx`, or if there is none, the gens on the slack bus) is moved onto the whole case: half onto generation, half onto load. With the swing at +X MW, every Closed gen with MW > 0 goes up by one factor (X/2 in total, capped at MWMax), and every Closed load with MW > 0 goes down by one factor (X/2 in total, Mvar with it). The same scaling engine moves the case there. Losses change as it moves, so this repeats until the swing is within `balance_tol_mw` (1 MW) of 0, at most `balance_max_rounds` (10) times. It shifts the area totals off their targets by that much, which `Final Error MW` shows. The `balance_df` sheet of the scale log lists each round.
+- **Balance the swing** (`balance_swing` in `settings.toml`, both modes; `Scripts/area.py`). The swing unit itself is never moved: it solves to whatever it needs, taking up every difference including losses. Its output (the giant swing `xx`, or if there is none, the gens on the slack bus) is what gets moved onto the rest of the case, half onto generation and half onto load. With the swing at +X MW, every Closed gen with MW > 0 (not on the slack bus) goes up by one factor (X/2 in total, capped at MWMax), and every Closed load with MW > 0 goes down by one factor (X/2 in total, Mvar with it). This happens:
+  - **During scaling** (`midrun_balancer()`): after each step, if the swing is further than `balance_trigger_mw` (1000 MW) from 0. The units moved get their start and target values scaled by the same factor, so the rest of the scaling keeps the balance instead of undoing it. If a balance can't bring the swing under the trigger (e.g. gens at MWMax), the next one waits until the swing has moved another `balance_trigger_mw`. The `midrun_balance_df` sheet lists each one.
+  - **After scaling** (`balance_swing()`): round after round until the swing is within `balance_tol_mw` (1 MW) of 0, at most `balance_max_rounds` (10) times, since losses move with each round. The `balance_df` sheet lists each round.
+
+  Either way the area totals move off their targets by what was balanced, which `Final Error MW` shows.
 - Save the case and the logs. Then the engineer handles the [Manual Work](#manual-work).
 
 

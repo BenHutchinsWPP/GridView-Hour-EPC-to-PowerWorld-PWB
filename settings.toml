@@ -15,7 +15,8 @@ create_giant_swing = true
 # Where the giant swing goes: "slack" (the case's slack bus), "max_fault_duty" (computes fault duty on every bus: slow),
 # or a bus number.
 swing_bus = "slack"
-# After scaling, move what is left on the swing onto the whole case's gen and load (half each) until it is ~0 MW.
+# Move MW off the swing onto the whole case's gen and load (half each): during scaling whenever the swing is further than
+# [area] balance_trigger_mw from 0, and after scaling until it is ~0 MW. The swing unit itself is never moved.
 balance_swing = true
 
 # Seed preparation (step 01).
@@ -36,6 +37,7 @@ off_at_zero_types = ["Wind", "Solar"]   # At a target of 0, these go offline (th
 manual_unit_types = ["DC"]              # Unit types never scaled (adjusted by hand).
 balance_tol_mw = 1.0
 balance_max_rounds = 10
+balance_trigger_mw = 1000.0     # While scaling: balance once the swing is further than this from 0 MW.
 # The GenTypes. Add one here to give it its own group, then map unit/fuel codes to it below.
 gen_types = ["Solar", "Hydro", "Wind", "Thermal", "Battery Storage", "Unknown"]
 

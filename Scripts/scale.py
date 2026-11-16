@@ -343,7 +343,7 @@ def retry_held(SimAuto, targets):
         mask = held(df)
         df.loc[mask, 'ExclusionReason'] = df.loc[mask, 'HeldReason']
 
-def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None) -> dict[str,pd.DataFrame]:
+def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None) -> dict[str,pd.DataFrame]:
     """
     Scales included gens & loads from their start to their targets. Returns the scale log sheets.
     Steps are in 1/RESOLUTION units. Each step which solves doubles the next one (up to MAX_STEP),
@@ -351,6 +351,7 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None) -> dict[str,pd.D
     the gens/loads which diverge are held back at their last good values, and the rest go ahead.
     Held gens/loads (including those on buses outside the voltage band) are retried after each step, and again at the end.
     pvqv_df: optional PVQV sensitivities. If given, gens/loads with a large linear dV estimate are excluded up front.
+    after_step: optional function(SimAuto, targets), called after each step (e.g. area.midrun_balancer()).
     """
     if not pw.solve(SimAuto):
         print('Could not solve the original input case!')
@@ -416,6 +417,8 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None) -> dict[str,pd.D
         if statcom:
             statcoms[statcom[0]] = statcom[1]
         log(start, goal, result, catch_up(SimAuto, targets, progress, step, bisect=False))
+        if after_step:
+            after_step(SimAuto, targets)
         if t.ok:
             step = min(step * 2, MAX_STEP)
         elif failed_step:
