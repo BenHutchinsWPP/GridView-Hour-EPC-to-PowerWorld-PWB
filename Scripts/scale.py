@@ -249,7 +249,11 @@ def create_statcom_on_lowestv_bus(SimAuto, skip_buses):
     """
     If there is a bus with voltage lower than STATCOM_VPU, adds a STATCOM to the lowest voltage bus.
     Returns None if no bus needs one, otherwise (bus number, whether the STATCOM closed in successfully).
+    Buses which already have one in the case (from any scaling run, e.g. an earlier balance) are skipped, as are
+    skip_buses (this run's attempts, including those rolled back).
     """
+    gen_df = pw.get_df(SimAuto, 'Gen', {'BusNum': int, 'ID': str})
+    skip_buses = set(skip_buses) | set(gen_df.loc[gen_df['ID'] == STATCOM_ID, 'BusNum'])
     bus_fields: dict[str,type] = {
         'Number': int
         ,'BusNomVolt': float
@@ -270,11 +274,11 @@ def create_statcom_on_lowestv_bus(SimAuto, skip_buses):
     number = int(min_row['Number'])
     print(f'Adding statcom to: {number}, kV={min_row["BusNomVolt"]}, Vpu={min_row["Vpu"]}')
 
-    # Create a STATCOM, in the "Open" position. Solve case.
+    # Create a STATCOM, Closed. Roll back if it doesn't solve.
     statcom_dict = {
         'BusNum': number
         ,'GenID': STATCOM_ID
-        ,'GenStatus': 'Open'
+        ,'GenStatus': 'Closed'
         ,'GenAVRAble': 'YES'
         ,'GenMVRMax': 9999
         ,'GenMVRMin': -9999
@@ -291,14 +295,7 @@ def create_statcom_on_lowestv_bus(SimAuto, skip_buses):
         with pw.creating(SimAuto):
             pw.set_df(SimAuto, 'Gen', statcom_df, list(statcom_dict))
     if not t.ok:
-        print('WARNING: Did not solve after creating statcom in Open state. Rolled back change.')
-        return (number, False)
-
-    # Try to close STATCOM. Roll back if it doesn't solve.
-    with pw.trial(SimAuto) as t:
-        pw.set_df(SimAuto, 'Gen', statcom_df.assign(GenStatus='Closed'), ['BusNum', 'GenID', 'GenStatus'])
-    if not t.ok:
-        print('WARNING: Did not solve after closing statcom. Rolled back change.')
+        print('WARNING: Did not solve with the STATCOM in. Rolled back change.')
 
     return (number, t.ok)
 
@@ -317,7 +314,9 @@ def drop_collapsed_sections(SimAuto) -> list[str]:
     print(f'Dropping branches to collapsed network sections: {dropped}')
     with pw.trial(SimAuto) as t:
         pw.set_df(SimAuto, 'Branch', filtered_df.assign(Status='Open'), ['ObjectID', 'Status'])
-        pw.run(SimAuto, 'ClearSmallIslands;')
+        result = SimAuto.RunScriptCommand('ClearSmallIslands;')
+        if result[0]:
+            print(f'WARNING: ClearSmallIslands: {result[0]}')
     if not t.ok:
         print('WARNING: Did not solve after dropping branches. Rolled back change.')
         return []
@@ -359,8 +358,10 @@ def retry_held(SimAuto, targets, label: str):
     """
     step = MAX_STEP
     for _ in range(FINAL_MAX_ROUNDS):
-        hold_voltage(targets, bus_vpu(SimAuto))
-        if not any(held(df).any() for df in targets.values()):
+        vpu_by_bus = bus_vpu(SimAuto)
+        hold_voltage(targets, vpu_by_bus)
+        # Only rows on buses inside the voltage band can be retried; with none, halving the step changes nothing.
+        if not any((held(df) & voltage_ok(df, vpu_by_bus)).any() for df in targets.values()):
             break
         print(f'{label}: retrying held gens/loads, {step}/{RESOLUTION} at a time.')
         if catch_up(SimAuto, targets, RESOLUTION, step, bisect=True):
@@ -373,7 +374,22 @@ def retry_held(SimAuto, targets, label: str):
         mask = held(df)
         df.loc[mask, 'ExclusionReason'] = df.loc[mask, 'HeldReason']
 
-def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None, label='Main scaling') -> dict[str,pd.DataFrame]:
+NETWORK_CHANGE_SHEETS = ('statcom_bus_df', 'dropped_branch_df')
+
+def merge_network_changes(log: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    """
+    The scale log with every run's STATCOMs and dropped branches in one sheet each, so none are missed in review.
+    Balances keep theirs as `<run>_statcom_bus_df` etc.; these become rows with Run = '<run>' ('main' for the main scaling).
+    """
+    log = dict(log)
+    for name in NETWORK_CHANGE_SHEETS:
+        runs = {k: log.pop(k) for k in list(log) if k == name or k.endswith('_' + name)}
+        parts = [df.assign(Run=k.removesuffix(name).rstrip('_') or 'main') for k, df in runs.items() if len(df)]
+        log[name] = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    return log
+
+def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None, label='Main scaling',
+                                initial_step=None) -> dict[str,pd.DataFrame]:
     """
     Scales included gens & loads from their start to their targets. Returns the scale log sheets.
     Steps are in 1/RESOLUTION units. Each step which solves doubles the next one (up to MAX_STEP),
@@ -383,6 +399,7 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None,
     pvqv_df: optional PVQV sensitivities. If given, gens/loads with a large linear dV estimate are excluded up front.
     after_step: optional function(SimAuto, targets, progress), called after each step (e.g. area.midrun_balancer()).
     label: names this run in the printed progress, to tell a balance's own scaling from the main one.
+    initial_step: first step (default INITIAL_STEP). Balances, a move of a few percent, start at MAX_STEP.
     """
     if not pw.solve(SimAuto):
         raise pw.SimAutoError('Could not solve the original input case.')
@@ -399,11 +416,9 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None,
     close_all_related_gen_load(SimAuto, targets)
     mark_start(targets)
 
-    prep.adjust_shunts(SimAuto)
-    if not pw.solve(SimAuto):
-        raise pw.SimAutoError('Could not solve after adjusting shunts in the original case.')
+    prep.adjust_shunts(SimAuto)     # Leaves the case solved: each change is kept only if it solves.
 
-    progress, step = 0, INITIAL_STEP
+    progress, step = 0, initial_step or INITIAL_STEP
     failed_step = None              # The step size which first diverged, before halving.
     step_log = []
     statcoms: dict[int,bool] = {}   # Bus number -> whether the STATCOM closed in successfully.
@@ -412,58 +427,65 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None,
         held_count = sum(int(held(df).sum()) for df in targets.values())
         step_log.append({'From': start, 'To': goal, 'Result': result, 'CaughtUp': caught_up, 'Held': held_count})
 
-    while progress < RESOLUTION:
-        step = min(step, RESOLUTION - progress)
-        goal = progress + step
-        print(f'----- {label}: {progress} -> {goal} of {RESOLUTION} -----')
-        new = {table: at_progress(table, df[scaling(df)], goal) for table, df in targets.items()}
-        with pw.trial(SimAuto, solves=STEP_SOLVES) as t:
-            for table, new_df in new.items():
-                pw.set_df(SimAuto, table, new_df, write_fields(table))
-        if t.ok:
-            for table, new_df in new.items():
-                targets[table].loc[new_df.index, new_df.columns] = new_df
-            result = 'Solved'
-        elif step > 1:
-            print('Did not solve. Halving the step.')
-            log(progress, goal, 'Diverged, halved step')
-            failed_step = failed_step or step
-            step //= 2
-            continue
-        else:
-            print('Did not solve at the smallest step. Bisecting to find the gens/loads which diverge, and holding them back.')
-            for table, new_df in new.items():
-                df = targets[table]
-                hold(df, df.index.isin(apply_rows(SimAuto, table, df, new_df, STEP_SOLVES)), 'Diverged during scaling')
-            result = 'Bisected'
-        start, progress = progress, goal
+    def package():
+        return {
+            **{table.lower(): df[~included(df)] for table, df in targets.items()}
+            ,'step_df': pd.DataFrame(step_log)
+            ,'statcom_bus_df': pd.DataFrame({"BusNum": list(statcoms), "Closed": list(statcoms.values())})
+            ,**{f'{table.lower()}_pvqv': bus_df for table, bus_df in pvqv.items()}
+            ,'dropped_branch_df': pd.DataFrame({"ObjectID": dropped_branches})
+        }
 
-        prep.adjust_shunts(SimAuto)
-        hold_voltage(targets, bus_vpu(SimAuto))
-        if DROP_COLLAPSED:
-            dropped_branches += drop_collapsed_sections(SimAuto)
-        statcom = ADD_STATCOMS and create_statcom_on_lowestv_bus(SimAuto, skip_buses=list(statcoms))
-        if statcom:
-            statcoms[statcom[0]] = statcom[1]
-        log(start, goal, result, catch_up(SimAuto, targets, progress, step, bisect=False))
-        if after_step:
-            after_step(SimAuto, targets, progress)
-        if t.ok:
-            step = min(step * 2, MAX_STEP)
-        elif failed_step:
-            step = failed_step      # The gens/loads which diverged are held now, so go back to the larger step.
-        failed_step = None
+    try:
+        while progress < RESOLUTION:
+            step = min(step, RESOLUTION - progress)
+            goal = progress + step
+            print(f'----- {label}: {progress} -> {goal} of {RESOLUTION} -----')
+            new = {table: at_progress(table, df[scaling(df)], goal) for table, df in targets.items()}
+            with pw.trial(SimAuto, solves=STEP_SOLVES) as t:
+                for table, new_df in new.items():
+                    pw.set_df(SimAuto, table, new_df, write_fields(table))
+            if t.ok:
+                for table, new_df in new.items():
+                    targets[table].loc[new_df.index, new_df.columns] = new_df
+                result = 'Solved'
+            elif step > 1:
+                print('Did not solve. Halving the step.')
+                log(progress, goal, 'Diverged, halved step')
+                failed_step = failed_step or step
+                step //= 2
+                continue
+            else:
+                print('Did not solve at the smallest step. Bisecting to find the gens/loads which diverge, and holding them back.')
+                for table, new_df in new.items():
+                    df = targets[table]
+                    hold(df, df.index.isin(apply_rows(SimAuto, table, df, new_df, STEP_SOLVES)), 'Diverged during scaling')
+                result = 'Bisected'
+            start, progress = progress, goal
 
-    retry_held(SimAuto, targets, label)
-    set_gen_load_status(SimAuto, targets)
+            prep.adjust_shunts(SimAuto)
+            hold_voltage(targets, bus_vpu(SimAuto))
+            if DROP_COLLAPSED:
+                dropped_branches += drop_collapsed_sections(SimAuto)
+            statcom = ADD_STATCOMS and create_statcom_on_lowestv_bus(SimAuto, skip_buses=list(statcoms))
+            if statcom:
+                statcoms[statcom[0]] = statcom[1]
+            log(start, goal, result, catch_up(SimAuto, targets, progress, step, bisect=False))
+            if after_step:
+                after_step(SimAuto, targets, progress)
+            if t.ok:
+                step = min(step * 2, MAX_STEP)
+            elif failed_step:
+                step = failed_step      # The gens/loads which diverged are held now, so go back to the larger step.
+            failed_step = None
+
+        retry_held(SimAuto, targets, label)
+        set_gen_load_status(SimAuto, targets)
+    except pw.SimAutoError as e:
+        # What this run did so far (STATCOMs, dropped branches) stays in the case: hand its log to the caller.
+        e.log = package()
+        raise
 
     print(f'----- {label}: done -----')
 
-    # Package the logs for return.
-    return {
-        **{table.lower(): df[~included(df)] for table, df in targets.items()}
-        ,'step_df': pd.DataFrame(step_log)
-        ,'statcom_bus_df': pd.DataFrame({"BusNum": list(statcoms), "Closed": list(statcoms.values())})
-        ,**{f'{table.lower()}_pvqv': bus_df for table, bus_df in pvqv.items()}
-        ,'dropped_branch_df': pd.DataFrame({"ObjectID": dropped_branches})
-    }
+    return package()

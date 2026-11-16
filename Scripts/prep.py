@@ -37,8 +37,10 @@ def adjust_shunts(SimAuto):
         return df[changed].assign(Status=new_status[changed])
 
     # Adjust all shunts in one go, to get the bulk of the work done.
-    with pw.trial(SimAuto):
-        pw.set_df(SimAuto, 'Shunt', shunt_changes(), ['ObjectID', 'Status'])
+    changes = shunt_changes()
+    if len(changes):
+        with pw.trial(SimAuto):
+            pw.set_df(SimAuto, 'Shunt', changes, ['ObjectID', 'Status'])
 
     # Adjust 1 shunt at a time, solve, see if any more need adjustment.
     # This helps fix situations where a bus has several shunts, and only some need to be online.

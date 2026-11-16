@@ -489,22 +489,35 @@ def swing_band(gen: pd.DataFrame, slack_buses) -> tuple[float, float]:
         lo, hi = max(lo, float(swing['MWMin'].sum())), min(hi, float(swing['MWMax'].sum()))
     return lo, hi
 
-def balance_targets(final: dict[str, pd.DataFrame], swing: float, swing_buses) -> dict[str, pd.DataFrame]:
+def balance_skips(SimAuto, final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFrame] | None = None) -> set:
+    """
+    ObjectIDs a balance leaves alone: gens/loads on buses outside the scaling voltage band (the balance's own scaling
+    would hold them at once, so their share would never move), and, during scaling, those the main scaling holds back
+    or has excluded (`targets`).
+    """
+    vpu = scale.bus_vpu(SimAuto)
+    skip = {oid for df in final.values() for oid in df.loc[~scale.voltage_ok(df, vpu), 'ObjectID']}
+    for df in (targets or {}).values():
+        skip |= set(df.index[~scale.included(df) | scale.held(df)])
+    return skip
+
+def balance_targets(final: dict[str, pd.DataFrame], swing: float, swing_buses, skip=frozenset()) -> dict[str, pd.DataFrame]:
     """
     Targets which move `swing` MW off the swing: half onto generation, half onto load, over the whole case.
     (Swing at +X MW: gens up X/2, load down X/2.) One factor on every Closed gen with MW > 0 (not on a swing bus, not a
     DC tie), capped at MWMax, and one on the MW and Mvar of every Closed load with MW > 0. Statuses are unchanged.
+    skip: ObjectIDs left out (balance_skips()); the rest take their share.
     """
     gen = scalable_gens(final['Gen'])
-    gen = gen[closed(gen) & (gen['MWSetPoint'] > 0) & ~gen['BusNum'].isin(swing_buses)].copy()
-    k_gen = 1 + (swing / 2) / gen['MWSetPoint'].sum() if len(gen) else 1.0
+    gen = gen[closed(gen) & (gen['MWSetPoint'] > 0) & ~gen['BusNum'].isin(swing_buses) & ~gen['ObjectID'].isin(skip)].copy()
     cap = gen['MWMax'].where(gen['MWMax'] > gen['MWSetPoint'], gen['MWSetPoint'])  # A unit already above MWMax isn't raised.
-    gen['MWSetPoint_Target'] = (gen['MWSetPoint'] * max(k_gen, 0.0)).clip(upper=cap)
+    # In proportion to MW; what units at MWMax can't take is spread over the rest, so one round moves it all.
+    gen['MWSetPoint_Target'] = proportional_fill(max(gen['MWSetPoint'].sum() + swing / 2, 0.0), gen['MWSetPoint'], cap)
     gen['MWSetPoint_Seed'] = gen['MWSetPoint']
     gen['Status_Target'] = gen['Status']
 
     load = final['Load']
-    load = load[closed(load) & (conforming(load) | SCALE_NONCONFORMING)].copy()
+    load = load[closed(load) & (conforming(load) | SCALE_NONCONFORMING) & ~load['ObjectID'].isin(skip)].copy()
     p = load[LOAD_P].sum(axis=1)
     load = load[p > 0]
     k_load = 1 - (swing / 2) / p[p > 0].sum() if len(load) else 1.0
@@ -524,10 +537,11 @@ def mw_changes(moved: dict[str, pd.DataFrame]) -> dict[str, float]:
     return {'Gen MW Change': (moved['Gen']['MWSetPoint'] - moved['Gen']['MWSetPoint_Seed']).sum(),
             'Load MW Change': (moved['Load'][LOAD_P].sum(axis=1) - moved['Load']['P_Seed']).sum()}
 
-def balance_swing(SimAuto) -> dict[str, pd.DataFrame]:
+def balance_swing(SimAuto, scaled: dict[str, pd.DataFrame] | None = None) -> dict[str, pd.DataFrame]:
     """
     With the case open: moves what is left on the swing onto the whole case's gen and load, half each (see
     balance_targets()), round after round until it is within BALANCE_TOL_MW. Returns the log sheets.
+    scaled: the main scaling's tables, so units it held back or excluded are left alone here too (balance_skips()).
     """
     slack = prep.slack_buses(SimAuto)
     rounds, sheets = [], {}
@@ -537,12 +551,18 @@ def balance_swing(SimAuto) -> dict[str, pd.DataFrame]:
         print(f'----- Balancing round {i + 1}: swing at {swing:.1f} MW -----')
         if abs(swing) < BALANCE_TOL_MW:
             break
-        targets = balance_targets(final, swing, swing_buses)
-        log = scale.iterate_to_gen_load_targets(SimAuto, targets, label=f'Final balance {i + 1}')
+        targets = balance_targets(final, swing, swing_buses, balance_skips(SimAuto, final, scaled))
+        try:
+            log = scale.iterate_to_gen_load_targets(SimAuto, targets, label=f'Final balance {i + 1}', initial_step=scale.MAX_STEP)
+        except pw.SimAutoError as e:
+            # Keep the hour: the case is solved at the last good checkpoint, and `targets` holds what was applied.
+            print(f'WARNING: Final balance {i + 1} stopped: {e}')
+            sheets.update({f'balance{i + 1}_{name}': df for name, df in getattr(e, 'log', {}).items() if len(df)})
+            rounds.append({'Round': i + 1, 'Swing MW': swing, 'Swing Buses': str(swing_buses), **mw_changes(targets), 'Error': str(e)})
+            break
         rounds.append({'Round': i + 1, 'Swing MW': swing, 'Swing Buses': str(swing_buses), **mw_changes(targets)})
         sheets.update({f'balance{i + 1}_{name}': df for name, df in log.items() if len(df)})
-    else:
-        swing, _ = swing_mw(read_case(SimAuto)['Gen'], slack)
+    swing, _ = swing_mw(read_case(SimAuto)['Gen'], slack)
     rounds.append({'Round': 'End', 'Swing MW': swing})
     return {'balance_df': pd.DataFrame(rounds), **sheets}
 
@@ -563,12 +583,19 @@ def midrun_balancer(SimAuto):
     the scaling still to come (rescale_targets()). If a balance leaves the swing outside the band (e.g. gens at MWMax),
     the band is widened to where it got to, plus a margin (BALANCE_TRIGGER_MW, or 10% of the band if that's 0), so the
     next balance waits until the swing has moved that much further. The swing itself is never moved.
+    A balance aims the swing at 0 MW, or at the nearest point a quarter of the band inside its edges if 0 is not there.
     log: a row per balance. sheets: the scaling logs of the balances (`midrun<N>_<name>`), filled in as they run.
     """
     slack = prep.slack_buses(SimAuto)
     lo, hi = swing_band(pw.get_df(SimAuto, 'Gen', GEN_FIELDS), slack)
     if not (np.isfinite(lo) or np.isfinite(hi)):
         print('Midrun balancing off: balance_trigger_mw is 0 and balance_at_swing_limits is false.')
+    # Balance to a point inside the band, not to 0: with a swing whose MWMin is 0, 0 is the band's edge, and the next
+    # step down would set off another balance. The final balance still takes the swing to 0.
+    if np.isfinite(lo) and np.isfinite(hi):
+        aim = float(np.clip(0.0, lo + 0.25 * (hi - lo), hi - 0.25 * (hi - lo)))
+    else:
+        aim = float(np.clip(0.0, lo, hi))
     state = {'lo': lo, 'hi': hi}
     log: list[dict] = []
     sheets: dict[str, pd.DataFrame] = {}
@@ -579,10 +606,18 @@ def midrun_balancer(SimAuto):
         if state['lo'] <= swing <= state['hi']:
             return
         print(f'----- Swing at {swing:.1f} MW, outside {state["lo"]:.0f} to {state["hi"]:.0f} MW: balancing half on gen, half on load -----')
-        moved = balance_targets({'Load': pw.get_df(SimAuto, 'Load', LOAD_FIELDS), 'Gen': gen}, swing, swing_buses)
+        final = {'Load': pw.get_df(SimAuto, 'Load', LOAD_FIELDS), 'Gen': gen}
+        moved = balance_targets(final, swing - aim, swing_buses, balance_skips(SimAuto, final, targets))
         label = f'Balance {len(log) + 1} (main scaling at {progress} of {scale.RESOLUTION})'
-        nested = scale.iterate_to_gen_load_targets(SimAuto, moved, label=label)
-        sheets.update({f'midrun{len(log) + 1}_{name}': df for name, df in nested.items() if len(df)})
+        error = ''
+        try:
+            nested = scale.iterate_to_gen_load_targets(SimAuto, moved, label=label, initial_step=scale.MAX_STEP)
+            sheets.update({f'midrun{len(log) + 1}_{name}': df for name, df in nested.items() if len(df)})
+        except pw.SimAutoError as e:
+            # Keep the hour: the case is solved at the last good checkpoint, and `moved` holds what was applied.
+            print(f'WARNING: {label} stopped: {e}')
+            sheets.update({f'midrun{len(log) + 1}_{name}': df for name, df in getattr(e, 'log', {}).items() if len(df)})
+            error = str(e)
         rescale_targets(targets, moved)
         after, _ = swing_mw(pw.get_df(SimAuto, 'Gen', GEN_FIELDS), slack)
         if not lo <= after <= hi:
@@ -592,6 +627,6 @@ def midrun_balancer(SimAuto):
         else:
             state['lo'], state['hi'] = lo, hi
         log.append({'Swing MW Before': swing, 'Swing MW After': after, **mw_changes(moved),
-                    'Next Band Low MW': state['lo'], 'Next Band High MW': state['hi']})
+                    'Next Band Low MW': state['lo'], 'Next Band High MW': state['hi'], 'Error': error})
 
     return after_step, log, sheets

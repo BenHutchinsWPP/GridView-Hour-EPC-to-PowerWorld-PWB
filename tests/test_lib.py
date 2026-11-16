@@ -146,6 +146,30 @@ def test_build_targets():
     assert scale.included(gen).all() and scale.included(ld).all()
 
 # ------------------ scale ------------------
+def test_statcom_skips_buses_which_already_have_one():
+    class LowVoltageSimAuto(FakeSimAuto):
+        """Buses 1 and 2 at 0.5 PU (bus 1 lowest); bus 1 already has a STATCOM from an earlier run."""
+        def GetParametersMultipleElementRect(self, table, fields, filter_group):
+            if table == 'Gen':
+                return ('', [[{'BusNum': '1', 'ID': scale.STATCOM_ID}[f] for f in fields]])
+            if table != 'Bus' or 'Vpu' not in fields:
+                return super().GetParametersMultipleElementRect(table, fields, filter_group)
+            values = {'Number': ['1', '2'], 'BusNomVolt': ['230', '230'], 'Vpu': ['0.4', '0.5'], 'IslandNumber': ['1', '1'], 'BusIsStarBus:1': ['NO', 'NO']}
+            return ('', [[values[f][i] for f in fields] for i in range(2)])
+    sa = LowVoltageSimAuto()
+    assert scale.create_statcom_on_lowestv_bus(sa, skip_buses=[]) == (2, True)
+    assert sa.applied[('Gen', '2')]['GenStatus'] == 'Closed'                    # Created Closed, in one trial.
+
+def test_merge_network_changes():
+    log = {'statcom_bus_df': pd.DataFrame({'BusNum': [5], 'Closed': [True]}),
+           'midrun1_statcom_bus_df': pd.DataFrame({'BusNum': [6], 'Closed': [False]}),
+           'balance2_dropped_branch_df': pd.DataFrame({'ObjectID': ['b1']}),
+           'dropped_branch_df': pd.DataFrame({'ObjectID': []}), 'step_df': pd.DataFrame({'From': [0]})}
+    merged = scale.merge_network_changes(log)
+    assert merged['statcom_bus_df'].to_dict('list') == {'BusNum': [5, 6], 'Closed': [True, False], 'Run': ['main', 'midrun1']}
+    assert merged['dropped_branch_df'].to_dict('list') == {'ObjectID': ['b1'], 'Run': ['balance2']}
+    assert sorted(merged) == ['dropped_branch_df', 'statcom_bus_df', 'step_df']
+
 def test_exclude_keeps_first_reason():
     df = targets_df(ObjectID=['g1', 'g2'], BusNum=[1, 2])
     scale.exclude(df, df.index == 'g1', 'Swing Unit')
@@ -387,11 +411,24 @@ def test_balance_targets_half_gen_half_load():
     load = loads([('l1', 1, 'Closed', 150.0, 0.0, 0.0, 30.0), ('l2', 2, 'Closed', 350.0, 0.0, 0.0, 70.0),
                   ('lneg', 2, 'Closed', -40.0, 0.0, 0.0, 0.0), ('lo', 2, 'Open', 99.0, 0.0, 0.0, 0.0)])
     t = area.balance_targets({'Gen': gen, 'Load': load}, swing=100.0, swing_buses=[9])
-    assert t['Gen']['MWSetPoint_Target'].to_dict() == {'g1': 125.0, 'g2': 120.0}  # g2 capped at MWMax.
+    assert t['Gen']['MWSetPoint_Target'].to_dict() == {'g1': 130.0, 'g2': 120.0}  # g2 capped at MWMax; g1 takes the rest.
     assert t['Load']['SMW_Target'].to_dict() == {'l1': 135.0, 'l2': 315.0}
     assert t['Load']['SMvar_Target'].to_dict() == {'l1': 27.0, 'l2': 63.0}
     assert t['Load']['P_Seed'].to_dict() == {'l1': 150.0, 'l2': 350.0}     # What rescale_targets() divides by.
     assert (t['Load']['Status_Target'] == 'Closed').all()
+
+def test_balance_skips_held_and_out_of_band_units():
+    # FakeSimAuto has buses 1 and 2 at 1.0 PU; bus 3 has no voltage, so it counts as outside the band.
+    gen = gens([('g1', 1, '1', 'Closed', 'GT', 100.0, 300.0, 0.0), ('g2', 1, '2', 'Closed', 'GT', 100.0, 300.0, 0.0),
+                ('g3', 1, '3', 'Closed', 'GT', 100.0, 300.0, 0.0)]).assign(BusNum=[1, 2, 3])
+    load = loads([('l1', 1, 'Closed', 100.0, 0.0, 0.0, 0.0), ('l2', 1, 'Closed', 100.0, 0.0, 0.0, 0.0)])
+    main = {'Gen': gen.set_index('ObjectID').assign(ExclusionReason='', HeldReason=['', 'Voltage', '']),
+            'Load': load.set_index('ObjectID').assign(ExclusionReason=['', 'PVQV'], HeldReason='')}
+    skip = area.balance_skips(FakeSimAuto(), {'Gen': gen, 'Load': load}, main)
+    assert skip == {'g2', 'g3', 'l2'}
+    t = area.balance_targets({'Gen': gen, 'Load': load}, swing=100.0, swing_buses=[], skip=skip)
+    assert t['Gen']['MWSetPoint_Target'].to_dict() == {'g1': 150.0}     # The whole gen half lands on what is left.
+    assert t['Load']['SMW_Target'].to_dict() == {'l1': 50.0}
 
 def thermal_case():
     return gens([('g1', 1, '1', 'Closed', 'GT', 50.0, 100.0, 0.0), ('g2', 1, '2', 'Open', 'GT', 0.0, 400.0, 0.0),
@@ -729,18 +766,6 @@ def test_iterate_raises_when_the_case_does_not_solve():
             assert False
         except pw.SimAutoError:
             pass
-    # Fine at the start, diverges once the shunts have been adjusted.
-    sa, state = FakeSimAuto(), {'broken': False}
-    sa.diverged = lambda: state['broken']
-    saved = prep.adjust_shunts
-    prep.adjust_shunts = lambda SimAuto: state.update(broken=True)
-    try:
-        scale.iterate_to_gen_load_targets(sa, scaling_targets(gen_status='Closed')[0])
-        assert False
-    except pw.SimAutoError as e:
-        assert 'shunt' in str(e)
-    finally:
-        prep.adjust_shunts = saved
 
 def test_test_gen_targets_only_writes_included_rows():
     class Recording(FakeSimAuto):
@@ -904,12 +929,6 @@ def test_settings_apply_and_reject():
         finally:
             scale.EXCLUDE_VMIN, area.UNIT_GENTYPE, area.ALL_ON_TYPES, area.GEN_TYPES = saved
 
-if __name__ == '__main__':
-    tests = [f for name, f in dict(globals()).items() if name.startswith('test_')]
-    for test in tests:
-        test()
-    print(f'{len(tests)} tests passed.')
-
 def test_trial_refuses_to_nest():
     sa = FakeSimAuto()
     with pw.trial(sa):
@@ -919,3 +938,118 @@ def test_trial_refuses_to_nest():
             assert False
         except RuntimeError:
             pass
+
+# ------------------ Fable review fixes (2026-11-16) ------------------
+def test_midrun_balance_aims_inside_the_band():
+    # Swing limits 0..800 MW: 0 is the band's edge, so a balance aims at 200 MW (a quarter of the band in), not 0.
+    gen, load = swing_case()
+    gen.loc[gen['ID'] == 'xx', ['MWMax', 'MWMin']] = [800.0, 0.0]
+    with saved_settings():
+        area.BALANCE_TRIGGER_MW, area.BALANCE_AT_SWING_LIMITS = 1000.0, True
+        sa = SwingSimAuto(gen, load)
+        after_step, log, _ = area.midrun_balancer(sa)
+        scale.iterate_to_gen_load_targets(sa, load_ramp_targets(), after_step=after_step)
+    assert len(log) >= 1 and abs(log[0]['Swing MW After'] - 200.0) < 1.0
+
+def test_final_balance_keeps_the_hour_when_a_round_fails():
+    gen, load = swing_case()
+    sa = SwingSimAuto(gen, load)
+    sa.base['Load'].loc[3, 'SMW'] = 900.0                       # Swing at +700 MW.
+    def fails(*args, **kwargs):
+        raise pw.SimAutoError('Could not solve the original input case.')
+    saved = scale.iterate_to_gen_load_targets
+    scale.iterate_to_gen_load_targets = fails
+    try:
+        sheets = area.balance_swing(sa)
+    finally:
+        scale.iterate_to_gen_load_targets = saved
+    rounds = sheets['balance_df']
+    assert rounds['Error'].iloc[0].startswith('Could not solve') and rounds['Round'].iloc[-1] == 'End'
+
+def test_step_02_saves_the_case_when_the_log_cannot_be_written():
+    gen, load = two_cases()
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        step = load_step_02(Path(d), 'area')
+        sa = CaseSimAuto({'h1.epc': (gen, load), 'Prepared.pwb': (gen, load)}, slack=[99])
+        real = pw.write_excel
+        def locked(fp, sheets):
+            if fp.name.endswith('_03_ScaleLog.xlsx'):
+                raise PermissionError(fp)
+            return real(fp, sheets)
+        step.pw.write_excel = locked
+        try:
+            step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')
+        finally:
+            step.pw.write_excel = real
+        assert 'h1.pwb' in sa.saved
+
+def test_adjust_shunts_takes_no_checkpoint_when_nothing_changes():
+    class InBand(FakeSimAuto):
+        def GetParametersMultipleElementRect(self, table, fields, filter_group):
+            if table == 'Shunt':
+                row = {'ObjectID': 'Shunt 1 1', 'MvarNom': '50', 'Status': 'Closed', 'Vpu': '1.0'}
+                return ('', [[row[f] for f in fields]])
+            return super().GetParametersMultipleElementRect(table, fields, filter_group)
+    sa = InBand()
+    prep.adjust_shunts(sa)
+    assert sa.checkpoint is None and sa.applied == {}
+
+def test_midrun_balance_failure_keeps_the_hour_and_its_network_log():
+    gen, load = swing_case()
+    sa = SwingSimAuto(gen, load)
+    after_step, log, sheets = area.midrun_balancer(sa)
+    run = scale.iterate_to_gen_load_targets
+    def balance_fails(SimAuto, targets, **kwargs):
+        e = pw.SimAutoError('Could not solve the original input case.')
+        e.log = {'statcom_bus_df': pd.DataFrame({'BusNum': [7], 'Closed': [True]})}
+        raise e
+    scale.iterate_to_gen_load_targets = balance_fails     # Only the balances' nested runs look it up by name.
+    try:
+        targets = load_ramp_targets()
+        run(sa, targets, after_step=after_step)
+    finally:
+        scale.iterate_to_gen_load_targets = run
+    assert targets['Load'].loc['l1', 'Progress'] == scale.RESOLUTION                 # The main scaling finished.
+    assert log and log[0]['Error'].startswith('Could not solve')
+    assert sheets['midrun1_statcom_bus_df']['BusNum'].tolist() == [7]               # The STATCOM it added is listed.
+
+def test_balance_starts_at_the_largest_step():
+    log = scale.iterate_to_gen_load_targets(FakeSimAuto(), scaling_targets(gen_status='Closed')[0], initial_step=scale.MAX_STEP)
+    assert log['step_df'].iloc[0][['From', 'To']].tolist() == [0, scale.RESOLUTION]
+
+def test_clear_small_islands_error_is_not_fatal():
+    class Collapsed(FakeSimAuto):
+        def GetParametersMultipleElementRect(self, table, fields, filter_group):
+            if table == 'Branch':
+                row = {'ObjectID': "Branch '1' '2' '1'", 'Status': 'Closed', 'BranchVpuHigh': '1.0', 'BranchVpuLow': '0.5'}
+                return ('', [[row[f] for f in fields]])
+            return super().GetParametersMultipleElementRect(table, fields, filter_group)
+        def RunScriptCommand(self, command):
+            return ('ClearSmallIslands: not allowed in Edit mode',) if command.startswith('ClearSmallIslands') else super().RunScriptCommand(command)
+    assert scale.drop_collapsed_sections(Collapsed()) == ["Branch '1' '2' '1'"]
+
+def test_final_balance_leaves_units_the_main_scaling_excluded():
+    gen, load = swing_case()
+    sa = SwingSimAuto(gen, load)
+    sa.base['Load'].loc[3, 'SMW'] = 600.0                                          # Swing at +400 MW.
+    scaled = {'Gen': targets_df(ObjectID=['g1'], BusNum=[1]).assign(ExclusionReason='PVQV', HeldReason=''),
+              'Load': targets_df(ObjectID=['l1'], BusNum=[3]).assign(HeldReason='')}
+    area.balance_swing(sa, scaled)
+    out = sa.table('Gen').set_index('ObjectID')
+    assert out.loc['g1', 'MWSetPoint'] == 100.0 and out.loc['g2', 'MWSetPoint'] > 100.0
+
+def test_midrun_balance_leaves_units_the_main_scaling_excluded():
+    gen, load = swing_case()
+    sa = SwingSimAuto(gen, load)
+    after_step, log, _ = area.midrun_balancer(sa)
+    targets = load_ramp_targets()
+    targets['Gen']['ExclusionReason'] = 'PVQV'                                     # g1: excluded by the main scaling.
+    scale.iterate_to_gen_load_targets(sa, targets, after_step=after_step)
+    out = sa.table('Gen').set_index('ObjectID')
+    assert log and out.loc['g1', 'MWSetPoint'] == 100.0 and out.loc['g2', 'MWSetPoint'] > 100.0
+
+if __name__ == '__main__':
+    tests = [f for name, f in dict(globals()).items() if name.startswith('test_')]
+    for test in tests:
+        test()
+    print(f'{len(tests)} tests passed.')

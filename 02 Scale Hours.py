@@ -51,14 +51,22 @@ def create_case(SimAuto, gv_fp, out_fp):
         log = scale.iterate_to_gen_load_targets(SimAuto, targets, pvqv, after_step)
         log['midrun_balance_df'] = pd.DataFrame(midrun_log)
         log.update(midrun_sheets)
-        log.update(area.balance_swing(SimAuto))
+        log.update(area.balance_swing(SimAuto, targets))
     else:
         log = scale.iterate_to_gen_load_targets(SimAuto, targets, pvqv)
     if reports:
         # Read back from PowerWorld, so the report shows what the case holds rather than what the scaling meant to do.
         log = {**area.achieved(area.read_case(SimAuto), reports, prep.slack_buses(SimAuto)), **log}
-    pw.write_excel(out_dir / (gv_fp.stem + '_03_ScaleLog.xlsx'), log)
+    if not pw.solve(SimAuto):
+        print('WARNING: the case does not solve at the end of scaling. Saved as it is.')
+    # Save the case first: a log which can't be written (e.g. open in Excel) mustn't cost the solved hour.
     pw.save_case(SimAuto, out_fp, run['case_format'])
+    log_fp = out_dir / (gv_fp.stem + '_03_ScaleLog.xlsx')
+    try:
+        pw.write_excel(log_fp, scale.merge_network_changes(log))
+    except OSError as e:
+        print(f'WARNING: could not write {log_fp.name} (open in Excel?): {e!r}. The case was saved; '
+              f'delete {out_fp.name} to rerun this hour with its log.')
 
     SimAuto.CloseCase()
 

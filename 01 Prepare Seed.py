@@ -99,6 +99,8 @@ if(__name__=='__main__'):
         prep.get_pvqv(SimAuto).to_csv(pvqv_fp, index=False)
 
     prep.disable_area_agc(SimAuto)
+    if not pw.solve(SimAuto):
+        raise SystemExit('The case does not solve with Area AGC off. Fix that before step 02.')
     if run['create_giant_swing']:
         swing_bus = run['swing_bus']
         if swing_bus == 'max_fault_duty':
