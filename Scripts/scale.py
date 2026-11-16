@@ -180,8 +180,10 @@ def apply_or_exclude(SimAuto, table: str, df: pd.DataFrame, new_df: pd.DataFrame
     exclude(df, df.index.isin(failed), reason)
 
 def close_all_related_gen_load(SimAuto, targets):
-    """Closes included gens & loads which are open now but closed in the target, at 0 MW / 0 Mvar."""
-    print('close_all_related_gen_load()')
+    """
+    Closes included gens & loads which are open now but closed in the target, at 0 MW / 0 Mvar.
+    Does nothing (and prints nothing) when no status changes, as in a balance.
+    """
     for table, df in targets.items():
         new_df = df[included(df)].copy()
         changed = pd.Series(False, index=new_df.index)
@@ -190,17 +192,25 @@ def close_all_related_gen_load(SimAuto, targets):
             new_df.loc[to_close, zeroed] = 0.0
             new_df.loc[to_close, status] = 'Closed'
             changed |= to_close
+        if changed.any():
+            print(f'close_all_related_gen_load(): closing {changed.sum()} {table} at 0 MW.')
         apply_or_exclude(SimAuto, table, df, new_df[changed], 'Diverged closing at 0 MW')
 
 def set_gen_load_status(SimAuto, targets):
-    """Sets included gens & loads to their final target statuses. Rows which diverge are excluded."""
-    print('set_gen_load_status()')
+    """
+    Sets included gens & loads to their final target statuses. Rows which diverge are excluded.
+    Only rows whose status changes are written, so a balance (no status changes) writes and solves nothing.
+    """
     # Loads first: any being opened should have reached 0 MW / 0 Mvar, so opening them has no impact on the solution.
     # Then gens: opening them at 0 MW may still remove VAR support. If one cannot be opened, make note of it and proceed.
     for table in ('Load', 'Gen'):
         df = targets[table]
         new_df = df[included(df)]
         new_df = new_df.assign(**{s: new_df[f'{s}_Target'] for s in STATUS[table]})
+        changed = pd.concat([new_df[s] != df.loc[new_df.index, s] for s in STATUS[table]], axis=1).any(axis=1)
+        new_df = new_df[changed]
+        if len(new_df):
+            print(f'set_gen_load_status(): {len(new_df)} {table} change status.')
         apply_or_exclude(SimAuto, table, df, new_df, 'Diverged setting final status')
 
 def mark_start(targets):
