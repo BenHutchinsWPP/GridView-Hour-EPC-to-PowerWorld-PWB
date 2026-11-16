@@ -5,7 +5,6 @@ Every SimAuto error raises SimAutoError.
 from pathlib import Path
 from contextlib import contextmanager
 from types import SimpleNamespace
-import itertools
 import pandas as pd
 import openpyxl.utils
 
@@ -68,24 +67,31 @@ def trial(SimAuto, solves: int = 1, keep_changes: bool = True):
     """
     Checkpoints the case, runs the body, then solves.
     Rolls back to the checkpoint if the case does not solve (or if keep_changes=False).
-    Uses named states, so trials can nest without overwriting each other's checkpoint.
+    Uses SimAuto's one in-memory checkpoint (SaveState/LoadState), which works in Edit and Run mode alike.
+    The named-state script commands (StoreState etc.) don't: they need Run mode, and switching
+    from Edit to Run destroys them. With one checkpoint, trials can't nest.
 
         with trial(SimAuto) as t:
             set_df(...)
         if not t.ok: ...
     """
-    name = f'trial{next(_trial_ids)}'
-    run(SimAuto, f'StoreState("{name}");')
-    t = SimpleNamespace(ok=False)
+    global _in_trial
+    if _in_trial:
+        raise RuntimeError('pw.trial cannot nest: SimAuto has only one checkpoint.')
+    _in_trial = True
     try:
-        yield t
-        t.ok = all(solve(SimAuto) for _ in range(solves))
+        chk(SimAuto.SaveState(), 'SaveState')
+        t = SimpleNamespace(ok=False)
+        try:
+            yield t
+            t.ok = all(solve(SimAuto) for _ in range(solves))
+        finally:
+            if not (t.ok and keep_changes):
+                chk(SimAuto.LoadState(), 'LoadState')
     finally:
-        if not (t.ok and keep_changes):
-            run(SimAuto, f'RestoreState(USER, "{name}");')
-        run(SimAuto, f'DeleteState(USER, "{name}");')
+        _in_trial = False
 
-_trial_ids = itertools.count()
+_in_trial = False
 
 @contextmanager
 def creating(SimAuto):

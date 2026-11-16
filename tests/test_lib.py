@@ -3,7 +3,6 @@ Tests for the parts of Scripts/ which don't need PowerWorld. Runs on any OS.
     python tests/test_lib.py      (or: pytest tests)
 """
 import importlib.util
-import re
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -23,18 +22,19 @@ class FakeSimAuto:
     def __init__(self, bad=()):
         self.bad = set(bad)
         self.applied = {}
-        self.states = {}
+        self.checkpoint = None
         self.CreateIfNotFound = False
 
+    def SaveState(self):
+        self.checkpoint = dict(self.applied)
+        return ('',)
+
+    def LoadState(self):
+        self.applied = dict(self.checkpoint)
+        return ('',)
+
     def RunScriptCommand(self, command):
-        name = re.search(r'"(.+?)"', command)
-        if command.startswith('StoreState'):
-            self.states[name.group(1)] = dict(self.applied)
-        elif command.startswith('RestoreState'):
-            self.applied = dict(self.states[name.group(1)])
-        elif command.startswith('DeleteState'):
-            del self.states[name.group(1)]
-        elif command.startswith('SolvePowerFlow') and self.diverged():
+        if command.startswith('SolvePowerFlow') and self.diverged():
             return ('Diverged',)
         return ('',)
 
@@ -74,7 +74,6 @@ def test_set_df_bisect_returns_failures_and_rolls_them_back():
     failed = pw.set_df_bisect(sa, 'Branch', df, ['ObjectID', 'Status'])
     assert sorted(df.loc[failed, 'ObjectID']) == ['b2', 'b5']
     assert {k for _, k in sa.applied} == {'b0', 'b1', 'b3', 'b4', 'b6', 'b7'}
-    assert sa.states == {}  # Every named state cleaned up.
 
 def test_trial_rolls_back_on_exception():
     sa = FakeSimAuto()
@@ -184,7 +183,6 @@ def test_iterate_grows_step_while_solving():
     assert results(log) == ['Solved'] * 3
     assert targets['Gen']['MWSetPoint'].tolist() == [50.0, 20.0]
     assert targets['Load']['SMW'].tolist() == [10.0, 8.0] and targets['Load'].loc['l2', 'Status'] == 'Closed'
-    assert sa.states == {}
 
 def test_iterate_excludes_gens_which_diverge_closing_in():
     sa = FakeSimAuto(bad={'2'})  # Closing the gen on bus 2 diverges.
@@ -205,7 +203,6 @@ def test_iterate_halves_step_then_bisects_and_holds():
     assert gen['MWSetPoint'].tolist() == [50.0, 10.0]  # g2 left where it got to.
     assert log['gen']['ExclusionReason'].to_dict() == {'g2': 'Diverged during scaling'}
     assert targets['Load']['SMW'].tolist() == [10.0, 8.0]
-    assert sa.states == {}
 
 class LaterConvergesSimAuto(FakeSimAuto):
     """Raising g2 (bus 2) above its start diverges, until g1 (bus 1) reaches 30 MW."""
@@ -221,7 +218,6 @@ def test_iterate_held_gen_resumes_once_it_converges():
     assert 'Bisected' in results(log) and log['step_df']['CaughtUp'].sum() > 0
     assert gen['MWSetPoint'].tolist() == [50.0, 20.0]
     assert (gen['ExclusionReason'] == '').all() and (gen['HeldReason'] == '').all()
-    assert sa.states == {}
 
 # ------------------ area ------------------
 def test_classify_gen_type():
@@ -359,7 +355,7 @@ def test_area_targets_through_the_engine():
     targets, _ = area.build_targets({'Load': epc, 'Gen': epc_gen}, {'Load': case, 'Gen': case_gen})
     sa = FakeSimAuto()
     log = scale.iterate_to_gen_load_targets(sa, targets)
-    assert results(log) == ['Solved'] * 3 and sa.states == {}
+    assert results(log) == ['Solved'] * 3
     load, gen = targets['Load'], targets['Gen']
     assert load['SMW'].tolist() == [150.0, 150.0] and load['SMvar'].tolist() == [20.0, 20.0]
     assert (load[['IMW', 'IMvar', 'ZMW', 'ZMvar', 'DistMWInput', 'DistMvarInput']] == 0).all().all()
@@ -779,7 +775,7 @@ class CaseSimAuto(SwingSimAuto):
     def OpenCase(self, fp):
         gen, load = self.cases[Path(fp).name]
         self.base = {'Gen': gen.set_index('BusNum', drop=False), 'Load': load.set_index('BusNum', drop=False)}
-        self.applied, self.states = {}, {}
+        self.applied = {}
         return ('',)
 
     def SaveCase(self, fp, case_format, overwrite):
@@ -902,3 +898,13 @@ if __name__ == '__main__':
     for test in tests:
         test()
     print(f'{len(tests)} tests passed.')
+
+def test_trial_refuses_to_nest():
+    sa = FakeSimAuto()
+    with pw.trial(sa):
+        try:
+            with pw.trial(sa):
+                pass
+            assert False
+        except RuntimeError:
+            pass
