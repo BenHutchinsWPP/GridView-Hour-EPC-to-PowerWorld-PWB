@@ -100,12 +100,6 @@ def read_case(SimAuto) -> dict[str, pd.DataFrame]:
     """Loads & gens of the open case (PWB, or an EPC opened in PowerWorld)."""
     return {'Load': pw.get_df(SimAuto, 'Load', LOAD_FIELDS), 'Gen': pw.get_df(SimAuto, 'Gen', GEN_FIELDS)}
 
-def same_keys(epc_df: pd.DataFrame, case_df: pd.DataFrame) -> set:
-    """Areas whose elements have exactly the same ObjectIDs in both cases."""
-    e = epc_df.groupby('AreaNumber')['ObjectID'].agg(frozenset)
-    c = case_df.groupby('AreaNumber')['ObjectID'].agg(frozenset)
-    return {a for a in c.index if a in e.index and e[a] == c[a]}
-
 def closed(df: pd.DataFrame) -> pd.Series:
     return df['Status'] == 'Closed'
 
@@ -163,25 +157,24 @@ def load_targets(epc_load: pd.DataFrame, case_load: pd.DataFrame) -> tuple[pd.Da
     """
     epc = epc_load.assign(P=epc_load[LOAD_P].sum(axis=1).where(closed(epc_load), 0.0),
                           Q=epc_load[LOAD_Q].sum(axis=1).where(closed(epc_load), 0.0))
-    matched = same_keys(epc_load, case_load)
-
     df = case_load[closed(case_load)].copy()
     df['P'] = df[LOAD_P].sum(axis=1)
     df['Q'] = df[LOAD_Q].sum(axis=1)
-    df['Method'] = np.where(df['AreaNumber'].isin(matched), 'Matched keys', 'Area scale')
 
-    # Area scale: positive and negative load separately, for MW and for Mvar. See sign_share().
+    # Basis: a load whose key is in the EPC starts from its EPC value (0 if Open there), any other from its seed value.
+    epc_by_id = epc.set_index('ObjectID')
+    in_epc = df['ObjectID'].isin(epc_by_id.index)
+    df['Method'] = np.where(in_epc, 'Key', 'Seed')
+    df['Basis MW'] = df['ObjectID'].map(epc_by_id['P']).where(in_epc, df['P'])
+    df['Basis Mvar'] = df['ObjectID'].map(epc_by_id['Q']).where(in_epc, df['Q'])
+
+    # Then each area's positive and negative basis is scaled to the EPC's totals, for MW and for Mvar. See sign_share().
+    # Where every key matches, the factors are 1 and each load gets its own EPC value.
     tgt = pd.concat([netted_sign_totals(epc, case_load, 'P', 'MW'), netted_sign_totals(epc, case_load, 'Q', 'Mvar')], axis=1)
     seed = pd.concat([sign_totals(df['P'], df['AreaNumber'], 'MW'), sign_totals(df['Q'], df['AreaNumber'], 'Mvar')], axis=1)
-    df['SMW_Target'] = sign_share(df['P'], df['AreaNumber'], tgt['MW +'], tgt['MW -'])
-    # Mvar of a sign which no seed load in the area has is spread over its zero-Mvar loads in proportion to |MW|.
-    df['SMvar_Target'] = sign_share(df['Q'], df['AreaNumber'], tgt['Mvar +'], tgt['Mvar -'], fallback=df['P'].abs())
-
-    # Matched keys: each load to its own EPC value.
-    m = df['Method'] == 'Matched keys'
-    epc_by_id = epc.set_index('ObjectID')
-    df['SMW_Target'] = df['SMW_Target'].where(~m, df['ObjectID'].map(epc_by_id['P']))
-    df['SMvar_Target'] = df['SMvar_Target'].where(~m, df['ObjectID'].map(epc_by_id['Q']))
+    df['SMW_Target'] = sign_share(df['Basis MW'], df['AreaNumber'], tgt['MW +'], tgt['MW -'])
+    # Mvar of a sign which no load in the area has is spread over its zero-Mvar loads in proportion to |MW|.
+    df['SMvar_Target'] = sign_share(df['Basis Mvar'], df['AreaNumber'], tgt['Mvar +'], tgt['Mvar -'], fallback=df['Basis MW'].abs())
 
     for c in ['IMW', 'IMvar', 'ZMW', 'ZMvar', 'DistMWInput', 'DistMvarInput']:
         df[f'{c}_Target'] = 0.0
@@ -200,13 +193,14 @@ def load_targets(epc_load: pd.DataFrame, case_load: pd.DataFrame) -> tuple[pd.Da
         'Planned MW': planned['MW +'] + planned['MW -'], 'Planned Mvar': planned['Mvar +'] + planned['Mvar -'],
         **{f'Target {c}': tgt[c] for c in tgt}, **{f'Seed {c}': seed[c] for c in seed},
         **{f'Planned {c}': planned[c] for c in planned},
+        'Basis MW': df.groupby('AreaNumber')['Basis MW'].sum(),
         'Seed Loads': df.groupby('AreaNumber').size(),
+        'Key Loads': in_epc.groupby(df['AreaNumber']).sum(),
         'EPC Loads': epc[closed(epc)].groupby('AreaNumber').size(),
         # e.g. GridView's X1/X2 distributed generation loads, which aren't in the PWB.
         'EPC-only MW': epc[~epc['ObjectID'].isin(case_load['ObjectID'])].groupby('AreaNumber')['P'].sum(),
         'EPC-only Netted MW': epc['P'].where(epc_only_negative(epc, case_load, 'P'), 0.0).groupby(epc['AreaNumber']).sum(),
     }).fillna(0.0)
-    report['Method'] = np.where(report.index.isin(matched), 'Matched keys', 'Area scale')
     report['Unmet MW'] = report['Target MW'] - report['Planned MW']
     report['Unmet Mvar'] = report['Target Mvar'] - report['Planned Mvar']
     for c in tgt:
@@ -219,6 +213,26 @@ def capacity_share(target: float, cap: pd.Series) -> pd.Series:
     """Spreads target (>= 0) over units in proportion to cap (>= 0): the same fraction of cap on each, at most all of it."""
     total = cap.sum()
     return cap * (min(target / total, 1.0) if total > 0 else 0.0)
+
+def proportional_fill(target: float, weight: pd.Series, cap: pd.Series) -> pd.Series:
+    """
+    Spreads target (>= 0) over units in proportion to weight (>= 0), at most cap each: units which reach their cap stay
+    there and the rest is spread again over the others. Units with weight 0 get 0. Less than target if all are capped.
+    """
+    x = pd.Series(0.0, index=weight.index)
+    free = weight > 0
+    remaining = target
+    while free.any() and remaining > 1e-9:
+        share = remaining * weight[free] / weight[free].sum()
+        over = share > cap[free]
+        if not over.any():
+            x[free] = share
+            break
+        hit = over[over].index
+        x[hit] = cap[hit]
+        remaining -= cap[hit].sum()
+        free[hit] = False
+    return x
 
 def scalable_gens(df: pd.DataFrame) -> pd.DataFrame:
     """All gens but the giant swing and MANUAL_UNIT_TYPES."""
@@ -275,6 +289,43 @@ def commit(rows: pd.DataFrame, target: float, gen_type: str, epc_online: set) ->
             have -= cap[i]
     return online
 
+def dispatch_bucket(rows: pd.DataFrame, target: float, gen_type: str, epc_online: set) -> tuple[pd.Series, pd.Series, str]:
+    """
+    (Status_Target, MWSetPoint_Target, method) of one (area, GenType) bucket's units, from their basis (gen_targets()).
+    'Key basis': the online units' basis MW is scaled by one factor to the target, capped at MWMax (the rest spread over
+    the others). Any MW still left brings offline units online by commit() and shares it over them by capacity.
+    'Capacity': for a bucket with no unit whose key is in the EPC, or nothing to scale (target 0, nothing online, or the
+    opposite sign): units are committed by commit() and share the target in proportion to MWMax (|MWMin| for a negative
+    target), following each GenType's dispatch rules.
+    Units with a basis of the opposite sign (e.g. storage charging in a generating bucket) keep it.
+    """
+    status = rows['Basis Status'].copy()
+    basis = rows['Basis MW']
+    sign = 1.0 if target >= 0 else -1.0
+    cap = (rows['MWMax'] if target >= 0 else -rows['MWMin']).fillna(0.0).clip(lower=0)
+    along = (basis * sign).clip(lower=0)                # Basis in the target's direction.
+    against = basis.where(basis * sign < 0, 0.0)        # Kept as it is.
+    want = abs(target - against.sum())
+
+    if target != 0 and along.sum() > 0 and (rows['Method'] == 'Key').any():
+        mw = against + sign * proportional_fill(want, along, cap.where(cap > along, along))
+        left = want - (mw - against).abs().sum()
+        if left > 1e-6 and COMMIT:
+            off = rows[status != 'Closed']
+            extra = commit(off.assign(Status='Open'), sign * left, gen_type, epc_online)
+            extra = extra[extra].index
+            mw[extra] = sign * capacity_share(left, cap[extra])
+            status[extra] = 'Closed'
+        return status, mw, 'Key basis'
+
+    if COMMIT:
+        status = pd.Series(np.where(commit(rows.assign(Status=status), target, gen_type, epc_online), 'Closed', 'Open'),
+                           index=rows.index)
+    on = status == 'Closed'
+    mw = pd.Series(0.0, index=rows.index)
+    mw[on] = sign * capacity_share(abs(target), cap[on])
+    return status, mw, 'Capacity'
+
 def gen_targets(epc_gen: pd.DataFrame, case_gen: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Returns (targets, bucket report). targets holds the case's gens which are online now or after commitment,
@@ -288,34 +339,26 @@ def gen_targets(epc_gen: pd.DataFrame, case_gen: pd.DataFrame) -> tuple[pd.DataF
                          f'are blank or unknown). Scaling would take the rest of the fleet offline. Map the codes in '
                          f'[area.unit_gentype] / [area.fuel_gentype] in settings.toml, or raise [area] max_unknown_share.')
     epc_online = set(epc.loc[closed(epc), 'ObjectID'])
-    matched = same_keys(epc_gen, case_gen)
 
     df = case_gen.copy()
     df['GenType'] = classify_gen_type(df)
-    df['Method'] = np.where(df['AreaNumber'].isin(matched), 'Matched keys', 'Area & type scale')
-    df['Status_Target'] = df['Status']
-    df['MWSetPoint_Target'] = df['MWSetPoint'].where(closed(df), 0.0)
+    # Basis: a unit whose key is in the EPC starts from its EPC status (with COMMIT) and MW, any other from its seed's.
+    by_id = epc.set_index('ObjectID')
+    in_epc = df['ObjectID'].isin(by_id.index)
+    df['Method'] = np.where(in_epc, 'Key', 'Seed')
+    df['Basis Status'] = df['ObjectID'].map(by_id['Status']).where(in_epc & COMMIT, df['Status'])
+    df['Basis MW'] = df['ObjectID'].map(by_id['P']).where(in_epc, df['MWSetPoint']).where(df['Basis Status'] == 'Closed', 0.0)
+    df['Status_Target'] = df['Basis Status']
+    df['MWSetPoint_Target'] = df['Basis MW']
 
     keys = ['AreaNumber', 'GenType']
     tgt = epc.groupby(keys)['P'].sum()
-    for bucket, rows in df[df['Method'] != 'Matched keys'].groupby(keys):
+    bucket_method = {}
+    for bucket, rows in df.groupby(keys):
         t = float(tgt.get(bucket, 0.0))
-        if COMMIT:
-            df.loc[rows.index, 'Status_Target'] = np.where(commit(rows, t, bucket[1], epc_online), 'Closed', 'Open')
-        on = df.loc[rows.index, 'Status_Target'] == 'Closed'
-        x = pd.Series(0.0, index=rows.index)
-        if t >= 0:   # Share by MWMax.
-            x[on] = capacity_share(t, rows.loc[on, 'MWMax'].fillna(0.0).clip(lower=0))
-        else:        # Net charging (storage): share by |MWMin|.
-            x[on] = -capacity_share(-t, (-rows.loc[on, 'MWMin'].fillna(0.0)).clip(lower=0))
-        df.loc[rows.index, 'MWSetPoint_Target'] = x
-
-    # Matched keys: each unit to its own EPC status (when committing) and value.
-    m = df['Method'] == 'Matched keys'
-    by_id = epc.set_index('ObjectID')
-    if COMMIT:
-        df['Status_Target'] = df['Status_Target'].where(~m, df['ObjectID'].map(by_id['Status']))
-    df['MWSetPoint_Target'] = df['MWSetPoint_Target'].where(~m, df['ObjectID'].map(by_id['P'])).where(df['Status_Target'] == 'Closed', 0.0)
+        status, mw, bucket_method[bucket] = dispatch_bucket(rows, t, bucket[1], epc_online)
+        df.loc[rows.index, 'Status_Target'] = status
+        df.loc[rows.index, 'MWSetPoint_Target'] = mw.where(status == 'Closed', 0.0)
 
     df['MWSetPoint'] = df['MWSetPoint'].where(closed(df), 0.0)   # Open units are at 0 MW, as the engine expects.
     df['Status_Seed'] = df['Status']
@@ -335,11 +378,13 @@ def gen_targets(epc_gen: pd.DataFrame, case_gen: pd.DataFrame) -> tuple[pd.DataF
         'Seed Online MWMax': df['MWMax'].where(on_seed, 0.0).groupby([df[k] for k in keys]).sum(),
         'Planned Online MWMax': df['MWMax'].where(on_plan, 0.0).groupby([df[k] for k in keys]).sum(),
         'All Units MWMax': g['MWMax'].sum(),
+        'Basis MW': g['Basis MW'].sum(),
+        'Key Gens': in_epc.groupby([df[k] for k in keys]).sum(),
         'EPC Online': epc[closed(epc)].groupby(keys).size(),
         'EPC Online MWMax': epc[closed(epc)].groupby(keys)['MWMax'].sum(),
     }).fillna(0.0)
     report = report[(report.drop(columns='All Units MWMax') != 0).any(axis=1)]   # Drop buckets with nothing online anywhere.
-    report['Method'] = np.where(report.index.get_level_values('AreaNumber').isin(matched), 'Matched keys', 'Area & type scale')
+    report['Method'] = report.index.map(lambda k: bucket_method.get(k, ''))
     report['Unmet MW'] = report['Target MW'] - report['Planned MW']
     # Units offline before and after aren't touched.
     df = df[on_seed | on_plan]

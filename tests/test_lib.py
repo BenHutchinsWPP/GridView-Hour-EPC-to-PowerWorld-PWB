@@ -245,14 +245,15 @@ def test_load_targets():
                  ('m1', 2, 'Closed', 30.0, 0.0, 0.0, 3.0), ('m2', 2, 'Open', 99.0, 0.0, 0.0, 9.0)])
     df, report = area.load_targets(epc, case)
     assert 'lo' not in df.index                                              # Open loads aren't scaled.
-    assert df['SMW_Target'].to_dict() == {'l1': 150.0, 'l2': 150.0, 'm1': 30.0, 'm2': 0.0, 'n1': 0.0}
-    assert df.loc[['l1', 'l2'], 'SMvar_Target'].tolist() == [20.0, 20.0]
+    # l1 starts from its EPC value (200), l2 from its seed (100): together they already make the 300 MW target.
+    assert df['SMW_Target'].to_dict() == {'l1': 200.0, 'l2': 100.0, 'm1': 30.0, 'm2': 0.0, 'n1': 0.0}
+    assert df.loc[['l1', 'l2'], 'SMvar_Target'].tolist() == [30.0, 10.0]
     assert (df[[f'{c}_Target' for c in ['IMW', 'IMvar', 'ZMW', 'ZMvar', 'DistMWInput', 'DistMvarInput']]] == 0).all().all()
     assert (df['DistStatus_Target'] == 'Open').all() and (df['Status_Target'] == df['Status']).all()
-    assert df['Method'].to_dict() == {'l1': 'Area scale', 'l2': 'Area scale', 'm1': 'Matched keys', 'm2': 'Matched keys', 'n1': 'Area scale'}
+    assert df['Method'].to_dict() == {'l1': 'Key', 'l2': 'Seed', 'm1': 'Key', 'm2': 'Key', 'n1': 'Seed'}
     r = report.set_index('AreaNumber')
     assert r.loc[1, 'Target MW'] == 300 and r.loc[1, 'Seed MW'] == 200 and r.loc[1, 'EPC-only MW'] == 100
-    assert r.loc[2, 'Method'] == 'Matched keys' and r.loc[3, 'Target MW'] == 0
+    assert r.loc[2, 'Key Loads'] == 2 and r.loc[3, 'Target MW'] == 0
     assert (r['Unmet MW'].abs() < 1e-9).all()
 
 def test_load_targets_area_with_no_seed_load_is_unmet():
@@ -294,7 +295,8 @@ def test_load_targets_scale_positive_and_negative_separately():
     epc = loads([('e1', 1, 'Closed', 300.0, 0.0, 0.0, 300.0), ('dc', 1, 'Closed', -400.0, 0.0, 0.0, -50.0)])
     df, report = area.load_targets(epc, case)
     assert df['SMW_Target'].to_dict() == {'l1': 200.0, 'l2': 100.0, 'dc': -400.0}
-    assert df['SMvar_Target'].to_dict() == {'l1': 300.0, 'l2': -50.0, 'dc': 0.0}
+    # Mvar -: dc starts from its EPC -50, l2 from its seed -98; together they scale to the EPC's -50.
+    assert {k: round(v, 6) for k, v in df['SMvar_Target'].items()} == {'l1': 300.0, 'l2': round(-50 * 98 / 148, 6), 'dc': round(-50 * 50 / 148, 6)}
     r = report.iloc[0]
     assert (r['Target MW +'], r['Target MW -'], r['Seed MW +'], r['Seed MW -']) == (300, -400, 150, -500)
     assert all(abs(r[c]) < 1e-9 for c in report.columns if c.startswith('Unmet'))
@@ -384,20 +386,42 @@ def test_balance_targets_half_gen_half_load():
     assert t['Load']['P_Seed'].to_dict() == {'l1': 150.0, 'l2': 350.0}     # What rescale_targets() divides by.
     assert (t['Load']['Status_Target'] == 'Closed').all()
 
-def test_thermal_scaling_up_brings_biggest_units_on_first():
-    # Thermal target 250 MW with 100 MW online: g3 (online in the EPC) comes on before the bigger g2, and is enough.
-    case = gens([('g1', 1, '1', 'Closed', 'GT', 50.0, 100.0, 0.0), ('g2', 1, '2', 'Open', 'GT', 0.0, 400.0, 0.0),
+def thermal_case():
+    return gens([('g1', 1, '1', 'Closed', 'GT', 50.0, 100.0, 0.0), ('g2', 1, '2', 'Open', 'GT', 0.0, 400.0, 0.0),
                  ('g3', 1, '3', 'Open', 'GT', 0.0, 200.0, 0.0), ('g4', 1, '4', 'Open', 'GT', 0.0, 50.0, 0.0),
                  ('sc', 1, '5', 'Closed', 'SC', 0.0, 0.0, 0.0)])
-    epc = gens([('g3', 1, '3', 'Closed', 'GT', 150.0, 200.0, 0.0), ('e1', 1, '9', 'Closed', 'CC', 100.0, 300.0, 0.0)])
-    df, report = area.gen_targets(epc, case)
-    assert df['Status_Target'].to_dict() == {'g1': 'Closed', 'g3': 'Closed', 'sc': 'Closed'}
-    assert df['MWSetPoint_Target'].round(6).to_dict() == {'g1': 83.333333, 'g3': 166.666667, 'sc': 0.0}
-    r = report.set_index(['AreaNumber', 'GenType'])
-    assert r.loc[(1, 'Thermal'), ['Committed', 'Decommitted', 'Unmet MW']].round(6).tolist() == [1, 0, 0]
-    # Same, but nothing online in the EPC: the biggest (g2) comes on.
-    df, _ = area.gen_targets(epc.iloc[[1]], case)
+
+def test_thermal_scaling_up_brings_biggest_units_on_first():
+    # No key in the EPC: thermal target 250 MW with 100 MW online, so the biggest (g2) comes on.
+    df, report = area.gen_targets(gens([('e1', 1, '9', 'Closed', 'CC', 250.0, 300.0, 0.0)]), thermal_case())
     assert df['Status_Target'].to_dict() == {'g1': 'Closed', 'g2': 'Closed', 'sc': 'Closed'}
+    r = report.set_index(['AreaNumber', 'GenType'])
+    assert r.loc[(1, 'Thermal'), ['Committed', 'Decommitted', 'Unmet MW', 'Method']].tolist() == [1, 0, 0, 'Capacity']
+
+def test_key_basis_scales_the_whole_group():
+    # g3 is in the EPC (online, 150 MW) and e1 isn't in the PWB (100 MW): target 250. g3 starts from its EPC 150 MW and
+    # status, g1 from its seed 50 MW; both scale by 250 / 200.
+    epc = gens([('g3', 1, '3', 'Closed', 'GT', 150.0, 200.0, 0.0), ('e1', 1, '9', 'Closed', 'CC', 100.0, 300.0, 0.0)])
+    df, report = area.gen_targets(epc, thermal_case())
+    assert df['Status_Target'].to_dict() == {'g1': 'Closed', 'g3': 'Closed', 'sc': 'Closed'}
+    assert df['MWSetPoint_Target'].to_dict() == {'g1': 62.5, 'g3': 187.5, 'sc': 0.0}
+    assert df['Method'].to_dict() == {'g1': 'Seed', 'g3': 'Key', 'sc': 'Seed'}
+    r = report.set_index(['AreaNumber', 'GenType'])
+    assert r.loc[(1, 'Thermal'), ['Method', 'Basis MW', 'Key Gens', 'Unmet MW']].tolist() == ['Key basis', 200.0, 1, 0.0]
+
+def test_key_basis_at_mwmax_commits_more_units():
+    # Target 400 from a basis of 200: g1 and g3 reach MWMax (100 + 200); the last 100 MW brings on the biggest offline unit.
+    epc = gens([('g3', 1, '3', 'Closed', 'GT', 150.0, 200.0, 0.0), ('e1', 1, '9', 'Closed', 'CC', 250.0, 300.0, 0.0)])
+    df, report = area.gen_targets(epc, thermal_case())
+    assert df['MWSetPoint_Target'].to_dict() == {'g1': 100.0, 'g2': 100.0, 'g3': 200.0, 'sc': 0.0}
+    assert df.loc['g2', 'Status_Target'] == 'Closed' and report['Unmet MW'].abs().max() < 1e-9
+
+def test_key_basis_matched_unit_offline_in_epc():
+    # g1 is Open in the EPC: with commit it goes offline, and g2 (seed) carries the target.
+    case = gens([('g1', 1, '1', 'Closed', 'GT', 50.0, 100.0, 0.0), ('g2', 1, '2', 'Closed', 'GT', 50.0, 100.0, 0.0)])
+    epc = gens([('g1', 1, '1', 'Open', 'GT', 0.0, 100.0, 0.0), ('e1', 1, '9', 'Closed', 'GT', 80.0, 100.0, 0.0)])
+    df, _ = area.gen_targets(epc, case)
+    assert df['Status_Target'].to_dict() == {'g1': 'Open', 'g2': 'Closed'} and df['MWSetPoint_Target'].tolist() == [0.0, 80.0]
 
 def test_thermal_scaling_down_takes_smallest_units_off_first():
     case = gens([('g1', 1, '1', 'Closed', 'GT', 100.0, 100.0, 0.0), ('g2', 1, '2', 'Closed', 'ST', 200.0, 200.0, 0.0),
@@ -406,11 +430,11 @@ def test_thermal_scaling_down_takes_smallest_units_off_first():
     df, _ = area.gen_targets(epc, case)
     assert df['Status_Target'].to_dict() == {'g1': 'Open', 'g2': 'Open', 'g3': 'Closed'}
     assert df['MWSetPoint_Target'].to_dict() == {'g1': 0.0, 'g2': 0.0, 'g3': 200.0}
-    # g1 is online in the EPC: g2 (offline in the EPC) goes off first instead, and g1 stays.
+    # With a key in the EPC (g1 at 100 MW), the group scales from its basis instead: all stay on, by 280 / 600.
     epc = gens([('g1', 1, '1', 'Closed', 'GT', 100.0, 100.0, 0.0), ('e1', 1, '9', 'Closed', 'GT', 180.0, 300.0, 0.0)])
     df, _ = area.gen_targets(epc, case)
-    assert df['Status_Target'].to_dict() == {'g1': 'Closed', 'g2': 'Open', 'g3': 'Closed'}
-    assert df['MWSetPoint_Target'].round(6).to_dict() == {'g1': 70.0, 'g2': 0.0, 'g3': 210.0}
+    assert (df['Status_Target'] == 'Closed').all()
+    assert df['MWSetPoint_Target'].round(6).to_dict() == {k: round(v * 280 / 600, 6) for k, v in {'g1': 100, 'g2': 200, 'g3': 300}.items()}
 
 def test_commitment_off_keeps_seed_statuses():
     case = gens([('g1', 1, '1', 'Closed', 'GT', 50.0, 100.0, 0.0), ('g2', 1, '2', 'Open', 'GT', 0.0, 400.0, 0.0)])
@@ -465,7 +489,7 @@ def test_build_targets_leaves_slack_bus_gens_out_of_both_cases():
     case = gens([('s1', 1, '1', 'Closed', 'GT', 300.0, 500.0, 0.0), ('g1', 1, '2', 'Closed', 'GT', 80.0, 100.0, 0.0)]).assign(BusNum=[5, 6])
     targets, reports = area.build_targets({'Load': loads([]), 'Gen': case}, {'Load': loads([]), 'Gen': case}, swing_buses=[5])
     assert targets['Gen'].index.tolist() == ['g1'] and targets['Gen'].loc['g1', 'MWSetPoint_Target'] == 80
-    assert reports['area_gen']['Method'].tolist() == ['Matched keys'] and reports['area_gen']['Unmet MW'].tolist() == [0.0]
+    assert reports['area_gen']['Method'].tolist() == ['Key basis'] and reports['area_gen']['Unmet MW'].tolist() == [0.0]
     # The read-back leaves them out too: the case matches, so there is no error. (Counting them would give +300 MW.)
     final = {'Load': loads([]), 'Gen': case}
     assert area.achieved(final, reports, swing_buses=[5])['area_gen'][['Final MW', 'Final Error MW']].values.tolist() == [[80.0, 0.0]]
