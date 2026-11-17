@@ -428,9 +428,12 @@ def compute_pw_targets(SimAuto, gv_fp: Path, pw_fp: Path, dummy_bus_fp: Path) ->
     pw.open_case(SimAuto, pw_fp)
     case = {table: pw.get_df(SimAuto, table, fields) for table, fields in TARGET_FIELDS.items()}
     slack = prep.slack_buses(SimAuto)
+    islands = scale.seed_islands(SimAuto, slack)
     SimAuto.CloseCase()
 
-    return build_targets(gv, case, slack)
+    targets = build_targets(gv, case, slack)
+    scale.exclude_islands(targets, islands)     # Gens/loads outside the main island are turned off before scaling.
+    return targets
 
 def build_targets(gv: dict[str,pd.DataFrame], case: dict[str,pd.DataFrame], swing_buses=()) -> dict[str,pd.DataFrame]:
     """

@@ -400,12 +400,21 @@ def gen_targets(epc_gen: pd.DataFrame, case_gen: pd.DataFrame) -> tuple[pd.DataF
     df = df[on_seed | on_plan]
     return df.set_index('ObjectID'), report.reset_index()
 
-def build_targets(epc: dict[str, pd.DataFrame], case: dict[str, pd.DataFrame], swing_buses=()) -> tuple[dict, dict]:
+def build_targets(epc: dict[str, pd.DataFrame], case: dict[str, pd.DataFrame], swing_buses=(),
+                  island_by_bus: pd.Series | None = None) -> tuple[dict, dict]:
     """
     Returns (targets {'Gen', 'Load'} for scale.iterate_to_gen_load_targets(), reports {'area_load', 'area_gen'}).
     Gens on swing_buses (the slack bus) are left out of both cases: the solution sets their MW, and swing balancing
     deals with what they carry.
+    island_by_bus (scale.seed_islands()): the PWB's gens/loads outside the main island take no share of the targets
+    (the main island's units carry the whole area target), and are left out of the area seed totals, like
+    non-conforming loads. Those Closed in the seed are added back as excluded rows targeted Open at 0 MW (turned off
+    before scaling), so the log names them (scale.island_reason()); reports['islanded'] has their seed MW per
+    (AreaNumber, Group).
     """
+    case_reason = {t: scale.island_reason(case[t], island_by_bus) for t in ('Gen', 'Load')}
+    islanded = {t: case[t][case_reason[t] != ''].assign(ExclusionReason=case_reason[t]) for t in ('Gen', 'Load')}
+    case = {t: case[t][case_reason[t] == ''] for t in ('Gen', 'Load')}
     epc_load, case_load = epc['Load'], case['Load']
     # Non-conforming is decided by key: a load which is non-conforming in the PWB, or flagged in the EPC, is out of both.
     nonc_ids = set(case_load.loc[~conforming(case_load), 'ObjectID'])
@@ -418,7 +427,28 @@ def build_targets(epc: dict[str, pd.DataFrame], case: dict[str, pd.DataFrame], s
     load_report['EPC Non-conforming MW'] = load_report['AreaNumber'].map(nonc(epc['Load'], epc_nonc)).fillna(0.0)
     off_swing = lambda df: df[~df['BusNum'].isin(swing_buses)]
     gen, gen_report = gen_targets(off_swing(epc['Gen']), off_swing(case['Gen']))
-    return {'Gen': gen, 'Load': load}, {'area_load': load_report, 'area_gen': gen_report}
+    gen, load, islanded_mw = _add_islanded(gen, load, islanded['Gen'], islanded['Load'])
+    return {'Gen': gen, 'Load': load}, {'area_load': load_report, 'area_gen': gen_report, 'islanded': islanded_mw}
+
+def _add_islanded(gen: pd.DataFrame, load: pd.DataFrame, i_gen: pd.DataFrame, i_load: pd.DataFrame):
+    """
+    build_targets(): the islanded gens/loads Closed in the seed (a second island's slack gens too; not the giant
+    swing), as excluded target rows targeted Open at 0 MW, which step 02 writes before scaling
+    (scale.turn_off_islanded()). Returns (gen, load, their seed MW per (AreaNumber, Group)).
+    """
+    i_gen = i_gen[i_gen['ID'] != prep.SWING_ID]
+    i_gen, i_load = i_gen[closed(i_gen)].copy(), i_load[closed(i_load)].copy()
+    for df, table in ((i_gen, 'Gen'), (i_load, 'Load')):
+        for c in [*scale.STATUS[table], *scale.SCALED[table]]:
+            df[f'{c}_Seed'] = df[c]
+            df[f'{c}_Target'] = df[c]
+        scale.turn_off_targets(df, table, df.index == df.index)
+    i_gen['GenType'] = classify_gen_type(i_gen) if len(i_gen) else pd.Series(dtype=object)
+    i_gen['Planned MW'], i_load['Planned MW'] = 0.0, 0.0
+    mw = pd.concat([_by_group(i_gen, i_gen['MWSetPoint'], i_gen['GenType']), _by_group(i_load, i_load[LOAD_P].sum(axis=1))])
+    scale.print_islanded({'Gen': len(i_gen), 'Load': len(i_load)}, set(i_gen['ExclusionReason']) | set(i_load['ExclusionReason']))
+    join = lambda a, b: pd.concat([a, b.set_index('ObjectID')]) if len(b) else a
+    return join(gen, i_gen), join(load, i_load), mw
 
 def dist_gen_cleanup(case_load: pd.DataFrame) -> pd.DataFrame:
     """
@@ -475,6 +505,8 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
     p_of = lambda df, cols: df[cols].sum(axis=1)
     if targets is not None:
         g, l = targets['Gen'], targets['Load']
+        # Islanded rows are out of the ledger, as they are out of Seed, Target and Final (even one that stayed on).
+        g, l = g[~scale.is_island_reason(g['ExclusionReason'])], l[~scale.is_island_reason(l['ExclusionReason'])]
         gg = _gen_group(g)
         not_reached = (_by_group(g, g['MWSetPoint_Target'] - g['MWSetPoint'], gg)
                        .add(_by_group(l, p_of(l, [f'{c}_Target' for c in LOAD_P]) - p_of(l, LOAD_P)), fill_value=0.0))
@@ -489,9 +521,11 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
                                .add(_by_group(g, g['MWSetPoint'] - g['MWSetPoint_Seed'], _gen_group(g)), fill_value=0.0)
                                .add(_by_group(l, p_of(l, LOAD_P) - l['P_Seed']), fill_value=0.0))
     if final is not None:
-        load = final['Load'][closed(final['Load']) & (conforming(final['Load']) | SCALE_NONCONFORMING)]
+        # Islanded units (excluded rows of the targets) are left out of Final MW, as they are out of Seed and Target.
+        out_ids = set().union(*[df.index[scale.is_island_reason(df['ExclusionReason'])] for df in (targets or {}).values()])
+        load = final['Load'][closed(final['Load']) & (conforming(final['Load']) | SCALE_NONCONFORMING) & ~final['Load']['ObjectID'].isin(out_ids)]
         gen = scalable_gens(final['Gen'])
-        gen = gen[closed(gen) & ~gen['BusNum'].isin(swing_buses)]
+        gen = gen[closed(gen) & ~gen['BusNum'].isin(swing_buses) & ~gen['ObjectID'].isin(out_ids)]
         parts['Final MW'] = _by_group(gen, gen['MWSetPoint'], _gen_group(gen)).add(_by_group(load, p_of(load, LOAD_P)), fill_value=0.0)
         parts['Final Mvar'] = _by_group(load, p_of(load, LOAD_Q))
         parts['Online Final'] = _by_group(gen, 1.0, _gen_group(gen)).add(_by_group(load, 1.0), fill_value=0.0)
@@ -526,6 +560,16 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
         out[c] = np.where(is_load, col.reindex(areas_of).to_numpy() if c in loss else np.nan, np.nan)
     ledger = out['Target MW'] - out['Unmet MW'] - out['Not Reached MW'] + out['Balance MW']
     out['Note'] = _area_notes(out, plan.reindex(index), ledger)
+    islanded = reports.get('islanded', pd.Series(dtype=float)).reindex(index).fillna(0.0)
+    still_on = pd.Series(0.0, index=index)
+    if final is not None and targets is not None:     # Island units whose turn-off diverged: still Closed at the end.
+        on_g = final['Gen'][closed(final['Gen']) & final['Gen']['ObjectID'].isin(out_ids)]
+        on_l = final['Load'][closed(final['Load']) & final['Load']['ObjectID'].isin(out_ids)]
+        still_on = (_by_group(on_g, on_g['MWSetPoint'], _gen_group(on_g)).add(_by_group(on_l, p_of(on_l, LOAD_P)), fill_value=0.0)
+                    .reindex(index).fillna(0.0))
+    note = pd.Series([('outside main island, turned off: ' + (f'{mw - on:.1f} MW' if not on else f'{mw:.1f} MW, of which {on:.1f} MW stayed on'))
+                      if mw else '' for mw, on in zip(islanded, still_on)], index=index)
+    out['Note'] = ['; '.join(filter(None, [n, i])) for n, i in zip(out['Note'], note)]
     return out.reset_index()[AREAS_COLUMNS]
 
 def _area_notes(out: pd.DataFrame, plan: pd.DataFrame, ledger: pd.Series) -> list[str]:
@@ -565,8 +609,9 @@ def compute_targets(SimAuto, gv_fp, pw_fp) -> tuple[dict, dict]:
     case = read_case(SimAuto)
     slack = prep.slack_buses(SimAuto)
     seed_loss = area_losses(SimAuto)
+    islands = scale.seed_islands(SimAuto, slack)
     SimAuto.CloseCase()
-    targets, reports = build_targets(epc, case, swing_buses=slack)
+    targets, reports = build_targets(epc, case, swing_buses=slack, island_by_bus=islands)
     reports['area_loss'] = loss_estimate(targets, reports['area_load'], seed_loss)
     return targets, reports
 
@@ -641,12 +686,15 @@ def swing_band(gen: pd.DataFrame, slack_buses) -> tuple[float, float]:
 
 def balance_skips(SimAuto, final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFrame] | None = None) -> set:
     """
-    ObjectIDs a balance leaves alone: gens/loads on buses outside the scaling voltage band (the balance's own scaling
-    would hold them at once, so their share would never move), and, during scaling, those the main scaling holds back
-    or has excluded (`targets`).
+    ObjectIDs a balance leaves alone: gens/loads on buses outside the main island (the swing can't take what they
+    move) or outside the scaling voltage band (the balance's own scaling would hold them at once, so their share would
+    never move), and, during scaling, those the main scaling holds back or has excluded (`targets`).
     """
-    vpu = scale.bus_vpu(SimAuto)
-    skip = {oid for df in final.values() for oid in df.loc[~scale.voltage_ok(df, vpu), 'ObjectID']}
+    vpu, island = scale.bus_vpu(SimAuto), scale.bus_islands(SimAuto)
+    if not (island == scale.MAIN_ISLAND).any():     # Numbering not as expected (or blank): don't skip everything.
+        island = pd.Series(scale.MAIN_ISLAND, index=island.index)
+    skip = {oid for df in final.values()
+            for oid in df.loc[~scale.voltage_ok(df, vpu) | (df['BusNum'].map(island) != scale.MAIN_ISLAND), 'ObjectID']}
     for df in (targets or {}).values():
         skip |= set(df.index[~scale.included(df) | scale.held(df)])
     return skip

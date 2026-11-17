@@ -94,11 +94,14 @@ def create_case(SimAuto, gv_fp, out_fp):
 
     # The plan first, so that a failure during the hour's long scaling still leaves it.
     try:
-        pw.write_excel(log_fp, build_log([], None, exception_runs=pretest))
+        # Units left out as outside the main island, listed as the main run's log will list them.
+        islanded = scale.Run('main', {t.lower(): df[scale.is_island_reason(df['ExclusionReason'])] for t, df in targets.items()})
+        pw.write_excel(log_fp, build_log([], None, exception_runs=[*pretest, islanded]))
     except Exception as e:     # Never lose the hour over its log.
         print(f'WARNING: could not write {log_fp.name} (open in Excel?): {e!r}.')
 
     pw.open_case(SimAuto, pw_fp)
+    scale.turn_off_islanded(SimAuto, targets)     # Everything outside the main island goes Open, before scaling.
     pvqv = pd.read_csv(pvqv_fp) if run['use_pvqv'] else None
     balance_tables = []
     slack = prep.slack_buses(SimAuto)

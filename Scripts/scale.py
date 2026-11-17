@@ -163,6 +163,94 @@ def voltage_ok(df: pd.DataFrame, vpu_by_bus: pd.Series) -> pd.Series:
 def bus_vpu(SimAuto) -> pd.Series:
     return pw.get_df(SimAuto, 'Bus', {'Number': int, 'Vpu': float}).set_index('Number')['Vpu']
 
+MAIN_ISLAND = 1     # Bus IslandNumber of the main island. Any other (or blank) is a separate island.
+
+def bus_islands(SimAuto) -> pd.Series:
+    """IslandNumber of each bus (NaN where blank), by bus number."""
+    return pw.get_df(SimAuto, 'Bus', {'Number': int, 'IslandNumber': int}).set_index('Number')['IslandNumber']
+
+def seed_islands(SimAuto, swing_buses) -> pd.Series | None:
+    """
+    With the seed PWB open: solves it, and returns bus_islands(), or None (islands not checked, with a warning) if the
+    case doesn't solve or no swing bus is in island MAIN_ISLAND (the numbering isn't what this code expects). A live
+    second island has a slack bus of its own: one swing bus in the main island is enough.
+    """
+    if not pw.solve(SimAuto):
+        print('WARNING: the seed does not solve; islands are not checked.')
+        return None
+    islands = bus_islands(SimAuto)
+    on_swing = islands.reindex(list(swing_buses))
+    if len(on_swing) and not (on_swing == MAIN_ISLAND).any():
+        print(f'WARNING: the swing bus is in island {on_swing.tolist()}, not {MAIN_ISLAND}; islands are not checked.')
+        return None
+    return islands
+
+def island_reason(df: pd.DataFrame, island_by_bus: pd.Series | None) -> pd.Series:
+    """
+    Per row: '' if its bus is in the main island (or islands weren't checked), else why it is left out:
+    'Island 3, not the main island', or 'No island' (blank IslandNumber, or a bus not found).
+    """
+    if island_by_bus is None or not len(df):
+        return pd.Series('', index=df.index, dtype=object)
+    island = df['BusNum'].map(island_by_bus)
+    reason = island.map(lambda i: 'No island' if pd.isna(i) else f'Island {int(i)}, not the main island')
+    return reason.where(island != MAIN_ISLAND, '').astype(object)
+
+def is_island_reason(reason: pd.Series) -> pd.Series:
+    return reason.astype(str).str.startswith(('Island ', 'No island'))
+
+def print_islanded(counts: dict[str, int], reasons):
+    """One line for the units found outside the main island, if any."""
+    if any(counts.values()):
+        names = sorted({r.split(',')[0].replace('Island ', '') if r != 'No island' else 'blank' for r in reasons})
+        print(f'Outside the main island, to be turned off: {counts.get("Gen", 0)} gens and {counts.get("Load", 0)} loads '
+              f'(islands {", ".join(names)}).')
+
+def turn_off_targets(df: pd.DataFrame, table: str, mask):
+    """Targets of the rows in mask: every status Open, and the MW/Mvar fields it zeroes at 0 (STATUS)."""
+    for status, zeroed in STATUS[table].items():
+        df.loc[mask, f'{status}_Target'] = 'Open'
+        df.loc[mask, [f'{c}_Target' for c in zeroed]] = 0.0
+
+def exclude_islands(targets, island_by_bus: pd.Series | None):
+    """
+    Per-unit (topology) targets: gens/loads outside the main island (island_reason()) are excluded from scaling, with
+    that reason even over an earlier one (e.g. a second island's own 'Swing Unit'), and targeted Open at 0 MW, for
+    turn_off_islanded() to write.
+    """
+    counts, reasons = {}, set()
+    for table, df in targets.items():
+        r = island_reason(df, island_by_bus)
+        off = (r != '') & (df['ID'] != prep.SWING_ID)     # Never the giant swing.
+        df.loc[off, 'ExclusionReason'] = r[off]
+        turn_off_targets(df, table, off)
+        counts[table] = int((off & (df['Status'] == 'Closed')).sum())
+        reasons |= set(r[off])
+    print_islanded(counts, reasons)
+
+def turn_off_islanded(SimAuto, targets):
+    """
+    With the case open, before scaling: writes every gen/load outside the main island (its ExclusionReason is an island
+    one) that is Closed now Open at 0 MW, as its targets say. Each write is solve-checked and bisected; those which
+    diverge stay as they are (printed; the exceptions sheet's Final Status shows them Closed).
+    """
+    counts, failed_ids = {}, []
+    for table in ('Load', 'Gen'):       # Loads first: a live island's gens (its slack too) can't go while it has load.
+        df = targets[table]
+        rows = df[is_island_reason(df['ExclusionReason']) & (df['Status'] == 'Closed')]
+        if not len(rows):
+            continue
+        new_df = rows.copy()
+        for c in [*STATUS[table], *SCALED[table]]:
+            new_df[c] = rows[f'{c}_Target']
+        failed = apply_rows(SimAuto, table, df, new_df[['BusNum', 'ID', *STATUS[table], *SCALED[table]]])
+        counts[table] = len(rows) - len(failed)
+        failed_ids += list(failed)
+    if counts:
+        print(f'Turned off {counts.get("Gen", 0)} gens and {counts.get("Load", 0)} loads outside the main island'
+              + (f'; {len(failed_ids)} stay on (the case diverged without them): {", ".join(map(str, failed_ids[:5]))}'
+                 + (' ...' if len(failed_ids) > 5 else '') if failed_ids else '') + '.')
+
 def hold_voltage(targets, vpu_by_bus: pd.Series):
     # Once a bus exceeds the vmin/vmax limits, hold its gens/loads back from scaling until it recovers.
     # This avoids voltage collapse related issues during scaling.

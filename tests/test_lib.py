@@ -590,7 +590,9 @@ class SwingSimAuto(FakeSimAuto):
         if table == 'Bus':
             buses = sorted(set(self.base['Gen']['BusNum']) | set(self.base['Load']['BusNum']))
             values = {'Vpu': '1.0', 'IslandNumber': '1', 'BusIsStarBus:1': 'NO', 'BusNomVolt': '230'}
-            return ('', [[str(n) if f in ('Busnum', 'Number') else 'YES' if f == 'Slack' and n in self.slack else values.get(f, 'NO' if f == 'Slack' else '0')
+            islands = getattr(self, 'islands', {})      # Bus -> IslandNumber text ('' = blank); 1 if not given.
+            return ('', [[str(n) if f in ('Busnum', 'Number') else islands.get(n, '1') if f == 'IslandNumber'
+                          else 'YES' if f == 'Slack' and n in self.slack else values.get(f, 'NO' if f == 'Slack' else '0')
                           for f in fields] for n in buses])
         return ('', [])
 
@@ -1406,6 +1408,129 @@ def test_step_02_estimates_losses_and_clears_untouched_dist_gen():
     row = sheets['areas'].set_index('Group').loc['Load']
     assert (row['Seed Loss MW'], round(row['Est. Loss MW'], 9), row['Final Loss MW']) == (10.0, 19.6, 10.0)
     assert sheets['areas'].set_index('Group').loc['Thermal', ['Seed Loss MW', 'Est. Loss MW', 'Final Loss MW']].isna().all()
+
+def test_exclude_islands_names_the_island_and_targets_it_off():
+    # Bus 1 main island, bus 2 island 3, bus 4 blank, bus 5 not in the case. gx (a second island's slack gen) loses
+    # its 'Swing Unit' reason: it is turned off with the rest of its island.
+    gen = targets_df(ObjectID=['g1', 'g2', 'g4', 'g5', 'gx', 'gs'], BusNum=[1, 2, 4, 5, 2, 2], ID=['1'] * 5 + ['xx'], Status='Closed',
+                     Status_Target='Closed', MWSetPoint=50.0, MWSetPoint_Target=60.0)
+    gen.loc['gx', 'ExclusionReason'] = 'Swing Unit'
+    load = targets_df(ObjectID=['l1', 'l2'], BusNum=[1, 2], ID='1', Status='Closed', Status_Target='Closed', DistStatus='Open',
+                      DistStatus_Target='Open', **{c: 5.0 for c in LOAD_P_ALL}, **{f'{c}_Target': 6.0 for c in LOAD_P_ALL})
+    islands = pd.Series([1.0, 3.0, np.nan], index=[1, 2, 4])
+    scale.exclude_islands({'Gen': gen, 'Load': load}, islands)
+    assert gen.loc['gs', 'ExclusionReason'] == '' and gen.loc['gs', 'Status_Target'] == 'Closed'   # The giant swing stays.
+    gen = gen.drop(index='gs')
+    assert gen['ExclusionReason'].to_dict() == {'g1': '', 'g2': 'Island 3, not the main island', 'g4': 'No island',
+                                                'g5': 'No island', 'gx': 'Island 3, not the main island'}
+    assert gen['Status_Target'].tolist() == ['Closed', 'Open', 'Open', 'Open', 'Open']
+    assert gen['MWSetPoint_Target'].tolist() == [60.0, 0.0, 0.0, 0.0, 0.0]
+    assert load['ExclusionReason'].tolist() == ['', 'Island 3, not the main island']
+    assert load.loc['l2', 'Status_Target'] == 'Open' and (load.loc['l2', [f'{c}_Target' for c in LOAD_P_ALL]] == 0).all()
+
+def test_turn_off_islanded_writes_island_units_open_and_keeps_those_which_diverge():
+    gen = targets_df(ObjectID=['g1', 'g2', 'g3'], BusNum=[1, 2, 3], ID='1', Status='Closed', Status_Target=['Closed', 'Open', 'Open'],
+                     MWSetPoint=50.0, MWSetPoint_Target=[60.0, 0.0, 0.0])
+    gen.loc[['g2', 'g3'], 'ExclusionReason'] = 'Island 2, not the main island'
+    load = targets_df(ObjectID=['l1'], BusNum=[1], ID='1', Status='Closed', Status_Target='Closed', DistStatus='Open',
+                      DistStatus_Target='Open', **{c: 5.0 for c in LOAD_P_ALL}, **{f'{c}_Target': 6.0 for c in LOAD_P_ALL})
+    load.loc['l1', 'ExclusionReason'] = 'Island 2, not the main island'
+    load.loc['l1', ['Status_Target', *[f'{c}_Target' for c in LOAD_P_ALL]]] = ['Open'] + [0.0] * len(LOAD_P_ALL)
+    class Ordered(FakeSimAuto):
+        tables = []
+        def ChangeParametersMultipleElementRect(self, table, fields, rows):
+            self.tables.append(table)
+            return super().ChangeParametersMultipleElementRect(table, fields, rows)
+    sa = Ordered(bad={'3'})                                                      # Turning g3 off diverges.
+    scale.turn_off_islanded(sa, {'Gen': gen, 'Load': load})
+    assert sa.tables[0] == 'Load'                                                # Loads go first.
+    assert sa.applied[('Gen', '2')]['Status'] == 'Open' and ('Gen', '3') not in sa.applied and ('Gen', '1') not in sa.applied
+    assert gen.loc['g2', 'Status'] == 'Open' and gen.loc['g2', 'MWSetPoint'] == 0.0 and gen.loc['g3', 'Status'] == 'Closed'
+
+def test_balance_skips_units_outside_the_main_island():
+    gen, load = swing_case()
+    sa = SwingSimAuto(gen, load)
+    sa.islands = {2: '2', 3: ''}                                                 # g2 (bus 2) and l1 (bus 3) are islanded.
+    final = area.read_case(sa)
+    assert area.balance_skips(sa, final) == {'g2', 'l1'}
+
+def test_step_02_excludes_units_outside_the_main_island_before_the_prebalance():
+    # h1 (bus 2) is in island 2: excluded with that reason, turned off before scaling, not counted by the pre-balance.
+    # The EPC's 50 MW of Hydro has no main-island unit left to take it: Unmet, and the areas row adds up.
+    gen, load = two_cases()
+    epc_gen = gens([('e1', 1, '1', 'Closed', 'GT', 150.0, 1000.0, 0.0), ('e2', 1, '2', 'Closed', 'HY', 50.0, 1000.0, 0.0)]).assign(BusNum=[1, 2], MW=0.0, NomkV=230.0, BusName='b')
+    epc_load = loads([('e1', 1, 'Closed', 300.0, 0.0, 0.0, 30.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        step = load_step_02(Path(d), 'area')
+        sa = CaseSimAuto({'h1.epc': (epc_gen, epc_load), 'Prepared.pwb': (gen, load)}, slack=[99])
+        sa.islands = {2: '2'}
+        seen = []
+        real_pb, real_write = area.prebalance_targets, pw.write_excel
+        plans = []
+        area.prebalance_targets = lambda t, loss_change=0.0: seen.append(t['Gen'].loc['h1', 'ExclusionReason']) or real_pb(t, loss_change)
+        step.pw.write_excel = lambda fp, sheets: plans.append({k: v.copy() for k, v in sheets.items()}) or real_write(fp, sheets)
+        try:
+            step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')
+        finally:
+            area.prebalance_targets, step.pw.write_excel = real_pb, real_write
+        sheets = pd.read_excel(step.out_dir / 'h1_Log.xlsx', sheet_name=None)
+    assert seen == ['Island 2, not the main island']
+    assert sa.saved['h1.pwb']['Gen'].loc['h1', 'Status'] == 'Open' and sa.saved['h1.pwb']['Gen'].loc['h1', 'MWSetPoint'] == 0.0
+    assert plans[0]['exceptions'].set_index('ObjectID').loc['h1', 'Reason'] == 'main: Island 2, not the main island'   # In the plan too.
+    exc = sheets['exceptions'].set_index('ObjectID')
+    assert exc.loc['h1', 'Reason'] == 'main: Island 2, not the main island'
+    hydro = sheets['areas'].set_index('Group').loc['Hydro']
+    assert (hydro['Seed MW'], hydro['Unmet MW'], hydro['Final MW']) == (0.0, 50.0, 0.0)
+    assert 'outside main island, turned off: 100.0 MW' in hydro['Note'] and 'unexplained' not in hydro['Note']
+
+def test_islanded_units_take_no_share_of_the_area_targets():
+    # Two hydro units at 100 MW, h2 in island 2. The EPC's 150 MW all goes to h1; h2 stays at 100, excluded.
+    # Same for load: l2 islanded, l1 takes the whole 300 MW.
+    case_gen = gens([('h1', 1, '1', 'Closed', 'HY', 100.0, 200.0, 0.0), ('h2', 1, '2', 'Closed', 'HY', 100.0, 200.0, 0.0),
+                     ('dc', 1, '3', 'Closed', 'DC', 20.0, 50.0, -50.0)]).assign(BusNum=[1, 2, 2])
+    epc_gen = gens([('e1', 1, '1', 'Closed', 'HY', 150.0, 200.0, 0.0)])
+    case_load = loads([('l1', 1, 'Closed', 100.0, 0.0, 0.0, 10.0), ('l2', 1, 'Closed', 50.0, 0.0, 0.0, 5.0)]).assign(BusNum=[1, 3])
+    epc_load = loads([('e1', 1, 'Closed', 300.0, 0.0, 0.0, 30.0)])
+    islands = pd.Series([1.0, 2.0, 2.0], index=[1, 2, 3])
+    targets, reports = area.build_targets({'Gen': epc_gen, 'Load': epc_load}, {'Gen': case_gen, 'Load': case_load}, island_by_bus=islands)
+    g, l = targets['Gen'], targets['Load']
+    assert g.loc['h1', 'MWSetPoint_Target'] == 150.0 and g.loc['h2', 'MWSetPoint_Target'] == 0.0 and g.loc['h2', 'Status_Target'] == 'Open'
+    assert g.loc['h2', 'ExclusionReason'] == 'Island 2, not the main island' and g.loc['h1', 'ExclusionReason'] == ''
+    assert l.loc['l1', 'SMW_Target'] == 300.0 and l.loc['l2', 'SMW_Target'] == 0.0 and l.loc['l2', 'ExclusionReason'] != ''
+    assert reports['area_load'].set_index('AreaNumber').loc[1, 'Seed MW'] == 100.0                  # l2 left out of the seed total.
+    assert g.loc['dc', 'Status_Target'] == 'Open'                                # A DC tie in a second island goes off too.
+    assert reports['islanded'].to_dict() == {(1, 'Hydro'): 100.0, (1, 'Load'): 50.0, (1, 'Unknown'): 20.0}
+    # Without islands, the two units share the target.
+    targets, _ = area.build_targets({'Gen': epc_gen, 'Load': epc_load}, {'Gen': case_gen, 'Load': case_load})
+    assert targets['Gen'].loc[['h1', 'h2'], 'MWSetPoint_Target'].tolist() == [75.0, 75.0]
+
+def test_seed_islands_are_not_checked_when_the_swing_is_not_in_island_1():
+    gen, load = swing_case()
+    sa = SwingSimAuto(gen, load, slack=[1])
+    assert scale.seed_islands(sa, [1]).to_dict() == {1: 1, 2: 1, 3: 1, 99: 1}
+    sa.islands = {1: '2'}
+    assert scale.seed_islands(sa, [1]) is None
+    sa.islands = {2: '2'}                                                       # A live second island with its own slack bus.
+    assert scale.seed_islands(sa, [1, 2]).to_dict()[2] == 2
+
+def test_balance_skips_no_island_when_no_bus_is_in_island_1():
+    gen, load = swing_case()
+    sa = SwingSimAuto(gen, load)
+    sa.islands = {n: '' for n in (1, 2, 3, 99)}
+    assert area.balance_skips(sa, area.read_case(sa)) == set()
+
+def test_areas_ledger_holds_when_an_island_unit_stays_on():
+    # h2 (island 2) couldn't be turned off: out of Not Reached and Final, and its Note says so.
+    case_gen = gens([('h1', 1, '1', 'Closed', 'HY', 100.0, 200.0, 0.0), ('h2', 1, '2', 'Closed', 'HY', 100.0, 200.0, 0.0)]).assign(BusNum=[1, 2])
+    epc_gen = gens([('e1', 1, '1', 'Closed', 'HY', 150.0, 200.0, 0.0)])
+    targets, reports = area.build_targets({'Gen': epc_gen, 'Load': loads([])}, {'Gen': case_gen, 'Load': loads([])},
+                                          island_by_bus=pd.Series([1.0, 2.0], index=[1, 2]))
+    g = targets['Gen']
+    g.loc['h1', 'MWSetPoint'] = 150.0                                            # h1 reached; h2 still Closed at 100.
+    final = {'Gen': case_gen.assign(MWSetPoint=[150.0, 100.0]), 'Load': loads([])}
+    row = area.areas(final, reports, targets).set_index('Group').loc['Hydro']
+    assert (row['Not Reached MW'], row['Final MW'], row['Error MW']) == (0.0, 150.0, 0.0)
+    assert 'unexplained' not in row['Note'] and 'of which 100.0 MW stayed on' in row['Note']
 
 if __name__ == '__main__':
     tests = [f for name, f in dict(globals()).items() if name.startswith('test_')]
