@@ -304,11 +304,15 @@ def scalable_gens(df: pd.DataFrame) -> pd.DataFrame:
 # ------------------ Unit commitment ------------------
 # Per (area, GenType) bucket, which PWB units are online is chosen to fit the target, rather than kept from the seed.
 COMMIT = True       # False: keep every unit's seed status.
-# Every unit online, all at the same % output (run of the river hydro, variable resources, storage).
-ALL_ON_TYPES = {'Hydro', 'Wind', 'Solar', 'Battery Storage'}
-# At a target of 0, these go offline. The other ALL_ON_TYPES keep their seed statuses, at 0 MW.
+# Two dispatch modes per GenType (dispatch_bucket()).
+# Capacity: one injection group. Every unit with capacity online, all at the same % of MWMax (|MWMin| for a negative
+# target), whatever each unit's EPC MW or status.
+CAPACITY_TYPES = {'Wind', 'Solar', 'Battery Storage'}
+# At a target of 0, these go offline. The other CAPACITY_TYPES keep their seed statuses, at 0 MW.
 OFF_AT_ZERO_TYPES = {'Wind', 'Solar'}
-# Other types (Thermal, Unknown) start from the seed's online units, so that the target is at most COMMIT_MAX_CF of the
+# Match (every other type: Thermal, Hydro, Unknown): units take their EPC MW key by key, the rest their seed MW, and the
+# group is scaled to its total. Units are committed as follows when a group has nothing to scale, or is capped.
+# They start from the seed's online units, so that the target is at most COMMIT_MAX_CF of the
 # online MWMax and no more units are online than that needs. Units online in the EPC (same key) are preferred:
 # scaling up brings on offline units which are online in the EPC first, then the biggest;
 # scaling down takes off online units which are offline in the EPC first, then the smallest.
@@ -324,7 +328,7 @@ def commit(rows: pd.DataFrame, target: float, gen_type: str, epc_online: set) ->
     cap = (rows['MWMax'] if target >= 0 else -rows['MWMin']).fillna(0.0).clip(lower=0)
     able = cap > 0
     online = closed(rows).copy()
-    if gen_type in ALL_ON_TYPES:
+    if gen_type in CAPACITY_TYPES:
         if target != 0:
             online[able] = True
         elif gen_type in OFF_AT_ZERO_TYPES:
@@ -359,9 +363,9 @@ def dispatch_bucket(rows: pd.DataFrame, target: float, gen_type: str, epc_online
     (Status_Target, MWSetPoint_Target, method) of one (area, GenType) bucket's units, from their basis (gen_targets()).
     'Scaled': the online units' basis MW is scaled by one factor to the target, capped at MWMax (the rest spread over
     the others). Any MW still left brings offline units online by commit() and shares it over them by capacity.
-    'Capacity': only when there is nothing to scale (target 0, or no online basis MW in the target's direction):
-    units are committed by commit() and share the target in proportion to MWMax (|MWMin| for a negative target),
-    following each GenType's dispatch rules.
+    'Capacity': CAPACITY_TYPES always (their basis is ignored); other types only when there is nothing to scale (target
+    0, or no online basis MW in the target's direction). Units are committed by commit() and share the target in
+    proportion to MWMax (|MWMin| for a negative target), following each GenType's dispatch rules.
     (Every group scales from its basis, keys or not: decided by Fable 2026-11-15. The seed dispatch is a solved operating
     point, scaling it stays close to that, and one rule for all groups is predictable.)
     Units with a basis of the opposite sign (e.g. storage charging in a generating bucket) keep it.
@@ -374,7 +378,7 @@ def dispatch_bucket(rows: pd.DataFrame, target: float, gen_type: str, epc_online
     against = basis.where(basis * sign < 0, 0.0)        # Kept as it is.
     want = abs(target - against.sum())
 
-    if target != 0 and along.sum() > 0:
+    if target != 0 and along.sum() > 0 and gen_type not in CAPACITY_TYPES:
         factor = want / along.sum()
         if factor < LOW_FACTOR_WARNING:
             print(f'WARNING: area {rows["AreaNumber"].iloc[0]} {gen_type} scaled to {factor:.0%} of its basis; '
@@ -450,7 +454,7 @@ def gen_targets(epc_gen: pd.DataFrame, case_gen: pd.DataFrame) -> tuple[pd.DataF
             short = set(unmet[unmet > 0].xs(a, level='AreaNumber').index) if a in unmet.index.get_level_values(0) else set()
             rows_a = df[(df['AreaNumber'] == a) & ~df['GenType'].isin(short)]
             off_cap = rows_a['MWMax'].where(rows_a['Status_Target'] != 'Closed', 0.0).clip(lower=0).groupby(rows_a['GenType']).sum()
-            off_cap = off_cap[(off_cap > 0) & ~off_cap.index.isin(ALL_ON_TYPES)]    # Only dispatchable types: commit() would bring every Wind/Solar/Hydro/Storage unit online.
+            off_cap = off_cap[(off_cap > 0) & ~off_cap.index.isin(CAPACITY_TYPES)]    # Not CAPACITY_TYPES: commit() would bring every unit online.
             for g, c in off_cap.items():
                 rows = rows_a[rows_a['GenType'] == g]
                 more = float(df.loc[rows.index, 'MWSetPoint_Target'].sum()) + mw_left * c / off_cap.sum()

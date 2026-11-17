@@ -32,7 +32,7 @@ SETTINGS = {
     'pw': {'mva_mismatch_threshold'},
     'prep': {'swing_mw_max', 'swing_mw_min', 'shunt_vlow', 'shunt_vhigh', 'shunt_max_iterations'},
     'topology': {'tap_threshold', 'unsupported_gv_branch_types'},
-    'area': {'commit', 'commit_max_cf', 'all_on_types', 'off_at_zero_types', 'manual_unit_types', 'scale_nonconforming',
+    'area': {'commit', 'commit_max_cf', 'capacity_types', 'off_at_zero_types', 'manual_unit_types', 'scale_nonconforming',
              'loss_exponent', 'makeup', 'balance_tol_mw', 'balance_max_rounds', 'balance_trigger_mw',
              'balance_at_swing_limits', 'max_unknown_share', 'gen_types', 'unit_gentype', 'fuel_gentype'},
     'scale': {'add_statcoms', 'drop_collapsed', 'exclude_vmin', 'exclude_vmax', 'statcom_vpu', 'statcom_vnom_min',
@@ -90,7 +90,7 @@ def _check_ranges(fp, get):
     _need(fp, get(area, 'LOSS_EXPONENT') >= 0, f'[area] loss_exponent must be 0 or more, not {get(area, "LOSS_EXPONENT")}')
     gen_types = set(get(area, 'GEN_TYPES'))
     bad = {v for n in ('UNIT_GENTYPE', 'FUEL_GENTYPE') for v in get(area, n).values() if v is not None and v not in gen_types}
-    bad |= (get(area, 'ALL_ON_TYPES') | get(area, 'OFF_AT_ZERO_TYPES')) - gen_types
+    bad |= (get(area, 'CAPACITY_TYPES') | get(area, 'OFF_AT_ZERO_TYPES')) - gen_types
     _need(fp, not bad, f'GenTypes {sorted(bad)} are not in [area] gen_types {get(area, "GEN_TYPES")}')
 
 def load(fp: Path = DEFAULT_FP) -> dict:

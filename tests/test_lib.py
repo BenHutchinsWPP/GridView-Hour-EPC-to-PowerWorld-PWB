@@ -317,16 +317,17 @@ def test_gen_targets():
         area.MAKEUP = False
         df, report = area.gen_targets(epc, case)
     assert 'xx' not in df.index and 'to' not in df.index                    # Swing, and gens offline before and after.
-    # Hydro, wind, storage: all on at the same %. Thermal 0 MW: off. Matched area 2: EPC statuses and values.
-    assert df['MWSetPoint_Target'].to_dict() == {'h1': 50.0, 'h2': 150.0, 'w1': 50.0, 'w2': 50.0, 'b1': -10.0, 'b2': -30.0,
+    # Wind, storage: capacity types, all on at the same %. Hydro (a match type) with nothing to scale: committed like
+    # Thermal (h2 alone covers 200 / 0.9). Thermal 0 MW: off. Matched area 2: EPC statuses and values.
+    assert df['MWSetPoint_Target'].to_dict() == {'h1': 0.0, 'h2': 200.0, 'w1': 50.0, 'w2': 50.0, 'b1': -10.0, 'b2': -30.0,
                                                  't1': 0.0, 'a': 70.0, 'b': 0.0}
-    assert df.loc[df['Status_Target'] == 'Open'].index.tolist() == ['t1', 'b']
+    assert df.loc[df['Status_Target'] == 'Open'].index.tolist() == ['h1', 't1', 'b']
     r = report.set_index(['AreaNumber', 'GenType'])['Unmet MW']
     assert r[(1, 'Wind')] == 50 and r[(1, 'Solar')] == 25 and r[(1, 'Hydro')] == 0 and r[(1, 'Thermal')] == 0
-    # With make-up: Wind's 50 MW (capped) and Solar's 25 MW (no PWB units) go onto area 1's Hydro, by MW (1:3).
+    # With make-up: Wind's 50 MW (capped) and Solar's 25 MW (no PWB units) go onto area 1's online Hydro (h2).
     # Storage (charging) takes none; area 2 is untouched. Unmet still says what each bucket's own units couldn't take.
     df, report = area.gen_targets(epc, case)
-    assert df['MWSetPoint_Target'].to_dict() == {'h1': 68.75, 'h2': 206.25, 'w1': 50.0, 'w2': 50.0, 'b1': -10.0, 'b2': -30.0,
+    assert df['MWSetPoint_Target'].to_dict() == {'h1': 0.0, 'h2': 275.0, 'w1': 50.0, 'w2': 50.0, 'b1': -10.0, 'b2': -30.0,
                                                  't1': 0.0, 'a': 70.0, 'b': 0.0}
     r = report.set_index(['AreaNumber', 'GenType'])
     assert r.loc[(1, 'Wind'), 'Unmet MW'] == 50 and r.loc[(1, 'Hydro'), 'Unmet MW'] == 0 and r.loc[(1, 'Hydro'), 'Make-up MW'] == 75
@@ -414,8 +415,8 @@ def test_dist_gen_cleanup_clears_every_load_still_carrying_it():
 def test_area_targets_through_the_engine():
     case = loads([('l1', 1, 'Closed', 60.0, 20.0, 20.0, 10.0), ('l2', 1, 'Closed', 100.0, 0.0, 0.0, 10.0)])
     epc = loads([('e1', 1, 'Closed', 300.0, 0.0, 0.0, 40.0)])
-    case_gen = gens([('h1', 1, '1', 'Closed', 'HY', 0.0, 100.0, 0.0), ('h2', 1, '2', 'Closed', 'HY', 0.0, 300.0, 0.0)])
-    epc_gen = gens([('e1', 1, '1', 'Closed', 'HY', 200.0, 500.0, 0.0)])
+    case_gen = gens([('h1', 1, '1', 'Closed', 'WT', 0.0, 100.0, 0.0), ('h2', 1, '2', 'Closed', 'WT', 0.0, 300.0, 0.0)])
+    epc_gen = gens([('e1', 1, '1', 'Closed', 'WT', 200.0, 500.0, 0.0)])
     targets, _ = area.build_targets({'Load': epc, 'Gen': epc_gen}, {'Load': case, 'Gen': case_gen})
     sa = FakeSimAuto()
     log = scale.iterate_to_gen_load_targets(sa, targets)
@@ -561,7 +562,7 @@ def test_commitment_off_keeps_seed_statuses():
     assert df['Status_Target'].to_dict() == {'g1': 'Closed'} and df['MWSetPoint_Target'].tolist() == [100.0]
     assert report['Unmet MW'].tolist() == [50.0]
 
-def test_commitment_headroom_and_all_on_types():
+def test_commitment_headroom_and_capacity_types():
     case = gens([('t1', 1, '1', 'Closed', 'GT', 0.0, 100.0, 0.0), ('t2', 1, '2', 'Closed', 'GT', 0.0, 300.0, 0.0),
                  ('w1', 1, '3', 'Closed', 'WT', 0.0, 50.0, 0.0), ('w2', 1, '4', 'Open', 'WT', 0.0, 50.0, 0.0),
                  ('h1', 1, '5', 'Open', 'HY', 0.0, 100.0, 0.0), ('h2', 1, '6', 'Closed', 'HY', 0.0, 300.0, 0.0),
@@ -573,13 +574,63 @@ def test_commitment_headroom_and_all_on_types():
     assert st['t1'] == 'Closed' and st['t2'] == 'Closed'   # 280 MW is over 0.9 of the 300 MW unit: both stay on.
     assert st['w1'] == 'Closed' and st['w2'] == 'Closed'   # Wind: all units on, even for 10 MW.
     assert df.loc[['w1', 'w2'], 'MWSetPoint_Target'].tolist() == [5.0, 5.0]
-    assert st['h1'] == 'Closed' and df.loc[['h1', 'h2'], 'MWSetPoint_Target'].tolist() == [10.0, 30.0]  # Run of the river.
+    assert 'h1' not in st and df.loc['h2', 'MWSetPoint_Target'] == 40.0  # Hydro (a match type): committed like Thermal.
     assert st['s1'] == 'Open' and 's2' not in st           # Solar target 0: all off.
     assert df.loc['s1', 'MWSetPoint_Target'] == 0
     # Storage target 0: seed statuses, at 0 MW.
     case = gens([('b1', 1, '1', 'Closed', 'BA', 5.0, 50.0, -50.0), ('b2', 1, '2', 'Open', 'BA', 0.0, 50.0, -50.0)])
     df, _ = area.gen_targets(gens([]), case)
     assert df['Status_Target'].to_dict() == {'b1': 'Closed'} and df['MWSetPoint_Target'].tolist() == [0.0]
+
+def test_capacity_types_ignore_unit_epc_values_and_run_flat():
+    # Wind: keyed units at very different EPC MW (w3 Open there) all come online at the area total's same % of MWMax.
+    case = gens([('w1', 1, '1', 'Closed', 'WT', 90.0, 100.0, 0.0), ('w2', 1, '2', 'Closed', 'WT', 0.0, 200.0, 0.0),
+                 ('w3', 1, '3', 'Open', 'WT', 0.0, 100.0, 0.0),
+                 ('b1', 1, '4', 'Closed', 'BA', 10.0, 50.0, -50.0), ('b2', 1, '5', 'Closed', 'BA', -5.0, 50.0, -150.0)])
+    epc = gens([('w1', 1, '1', 'Closed', 'WT', 80.0, 100.0, 0.0), ('w2', 1, '2', 'Closed', 'WT', 20.0, 200.0, 0.0),
+                ('w3', 1, '3', 'Open', 'WT', 0.0, 100.0, 0.0),
+                ('b1', 1, '4', 'Closed', 'BA', -50.0, 50.0, -50.0), ('b2', 1, '5', 'Closed', 'BA', 10.0, 50.0, -150.0)])
+    with saved_settings():
+        area.MAKEUP = False
+        df, report = area.gen_targets(epc, case)
+    assert (df['Status_Target'] == 'Closed').all()
+    assert df.loc[['w1', 'w2', 'w3'], 'MWSetPoint_Target'].tolist() == [25.0, 50.0, 25.0]      # 100 MW: 25% of each.
+    assert df.loc[['b1', 'b2'], 'MWSetPoint_Target'].tolist() == [-10.0, -30.0]                # Charging 40 MW: by |MWMin|.
+    assert set(report.loc[report['GenType'].isin(['Wind', 'Battery Storage']), 'Method']) == {'Capacity'}
+    # Not a capacity type: the same wind units match key by key instead, and w3 stays Open as in the EPC.
+    with saved_settings():
+        area.MAKEUP, area.CAPACITY_TYPES = False, {'Battery Storage'}
+        df, _ = area.gen_targets(epc, case)
+    assert df.loc[['w1', 'w2'], 'MWSetPoint_Target'].tolist() == [80.0, 20.0] and 'w3' not in df.index
+
+def test_match_types_take_epc_values_key_by_key_and_fill_from_seed():
+    # Thermal: t1 and t2 keyed (t2 Open in the EPC), t3 not in the EPC keeps its seed MW. Total 240 = 150 + 0 + 60 + 30
+    # more: the basis (210) is scaled by 240 / 210.
+    case = gens([('t1', 1, '1', 'Closed', 'GT', 100.0, 300.0, 0.0), ('t2', 1, '2', 'Closed', 'GT', 100.0, 300.0, 0.0),
+                 ('t3', 1, '3', 'Closed', 'GT', 60.0, 300.0, 0.0)])
+    epc = gens([('t1', 1, '1', 'Closed', 'GT', 150.0, 300.0, 0.0), ('t2', 1, '2', 'Open', 'GT', 80.0, 300.0, 0.0),
+                ('e9', 1, '9', 'Closed', 'GT', 90.0, 300.0, 0.0)])
+    df, _ = area.gen_targets(epc, case)
+    assert df['Status_Target'].to_dict() == {'t1': 'Closed', 't2': 'Open', 't3': 'Closed'}
+    assert df['MWSetPoint_Target'].round(9).to_dict() == {'t1': round(150 * 240 / 210, 9), 't2': 0.0, 't3': round(60 * 240 / 210, 9)}
+    # Every key matched: each unit gets exactly its EPC value.
+    epc = gens([('t1', 1, '1', 'Closed', 'GT', 150.0, 300.0, 0.0), ('t2', 1, '2', 'Open', 'GT', 80.0, 300.0, 0.0),
+                ('t3', 1, '3', 'Closed', 'GT', 20.0, 300.0, 0.0)])
+    df, _ = area.gen_targets(epc, case)
+    assert df['MWSetPoint_Target'].to_dict() == {'t1': 150.0, 't2': 0.0, 't3': 20.0}
+
+def test_capacity_share_leaves_out_units_outside_the_main_island():
+    # w3 is on bus 3, island 2: excluded and turned off; w1 and w2 carry the whole 150 MW at the same %.
+    case = gens([('w1', 1, '1', 'Closed', 'WT', 10.0, 100.0, 0.0), ('w2', 1, '2', 'Closed', 'WT', 10.0, 200.0, 0.0),
+                 ('w3', 1, '3', 'Closed', 'WT', 10.0, 300.0, 0.0)]).assign(BusNum=[1, 2, 3])
+    epc = gens([('w1', 1, '1', 'Closed', 'WT', 50.0, 100.0, 0.0), ('w2', 1, '2', 'Closed', 'WT', 50.0, 200.0, 0.0),
+                ('w3', 1, '3', 'Closed', 'WT', 50.0, 300.0, 0.0)])
+    targets, _ = area.build_targets({'Load': loads([]), 'Gen': epc}, {'Load': loads([]), 'Gen': case},
+                                    island_by_bus=pd.Series({1: 1, 2: 1, 3: 2}))
+    g = targets['Gen']
+    assert g.loc[['w1', 'w2'], 'MWSetPoint_Target'].tolist() == [50.0, 100.0]
+    assert g.loc['w3', 'MWSetPoint_Target'] == 0 and g.loc['w3', 'Status_Target'] == 'Open'
+    assert scale.is_island_reason(g.loc[['w3'], 'ExclusionReason']).all()
 
 def test_nonconforming_loads_are_left_alone():
     # l2 / e2 are non-conforming (AGC NO): kept at seed value, out of both area totals, out of balancing.
@@ -1181,24 +1232,24 @@ def test_settings_reject_a_negative_loss_exponent():
 
 def test_settings_apply_and_reject():
     import tempfile
-    saved = (scale.EXCLUDE_VMIN, dict(area.UNIT_GENTYPE), set(area.ALL_ON_TYPES), list(area.GEN_TYPES))
+    saved = (scale.EXCLUDE_VMIN, dict(area.UNIT_GENTYPE), set(area.CAPACITY_TYPES), list(area.GEN_TYPES))
     with tempfile.TemporaryDirectory() as d:
         fp = Path(d) / 's.toml'
         try:
             fp.write_text('[run]\nmode = "topology"\n[scale]\nexclude_vmin = 0.7\n'
-                          '[area]\nall_on_types = ["Wind"]\ngen_types = ["Solar", "Hydro", "Wind", "Thermal", "Battery Storage", "Unknown", "Pumped"]\n'
+                          '[area]\ncapacity_types = ["Wind"]\ngen_types = ["Solar", "Hydro", "Wind", "Thermal", "Battery Storage", "Unknown", "Pumped"]\n'
                           '[area.unit_gentype]\nps = "Pumped"\nHY = "fuel"\n')
             run = settings.load(fp)
             assert run['mode'] == 'topology' and run['balance_swing'] is True     # Default filled in.
-            assert scale.EXCLUDE_VMIN == 0.7 and area.ALL_ON_TYPES == {'Wind'}
+            assert scale.EXCLUDE_VMIN == 0.7 and area.CAPACITY_TYPES == {'Wind'}
             assert area.UNIT_GENTYPE['PS'] == 'Pumped' and area.UNIT_GENTYPE['HY'] is None and area.UNIT_GENTYPE['GT'] == 'Thermal'
             # The setting reaches code which reads it at call time.
             gen = targets_df(ObjectID=['g1'], BusNum=[1])
             assert scale.voltage_ok(gen, pd.Series({1: 0.75})).tolist() == [True]
-            scale.EXCLUDE_VMIN, area.UNIT_GENTYPE, area.ALL_ON_TYPES, area.GEN_TYPES = saved[0], dict(saved[1]), set(saved[2]), list(saved[3])
+            scale.EXCLUDE_VMIN, area.UNIT_GENTYPE, area.CAPACITY_TYPES, area.GEN_TYPES = saved[0], dict(saved[1]), set(saved[2]), list(saved[3])
             for bad in ['[run]\nmode = "x"\n', '[run]\nmodee = "area"\n', '[scale]\nnope = 1\n', '[nope]\n',
                         '[area.unit_gentype]\nPS = "Pumped"\n', '[run]\nswing_bus = true\n', '[scale]\nexclude_vmin = "low"\n',
-                        '[run]\nbalance_swing = 1\n', '[scale]\nstatus = {}\n', '[area]\nall_on_types = "Wind"\n']:
+                        '[run]\nbalance_swing = 1\n', '[scale]\nstatus = {}\n', '[area]\ncapacity_types = "Wind"\n']:
                 fp.write_text(bad)
                 try:
                     settings.load(fp)
@@ -1206,7 +1257,7 @@ def test_settings_apply_and_reject():
                 except ValueError:
                     pass
         finally:
-            scale.EXCLUDE_VMIN, area.UNIT_GENTYPE, area.ALL_ON_TYPES, area.GEN_TYPES = saved
+            scale.EXCLUDE_VMIN, area.UNIT_GENTYPE, area.CAPACITY_TYPES, area.GEN_TYPES = saved
 
 def test_trial_refuses_to_nest():
     sa = FakeSimAuto()
@@ -1760,6 +1811,17 @@ def test_plan_makeup_commitment_leaves_offline_solar_and_wind_off():
     out = area.areas({'Gen': final, 'Load': loads([]).assign(NomkV=1.0)}, reports, targets).set_index('Group')
     assert out.loc['Thermal', 'Unmet MW'] == 70.0 and out.loc['Solar', 'Unmet MW'] == 0.0 and out.loc['Wind', 'Unmet MW'] == 0.0
     assert not out['Note'].str.contains('unexplained').any(), out['Note']
+
+def test_hydro_is_a_match_type_off_at_zero_and_committed_by_plan_makeup():
+    # Hydro target 0: its seed-online unit goes offline (match types commit like Thermal), not kept on at 0 MW.
+    case = gens([('h1', 1, '1', 'Closed', 'HY', 20.0, 100.0, 0.0), ('t1', 1, '2', 'Closed', 'GT', 100.0, 200.0, 0.0)])
+    df, _ = area.gen_targets(gens([('eT', 1, '9', 'Closed', 'GT', 100.0, 200.0, 0.0)]), case)
+    assert df.loc['h1', 'Status_Target'] == 'Open' and df.loc['h1', 'MWSetPoint_Target'] == 0
+    # Thermal 300 MW short of capacity (t1 MWMax 200): the plan make-up re-dispatches Hydro, bringing offline h2 online.
+    case = gens([('t1', 1, '1', 'Closed', 'GT', 150.0, 200.0, 0.0), ('h2', 1, '2', 'Open', 'HY', 0.0, 300.0, 0.0)])
+    df, report = area.gen_targets(gens([('eT', 1, '9', 'Closed', 'GT', 300.0, 400.0, 0.0)]), case)
+    assert df.loc['h2', 'Status_Target'] == 'Closed' and df.loc['h2', 'MWSetPoint_Target'] == 100.0
+    assert report.set_index('GenType').loc['Hydro', 'Make-up MW'] == 100.0
 
 def test_areas_online_final_leaves_out_statcoms():
     case = gens([('g1', 1, '1', 'Closed', 'GT', 100.0, 200.0, 0.0), ('sc', 1, scale.STATCOM_ID, 'Closed', '', 0.0, 0.0, 0.0)])
