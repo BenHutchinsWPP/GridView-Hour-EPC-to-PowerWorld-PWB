@@ -466,7 +466,7 @@ def dist_gen_removed(cleanup: pd.DataFrame) -> float:
     """MW of distributed generation a dist_gen_cleanup() table takes off the case (it injected only where Closed)."""
     return float(cleanup['DistMW_Seed'].sum()) if len(cleanup) else 0.0
 
-AREAS_COLUMNS = ['AreaNumber', 'Group', 'Seed MW', 'Target MW', 'Unmet MW', 'Not Reached MW', 'Balance MW', 'Final MW', 'Error MW',
+AREAS_COLUMNS = ['AreaNumber', 'Group', 'Seed MW', 'Target MW', 'Unmet MW', 'Not Reached MW', 'Make-up MW', 'Balance MW', 'Final MW', 'Error MW',
                  'Target Mvar', 'Final Mvar', 'Online Seed', 'Online Final', 'Seed Loss MW', 'Est. Loss MW', 'Final Loss MW', 'Note']
 LEDGER_TOL_MW = 1.0     # A row's Final further than this from its ledger is noted as unexplained.
 
@@ -484,10 +484,12 @@ def _gen_group(df: pd.DataFrame) -> pd.Series:
     return classify_gen_type(df) if len(df) else pd.Series(dtype=object)
 
 def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame], targets: dict[str, pd.DataFrame] | None = None,
-          balance_tables=(), swing_buses=(), final_loss: pd.Series | None = None) -> pd.DataFrame:
+          balance_tables=(), swing_buses=(), final_loss: pd.Series | None = None, makeup_tables=()) -> pd.DataFrame:
     """
     The `areas` sheet: a row per (AreaNumber, Group), Group a GenType or 'Load' (AREAS_COLUMNS). The ledger per row:
-        Final = Target - Unmet - Not Reached + Balance
+        Final = Target - Unmet - Not Reached + Make-up + Balance
+    Make-up: what the make-up run moved onto the group's other units (makeup_tables: makeup_targets() tables, after
+    scaling), to cover what its excluded units didn't reach.
     Not Reached: over the main scaling's rows, end-of-run target less end-of-run value (excluded, diverged, held units).
     Balance: what swing balancing moved onto the group = the midrun part (end-of-run `_Target` less Planned MW, main rows:
     midrun balances rescale the main targets) + the final part (value less seed in each final balance's table).
@@ -514,12 +516,13 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
         planned = _by_group(g, g['Planned MW'], gg).add(_by_group(l, l['Planned MW']), fill_value=0.0)
         parts['Not Reached MW'] = not_reached
         parts['Balance MW'] = end_target.sub(planned, fill_value=0.0)        # The midrun part.
-    for t in balance_tables:
-        g, l = t['Gen'], t['Load']
-        g = g[~g['BusNum'].isin(swing_buses)]       # Left out of Final MW too (a second slack bus beside the giant swing).
-        parts['Balance MW'] = (parts.get('Balance MW', pd.Series(dtype=float))
-                               .add(_by_group(g, g['MWSetPoint'] - g['MWSetPoint_Seed'], _gen_group(g)), fill_value=0.0)
-                               .add(_by_group(l, p_of(l, LOAD_P) - l['P_Seed']), fill_value=0.0))
+    for col, tables in (('Balance MW', balance_tables), ('Make-up MW', makeup_tables)):
+        for t in tables:
+            g, l = t['Gen'], t['Load']
+            g = g[~g['BusNum'].isin(swing_buses)]       # Left out of Final MW too (a second slack bus beside the giant swing).
+            start = parts[col] if col in parts else _by_group(g.iloc[:0], [])
+            parts[col] = (start.add(_by_group(g, g['MWSetPoint'] - g['MWSetPoint_Seed'], _gen_group(g)), fill_value=0.0)
+                          .add(_by_group(l, p_of(l, LOAD_P) - l['P_Seed']), fill_value=0.0))
     if final is not None:
         # Islanded units (excluded rows of the targets) are left out of Final MW, as they are out of Seed and Target.
         out_ids = set().union(*[df.index[scale.is_island_reason(df['ExclusionReason'])] for df in (targets or {}).values()])
@@ -545,7 +548,7 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
         out[c] = plan[c].reindex(index) if c in plan else np.nan
     out[['Seed MW', 'Target MW', 'Unmet MW']] = out[['Seed MW', 'Target MW', 'Unmet MW']].fillna(0.0)
     out.loc[out.index.get_level_values('Group') != 'Load', 'Target Mvar'] = np.nan
-    for c in ('Not Reached MW', 'Balance MW'):
+    for c in ('Not Reached MW', 'Make-up MW', 'Balance MW'):
         out[c] = parts[c].reindex(index, fill_value=0.0) if c in parts else 0.0
     out = out.rename(columns={'Seed Online': 'Online Seed'})
     out['Online Seed'] = out['Online Seed'].fillna(0.0)
@@ -558,7 +561,7 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
     for c in ('Seed Loss MW', 'Est. Loss MW', 'Final Loss MW'):
         col = loss[c] if c in loss else pd.Series(dtype=float)
         out[c] = np.where(is_load, col.reindex(areas_of).to_numpy() if c in loss else np.nan, np.nan)
-    ledger = out['Target MW'] - out['Unmet MW'] - out['Not Reached MW'] + out['Balance MW']
+    ledger = out['Target MW'] - out['Unmet MW'] - out['Not Reached MW'] + out['Make-up MW'] + out['Balance MW']
     out['Note'] = _area_notes(out, plan.reindex(index), ledger)
     islanded = reports.get('islanded', pd.Series(dtype=float)).reindex(index).fillna(0.0)
     still_on = pd.Series(0.0, index=index)
@@ -829,6 +832,91 @@ def rescale_targets(targets: dict[str, pd.DataFrame], moved: dict[str, pd.DataFr
     gen, load = moved['Gen'], moved['Load']
     scale.rescale(targets['Gen'], gen['MWSetPoint'] / gen['MWSetPoint_Seed'], scale.SCALED['Gen'], cap=gen['MWMax'])
     scale.rescale(targets['Load'], load[LOAD_P].sum(axis=1) / load['P_Seed'], LOAD_P + LOAD_Q)
+
+# ------------------ Make-up ------------------
+MAKEUP = True   # After the main scaling: move what excluded units didn't reach onto their group's other units.
+
+def makeup_targets(final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFrame], swing_buses,
+                   skip=frozenset()) -> tuple[dict[str, pd.DataFrame], float] | None:
+    """
+    After the main scaling (area mode): per (AreaNumber, GenType) and per AreaNumber's load, the shortfall S = target -
+    value of the main rows which were excluded (held units are excluded at the end of the main run; islanded rows are
+    left out). S goes onto the same group's other units, read from the live case (`final`, read_case()), so the main
+    tables are never touched: Closed gens with MW > 0 not on a swing bus, in proportion to MW (S > 0: capped at MWMax,
+    what can't be placed stays short; S < 0: down by one factor, floor 0), and Closed loads with MW > 0 (conforming
+    unless SCALE_NONCONFORMING), one factor on MW and Mvar. skip: ObjectIDs left out (balance_skips()).
+    Returns (tables in balance_targets()' shape, {'Gen': MW asked, 'Load': MW asked}), or None if no group is short
+    by 1 MW or more.
+    """
+    def shortfall(df, cur, tgt, group):
+        out = df[~scale.included(df) & ~scale.is_island_reason(df['ExclusionReason'])]
+        return _by_group(out, tgt(out) - cur(out), group(out) if group else None)
+    tp = lambda df: df[[f'{c}_Target' for c in LOAD_P]].sum(axis=1)
+    s_gen = shortfall(targets['Gen'], lambda d: d['MWSetPoint'], lambda d: d['MWSetPoint_Target'], _gen_group)
+    s_load = shortfall(targets['Load'], lambda d: d[LOAD_P].sum(axis=1), tp, None)
+    s_gen, s_load = s_gen[s_gen.abs() >= 1.0], s_load[s_load.abs() >= 1.0]
+    if not (len(s_gen) or len(s_load)):
+        return None
+
+    gen = scalable_gens(final['Gen'])
+    gen = gen[closed(gen) & (gen['MWSetPoint'] > 0) & ~gen['BusNum'].isin(swing_buses) & ~gen['ObjectID'].isin(skip)].copy()
+    gen['key'] = list(zip(gen['AreaNumber'], _gen_group(gen)))
+    gen = gen[gen['key'].isin(s_gen.index)]
+    gen['MWSetPoint_Target'] = gen['MWSetPoint']
+    for key, rows in gen.groupby('key').groups.items():
+        mw, short = gen.loc[rows, 'MWSetPoint'], s_gen[key]
+        if short > 0:
+            cap = gen.loc[rows, 'MWMax'].where(gen.loc[rows, 'MWMax'] > mw, mw)
+            gen.loc[rows, 'MWSetPoint_Target'] = proportional_fill(mw.sum() + short, mw, cap)
+        else:
+            gen.loc[rows, 'MWSetPoint_Target'] = mw * max(1 + short / mw.sum(), 0.0)
+    gen['MWSetPoint_Seed'] = gen['MWSetPoint']
+    gen['Status_Target'] = gen['Status']
+
+    load = final['Load']
+    load = load[closed(load) & (conforming(load) | SCALE_NONCONFORMING) & ~load['ObjectID'].isin(skip)].copy()
+    p = load[LOAD_P].sum(axis=1)
+    load = load[(p > 0) & load['AreaNumber'].isin(s_load.index.get_level_values('AreaNumber'))]
+    p = p[load.index]
+    k = (1 + load['AreaNumber'].map(s_load.droplevel('Group')) / load['AreaNumber'].map(p.groupby(load['AreaNumber']).sum())).clip(lower=0.0)
+    for c in scale.SCALED['Load']:
+        load[f'{c}_Target'] = load[c] * k if c in LOAD_P + LOAD_Q else load[c]
+    for c in scale.STATUS['Load']:
+        load[f'{c}_Target'] = load[c]
+    load['P_Seed'] = p
+
+    tables = {'Gen': gen.drop(columns='key'), 'Load': load}
+    for df in tables.values():
+        df['ExclusionReason'] = ''
+    return {t: df.set_index('ObjectID') for t, df in tables.items()}, {'Gen': float(s_gen.sum()), 'Load': float(s_load.sum())}
+
+def makeup(SimAuto, targets: dict[str, pd.DataFrame], tables: list | None = None) -> list[scale.Run]:
+    """
+    With the case open, after the main scaling: runs makeup_targets() (a `makeup` run; none if nothing is short).
+    tables: if a list, the make-up tables (after scaling) are appended to it, for areas(). A make-up which fails
+    part-way keeps what it applied and the hour carries on.
+    """
+    slack = prep.slack_buses(SimAuto)
+    final = read_case(SimAuto)
+    before, swing_buses = swing_mw(final['Gen'], slack)
+    made = makeup_targets(final, targets, swing_buses, balance_skips(SimAuto, final, targets))
+    if made is None:
+        return []
+    moved, asked = made
+    if tables is not None:
+        tables.append(moved)
+    run = scale.Run('makeup', moved=moved, before=before)
+    try:
+        run.log = scale.iterate_to_gen_load_targets(SimAuto, moved, label='Make-up', initial_step=scale.MAX_STEP)
+    except pw.SimAutoError as e:
+        print(f'WARNING: Make-up stopped: {e}')
+        run.log, run.note = getattr(e, 'log', {}), f'stopped: {e}'
+    run.after = swing_mw(read_case(SimAuto)['Gen'], slack)[0]
+    placed = mw_changes(moved)
+    run.note = '; '.join(filter(None, [f"gen asked {asked['Gen']:+,.0f} MW, placed {placed['Gen MW Change']:+,.0f} MW; "
+                                       f"load asked {asked['Load']:+,.0f} MW, placed {placed['Load MW Change']:+,.0f} MW", run.note]))
+    print(f'Make-up: {run.note}.')
+    return [run]
 
 def midrun_balancer(SimAuto):
     """

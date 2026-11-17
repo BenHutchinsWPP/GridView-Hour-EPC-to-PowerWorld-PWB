@@ -84,12 +84,12 @@ def create_case(SimAuto, gv_fp, out_fp):
             pre_runs = [scale.Run('prebalance', moved=moved, note='targets moved before scaling')]
     log_fp = out_dir / (gv_fp.stem + '_Log.xlsx')
 
-    def build_log(runs, final, balance_tables=(), swing_buses=(), exception_runs=(), final_loss=None):
+    def build_log(runs, final, balance_tables=(), swing_buses=(), exception_runs=(), final_loss=None, makeup_tables=()):
         log = {'exceptions': scale.exceptions([*exception_runs, *runs], targets, final), 'runs': scale.runs_sheet(runs)}
         if area_mode:
             # Before scaling (final None) nothing has been reached or balanced yet: the plan alone.
             scaled = targets if final is not None else None
-            log = {'areas': area.areas(final, reports, scaled, balance_tables, swing_buses, final_loss), **log}
+            log = {'areas': area.areas(final, reports, scaled, balance_tables, swing_buses, final_loss, makeup_tables), **log}
         return log
 
     # The plan first, so that a failure during the hour's long scaling still leaves it.
@@ -103,7 +103,7 @@ def create_case(SimAuto, gv_fp, out_fp):
     pw.open_case(SimAuto, pw_fp)
     scale.turn_off_islanded(SimAuto, targets)     # Everything outside the main island goes Open, before scaling.
     pvqv = pd.read_csv(pvqv_fp) if run['use_pvqv'] else None
-    balance_tables = []
+    balance_tables, makeup_tables = [], []
     slack = prep.slack_buses(SimAuto)
     swing = lambda: area.swing_mw(pw.get_df(SimAuto, 'Gen', area.GEN_FIELDS), slack)[0]
     before = swing()
@@ -118,6 +118,14 @@ def create_case(SimAuto, gv_fp, out_fp):
     # the swing; the final balance rounds follow. The last row's After is where the swing ended.
     runs = [*pre_runs, *midrun_runs, scale.Run('main', log, before=before, after=swing())]
     runs += clear_dist_gen(SimAuto, swing)
+    if area_mode and area.MAKEUP:
+        # What excluded units didn't reach goes onto their group's other units, before the final balance.
+        try:
+            runs += area.makeup(SimAuto, targets, tables=makeup_tables)
+        except Exception as e:     # Never lose the hour over its make-up: the final balance still runs.
+            print(f'WARNING: make-up failed: {e!r}. Carrying on without it.')
+            makeup_tables.clear()
+            runs.append(scale.Run('makeup', note=f'failed: {e!r}'))
     if run['balance_swing']:
         runs += area.balance_swing(SimAuto, targets, tables=balance_tables)
     # Read back from PowerWorld, so the log shows what the case holds rather than what the scaling meant to do.
@@ -129,7 +137,7 @@ def create_case(SimAuto, gv_fp, out_fp):
     # Save the case first: a log which can't be built or written (e.g. open in Excel) mustn't cost the solved hour.
     pw.save_case(SimAuto, out_fp, run['case_format'])
     try:
-        log = build_log(runs, final, balance_tables, swing_buses, final_loss=final_loss)
+        log = build_log(runs, final, balance_tables, swing_buses, final_loss=final_loss, makeup_tables=makeup_tables)
         print(summary_line(gv_fp.stem, log, area_mode))
         pw.write_excel(log_fp, log)
     except Exception as e:     # Never lose the hour over its log.

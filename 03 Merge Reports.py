@@ -5,7 +5,7 @@ from Scripts import pw
 
 EXCEL_MAX_ROWS = 1_048_576
 MERGED_SHEETS = ['areas', 'exceptions', 'runs']     # Fixed sheet names written by step 02 (area mode: all three; topology: no areas).
-HOUR_COLUMNS = ['Hour', 'Final Swing MW', 'Unmet MW', 'Not Reached MW', 'Balance Gen MW', 'Balance Load MW', 'Worst Error MW', 'Worst AreaNumber',
+HOUR_COLUMNS = ['Hour', 'Final Swing MW', 'Unmet MW', 'Not Reached MW', 'Make-up MW', 'Balance Gen MW', 'Balance Load MW', 'Worst Error MW', 'Worst AreaNumber',
                 'Worst Group', 'Exceptions Gen/Load', 'Exceptions STATCOM', 'Exceptions Branch']
 
 def _hour_row(hour: str, sheets: dict[str, pd.DataFrame]) -> dict:
@@ -16,8 +16,8 @@ def _hour_row(hour: str, sheets: dict[str, pd.DataFrame]) -> dict:
     row['Final Swing MW'] = runs['Swing MW After'].iloc[-1] if runs is not None and len(runs) else np.nan
     areas = sheets.get('areas')
     if areas is not None and len(areas):
-        for col in ('Unmet MW', 'Not Reached MW'):
-            row[col] = areas[col].sum()
+        for col in ('Unmet MW', 'Not Reached MW', 'Make-up MW'):
+            row[col] = areas[col].sum() if col in areas else np.nan      # Make-up MW: not in older logs.
         # Gen and load balancing apart: summed together, MW put onto gen and taken off load would cancel.
         is_load = areas['Group'] == 'Load'
         row['Balance Gen MW'] = areas.loc[~is_load, 'Balance MW'].sum()

@@ -45,6 +45,9 @@ scale_nonconforming = false
 # as (its target load / its seed load) ** loss_exponent. 2 = I^2 R; 0 = losses stay at their seed values. The areas
 # sheet shows Seed, Est. and Final Loss MW, to check it by.
 loss_exponent = 2.0
+# After the main scaling, move what excluded/held units didn't reach onto the other units of their area & GenType (or
+# their area's load), before the final balance. The areas sheet shows it as Make-up MW.
+makeup = true
 balance_tol_mw = 1.0
 balance_max_rounds = 10
 # While scaling, balance once the swing goes outside its band: further than balance_trigger_mw from 0 (0 = not used),

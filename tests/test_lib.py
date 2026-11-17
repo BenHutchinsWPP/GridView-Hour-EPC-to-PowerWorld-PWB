@@ -904,7 +904,7 @@ def test_slack_bus_gens_are_the_swing_when_there_is_no_giant_swing():
     area.balance_swing(sa)
     assert abs(area.swing_mw(sa.table('Gen'), [9])[0]) < area.BALANCE_TOL_MW and ('Gen', '9') not in sa.applied
 
-def ledger_run(mutate=None, slack=(99,)):
+def ledger_run(mutate=None, slack=(99,), makeup=False):
     """Midrun + final balances, a diverging gen (g3, bus 4) and the areas sheet of the result. slack: slack buses (99 has xx)."""
     gen = gens([('xx', 1, 'xx', 'Closed', '', 0.0, 2e4, -2e4), ('g1', 1, '1', 'Closed', 'GT', 100.0, 1000.0, 0.0),
                 ('g2', 1, '2', 'Closed', 'HY', 100.0, 1000.0, 0.0), ('g3', 1, '3', 'Closed', 'GT', 100.0, 1000.0, 0.0)]
@@ -918,10 +918,12 @@ def ledger_run(mutate=None, slack=(99,)):
     targets, reports = area.build_targets({'Load': epc_load, 'Gen': epc_gen}, {'Load': load, 'Gen': gen}, swing_buses=list(slack))
     after_step, midrun_log = area.midrun_balancer(sa)
     scale.iterate_to_gen_load_targets(sa, targets, after_step=after_step)
-    tables = []
+    tables, mk = [], []
+    if makeup:
+        assert area.makeup(sa, targets, tables=mk)
     area.balance_swing(sa, targets, tables=tables)
     assert midrun_log and tables
-    return area.areas(area.read_case(sa), reports, targets, tables, swing_buses=list(slack)), targets
+    return area.areas(area.read_case(sa), reports, targets, tables, swing_buses=list(slack), makeup_tables=mk), targets
 
 def test_areas_ledger_holds_with_midrun_and_final_balances_and_a_diverging_gen():
     out, targets = ledger_run()
@@ -1531,6 +1533,72 @@ def test_areas_ledger_holds_when_an_island_unit_stays_on():
     row = area.areas(final, reports, targets).set_index('Group').loc['Hydro']
     assert (row['Not Reached MW'], row['Final MW'], row['Error MW']) == (0.0, 150.0, 0.0)
     assert 'unexplained' not in row['Note'] and 'of which 100.0 MW stayed on' in row['Note']
+
+def test_areas_ledger_holds_with_a_makeup_and_the_held_gens_shortfall_lands_on_its_group():
+    out, targets = ledger_run(makeup=True)
+    ledger = out['Target MW'] - out['Unmet MW'] - out['Not Reached MW'] + out['Make-up MW'] + out['Balance MW']
+    assert (abs(out['Final MW'] - ledger) < 1e-6).all(), out
+    assert not out['Note'].str.contains('unexplained').any(), out['Note']
+    thermal = out[out['Group'] == 'Thermal'].iloc[0]
+    assert abs(thermal['Make-up MW'] - thermal['Not Reached MW']) < 1e-6 and thermal['Make-up MW'] > 0   # g1 took g3's.
+    assert (out.loc[out['Group'] != 'Thermal', 'Make-up MW'] == 0).all()
+    # The shortfall no longer lands on the swing, so balancing moves 100 MW less over the case.
+    before, _ = ledger_run()
+    assert abs(before['Balance MW'].abs().sum() - out['Balance MW'].abs().sum() - 100.0) < 1e-6
+
+def test_makeup_targets_stay_in_the_group_and_respect_caps_islands_and_signs():
+    # Area 1 Thermal: gx excluded 60 MW short; g1 (MWMax 120) and g2 share it by MW but g1 caps at 120: g1 120, g2 140.
+    # gi is islanded (target 0, still at 50): not counted. Area 2 Thermal (g9) untouched. Hydro h1 isn't Thermal.
+    # Load area 1: lx excluded 30 MW short; l1 (100) takes it, the negative dc load and l9 (area 2) don't.
+    tg = targets_df(ObjectID=['g1', 'g2', 'gx', 'gi', 'g9', 'h1'], AreaNumber=[1, 1, 1, 1, 2, 1], BusNum=[1, 2, 3, 4, 5, 6],
+                    ID='1', UnitTypeCode=['GT'] * 5 + ['HY'], FuelTypeCode='', Status='Closed',
+                    MWSetPoint=[100.0, 100.0, 40.0, 50.0, 100.0, 100.0], MWSetPoint_Target=[100.0, 100.0, 100.0, 0.0, 100.0, 100.0])
+    tg.loc['gx', 'ExclusionReason'], tg.loc['gi', 'ExclusionReason'] = 'Diverged during scaling', 'Island 2, not the main island'
+    tl = targets_df(ObjectID=['l1', 'lx', 'dc', 'l9'], AreaNumber=[1, 1, 1, 2], BusNum=[1, 2, 3, 5], ID='1', Status='Closed',
+                    **{c: 0.0 for c in LOAD_P_ALL}, **{f'{c}_Target': 0.0 for c in LOAD_P_ALL})
+    tl['SMW'], tl['SMW_Target'] = [100.0, 20.0, -50.0, 100.0], [100.0, 50.0, -50.0, 100.0]
+    tl.loc['lx', 'ExclusionReason'] = 'Diverged during scaling'
+    final = {'Gen': tg.reset_index().assign(MWMax=[120.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0]),
+             'Load': tl.reset_index().assign(AGC='YES', DistStatus='Open')}
+    moved, asked = area.makeup_targets(final, {'Gen': tg, 'Load': tl}, swing_buses=[], skip={'gx', 'gi', 'lx'})
+    assert asked == {'Gen': 60.0, 'Load': 30.0}
+    assert moved['Gen']['MWSetPoint_Target'].round(9).to_dict() == {'g1': 120.0, 'g2': 140.0}
+    assert moved['Load'].index.tolist() == ['l1'] and moved['Load'].loc['l1', 'SMW_Target'] == 130.0
+    assert area.makeup_targets(final, {'Gen': tg.assign(ExclusionReason=''), 'Load': tl.assign(ExclusionReason='')}, []) is None
+
+def test_step_02_runs_a_makeup_only_in_area_mode_when_something_is_short():
+    gen, load = two_cases()
+    epc_gen = gens([('e1', 1, '1', 'Closed', 'GT', 150.0, 1000.0, 0.0), ('e2', 1, '2', 'Closed', 'HY', 50.0, 1000.0, 0.0)]).assign(BusNum=[1, 2], MW=0.0, NomkV=230.0, BusName='b')
+    epc_load = loads([('e1', 1, 'Closed', 300.0, 0.0, 0.0, 30.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        step = load_step_02(Path(d), 'area')
+        sa = CaseSimAuto({'h1.epc': (epc_gen, epc_load), 'Prepared.pwb': (gen, load)}, slack=[99])
+        step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')
+        sheets = pd.read_excel(step.out_dir / 'h1_Log.xlsx', sheet_name=None)
+    assert 'makeup' not in sheets['runs']['Run'].tolist()                       # Nothing short: no make-up run.
+    assert 'Make-up MW' in sheets['areas'].columns
+    with saved_settings(), tempfile.TemporaryDirectory() as d:                  # g1 (bus 1) diverges: Thermal is short.
+        step = load_step_02(Path(d), 'area')
+        sa = CaseSimAuto({'h1.epc': (epc_gen, epc_load), 'Prepared.pwb': (gen, load)}, slack=[99])
+        sa.bad = {'1'}
+        step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')
+        runs = pd.read_excel(step.out_dir / 'h1_Log.xlsx', sheet_name='runs').set_index('Run')
+    assert 'gen asked +89 MW, placed +0 MW' in runs.loc['makeup', 'Note']        # No other Thermal unit to take it.
+    with saved_settings(), tempfile.TemporaryDirectory() as d:                  # A make-up error keeps the hour.
+        step = load_step_02(Path(d), 'area')
+        sa = CaseSimAuto({'h1.epc': (epc_gen, epc_load), 'Prepared.pwb': (gen, load)}, slack=[99])
+        sa.bad = {'1'}
+        real = step.area.makeup_targets
+        step.area.makeup_targets = lambda *a, **k: 1 / 0
+        try:
+            step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')
+        finally:
+            step.area.makeup_targets = real
+        runs = pd.read_excel(step.out_dir / 'h1_Log.xlsx', sheet_name='runs').set_index('Run')
+    assert 'h1.pwb' in sa.saved and runs.loc['makeup', 'Note'].startswith('failed: ZeroDivisionError')
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        step = load_step_02(Path(d), 'topology')
+        assert step.area.MAKEUP                                                  # On, but area mode only.
 
 if __name__ == '__main__':
     tests = [f for name, f in dict(globals()).items() if name.startswith('test_')]
