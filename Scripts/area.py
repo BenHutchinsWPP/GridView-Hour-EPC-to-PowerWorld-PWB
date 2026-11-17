@@ -20,7 +20,8 @@ The targets are:
   own EPC value (0 if Open in the EPC), instead of being scaled as a group. With COMMIT, such gens also take their EPC status.
 
 After that, whatever is left on the swing is balanced out over the whole case, all on generation (load stays on its targets)
-(see balance_targets()), so the swing ends near 0 MW. This moves the area totals off their targets by that much.
+(see balance_targets()), so the swing ends at its goal (swing_goal(): the giant swing at 0 MW; the case's own slack at its
+EPC MW, or within its limits). This moves the area totals off their targets by that much.
 
 Working tables are in the shape Scripts/scale.py expects (see its docstring), plus AreaNumber, GenType and Method.
 """
@@ -525,7 +526,28 @@ def build_targets(epc: dict[str, pd.DataFrame], case: dict[str, pd.DataFrame], s
     off_swing = lambda df: df[~df['BusNum'].isin(swing_buses)]
     gen, gen_report = gen_targets(off_swing(epc['Gen']), off_swing(case['Gen']))
     gen, load, islanded_mw = _add_islanded(gen, load, islanded['Gen'], islanded['Load'])
-    return {'Gen': gen, 'Load': load}, {'area_load': load_report, 'area_gen': gen_report, 'islanded': islanded_mw}
+    return {'Gen': gen, 'Load': load}, {'area_load': load_report, 'area_gen': gen_report, 'islanded': islanded_mw,
+                                        'swing': swing_epc(epc['Gen'], case['Gen'], swing_buses)}
+
+def swing_epc(epc_gen: pd.DataFrame, case_gen: pd.DataFrame, swing_buses) -> pd.DataFrame:
+    """
+    The case's own slack gens (Closed, on swing_buses) whose key is also in the EPC: 'Seed MW' (their solved MW, or
+    MWSetPoint if MW isn't read) and 'EPC MW' (0 if Open in the EPC; kept within its MWMin to MWMax), by ObjectID. The balances aim each at its EPC MW
+    (swing_goal()). Empty if the case has a giant swing: that one always aims at 0.
+    """
+    empty = pd.DataFrame(columns=['Seed MW', 'EPC MW'], dtype=float)
+    if (case_gen['ID'] == prep.SWING_ID).any():
+        return empty
+    slack = case_gen[closed(case_gen) & case_gen['BusNum'].isin(swing_buses) & case_gen['ObjectID'].isin(epc_gen['ObjectID'])]
+    if not len(slack):
+        return empty
+    epc = epc_gen.set_index('ObjectID')
+    epc_mw = epc['MWSetPoint'].fillna(0.0).where(closed(epc), 0.0)
+    seed = slack['MW'] if 'MW' in slack else slack['MWSetPoint']
+    lo, hi = _limits(slack)
+    goal = slack['ObjectID'].map(epc_mw).clip(lower=lo, upper=hi)     # Within its own limits (swing_goal()).
+    return pd.DataFrame({'Seed MW': seed.to_numpy(dtype=float), 'EPC MW': goal.to_numpy(dtype=float)},
+                        index=pd.Index(slack['ObjectID'], name='ObjectID'))
 
 def _add_islanded(gen: pd.DataFrame, load: pd.DataFrame, i_gen: pd.DataFrame, i_load: pd.DataFrame):
     """
@@ -774,11 +796,21 @@ def swing_mw(gen: pd.DataFrame, slack_buses) -> tuple[float, list]:
     swing = swing_units(gen, slack_buses)
     return float(swing['MW'].sum()), sorted(set(swing['BusNum']))
 
+def _limits(units: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """(low, high) MW limits of each unit: MWMin / MWMax in order, a blank one unlimited."""
+    a, b = units['MWMin'].astype(float).fillna(-np.inf), units['MWMax'].astype(float).fillna(np.inf)
+    return np.minimum(a, b), np.maximum(a, b)
+
 def swing_band(gen: pd.DataFrame, slack_buses) -> tuple[float, float]:
     """
-    (low, high) MW the swing may sit within while scaling, before midrun_balancer() rebalances: the narrowest of
-    +/- BALANCE_TRIGGER_MW (if not 0) and the swing's MWMin / MWMax (if BALANCE_AT_SWING_LIMITS).
+    (low, high) MW the swing may sit within while scaling, before midrun_balancer() rebalances. The case's own slack
+    gens (no giant swing): their MWMin to MWMax (summed). The giant swing: the narrowest of +/- BALANCE_TRIGGER_MW
+    (if not 0) and its MWMin / MWMax (if BALANCE_AT_SWING_LIMITS).
     """
+    swing = swing_units(gen, slack_buses)
+    if len(swing) and not (swing['ID'] == prep.SWING_ID).any():
+        lo, hi = _limits(swing)
+        return float(lo.sum()), float(hi.sum())
     lo, hi = -np.inf, np.inf
     if BALANCE_TRIGGER_MW:
         lo, hi = -BALANCE_TRIGGER_MW, BALANCE_TRIGGER_MW
@@ -786,6 +818,21 @@ def swing_band(gen: pd.DataFrame, slack_buses) -> tuple[float, float]:
         swing = swing_units(gen, slack_buses)
         lo, hi = max(lo, float(swing['MWMin'].sum())), min(hi, float(swing['MWMax'].sum()))
     return lo, hi
+
+def swing_goal(gen: pd.DataFrame, slack_buses, epc: pd.DataFrame | None = None) -> tuple[float, float]:
+    """
+    (low, high) MW the swing should end within. The giant swing: 0. The case's own slack gens: each one in `epc`
+    (swing_epc()) at its EPC MW kept within its MWMin to MWMax (an EPC MW past a limit, or 0 for a slack Open in the
+    EPC, aims at that limit), any other anywhere within its limits (a blank limit: unlimited); summed.
+    """
+    swing = swing_units(gen, slack_buses)
+    if not len(swing) or (swing['ID'] == prep.SWING_ID).any():
+        return 0.0, 0.0
+    lo, hi = _limits(swing)
+    epc_mw = swing['ObjectID'].map(epc['EPC MW']) if epc is not None and len(epc) else pd.Series(np.nan, index=swing.index)
+    matched = epc_mw.notna()
+    goal = epc_mw[matched].clip(lower=lo[matched], upper=hi[matched])
+    return float(goal.sum() + lo[~matched].sum()), float(goal.sum() + hi[~matched].sum())
 
 def balance_skips(SimAuto, final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFrame] | None = None) -> set:
     """
@@ -828,12 +875,14 @@ def balance_targets(final: dict[str, pd.DataFrame], swing: float, swing_buses, s
         df['ExclusionReason'] = ''
     return {t: df.set_index('ObjectID') for t, df in targets.items()}
 
-def prebalance_targets(targets: dict[str, pd.DataFrame], loss_change: float = 0.0) -> dict[str, pd.DataFrame] | None:
+def prebalance_targets(targets: dict[str, pd.DataFrame], loss_change: float = 0.0, swing_change: float = 0.0) -> dict[str, pd.DataFrame] | None:
     """
     Before scaling: moves the targets so that scaling leaves the swing where it is. The change in
     load - gen - dist gen + losses from now to the targets would otherwise land on the swing as it scales (and set off a
     midrun balance every few steps). Gens and loads count only while Closed (an Open one injects nothing, whatever its MW).
-    loss_change: estimated target losses less seed losses (loss_estimate()). Same rule as a balance: all onto gen, one
+    loss_change: estimated target losses less seed losses (loss_estimate()). swing_change: the case's own slack gens'
+    seed MW less their EPC MW (swing_epc()): the rest of the gens make that up, so the slack ends at its EPC MW.
+    Same rule as a balance: all onto gen, one
     factor on the target MW of every included gen Closed in the target with a positive target, spread_evenly() (capped
     at MWMax); load targets are never moved. What the gens can't take stays on the swing. Returns the moved tables for
     the `runs` sheet (mw_changes()), or None if nothing moved.
@@ -847,7 +896,7 @@ def prebalance_targets(targets: dict[str, pd.DataFrame], loss_change: float = 0.
     def dist(suffix):       # Dist gen injects only while the load and its dist gen are both Closed.
         return l_in['DistMWInput' + suffix].where(on(l_in, suffix) & (l_in['DistStatus' + suffix] == 'Closed'), 0.0).sum()
     swing = ((p_target - p).sum() - (gen_mw('_Target') - gen_mw('')) - (dist('_Target') - dist(''))
-             + loss_change)
+             + loss_change + swing_change)
     if abs(swing) < 1.0:
         return None
 
@@ -860,7 +909,8 @@ def prebalance_targets(targets: dict[str, pd.DataFrame], loss_change: float = 0.
 
     left = swing - (new.sum() - seed.sum())
     print(f'Targets balanced before scaling: {swing:+.0f} MW would have landed on the swing'
-          + (f' (losses {loss_change:+.0f} MW)' if abs(loss_change) >= 1.0 else '') + f'; gen {new.sum() - seed.sum():+.0f} MW'
+          + (f' (losses {loss_change:+.0f} MW)' if abs(loss_change) >= 1.0 else '')
+          + (f' (slack to its EPC MW {swing_change:+.0f} MW)' if abs(swing_change) >= 1.0 else '') + f'; gen {new.sum() - seed.sum():+.0f} MW'
           + (f'; {left:+.0f} MW could not be placed and stays on the swing.' if abs(left) >= 1.0 else '.'))
     return {'Gen': pd.DataFrame({'MWSetPoint': new, 'MWSetPoint_Seed': seed}),
             'Load': pd.DataFrame(columns=LOAD_P + ['P_Seed'], dtype=float)}
@@ -870,10 +920,12 @@ def mw_changes(moved: dict[str, pd.DataFrame]) -> dict[str, float]:
     return {'Gen MW Change': (moved['Gen']['MWSetPoint'] - moved['Gen']['MWSetPoint_Seed']).sum(),
             'Load MW Change': (moved['Load'][LOAD_P].sum(axis=1) - moved['Load']['P_Seed']).sum()}
 
-def balance_swing(SimAuto, scaled: dict[str, pd.DataFrame] | None = None, tables: list | None = None) -> list[scale.Run]:
+def balance_swing(SimAuto, scaled: dict[str, pd.DataFrame] | None = None, tables: list | None = None,
+                  epc: pd.DataFrame | None = None) -> list[scale.Run]:
     """
-    With the case open: moves what is left on the swing onto the whole case's gen (see
-    balance_targets()), round after round until it is within BALANCE_TOL_MW. Returns a scale.Run per round that ran
+    With the case open: moves the swing onto the whole case's gen (see balance_targets()) until it is within
+    BALANCE_TOL_MW of its goal (swing_goal(): 0 for the giant swing; the case's own slack gens at their EPC MW where
+    their key is in the EPC (`epc`, swing_epc()), else anywhere within their limits). Returns a scale.Run per round that ran
     (`balance<N>`; the swing after a round is the next round's, or the end swing).
     scaled: the main scaling's tables, so units it held back or excluded are left alone here too (balance_skips()).
     tables: if a list, each round's balance_targets() tables (after scaling) are appended to it, for areas().
@@ -884,11 +936,14 @@ def balance_swing(SimAuto, scaled: dict[str, pd.DataFrame] | None = None, tables
     for i in range(BALANCE_MAX_ROUNDS):
         final = read_case(SimAuto)
         swing, swing_buses = swing_mw(final['Gen'], slack)
-        print(f'----- Balancing round {i + 1}: swing at {swing:.1f} MW -----')
-        if abs(swing) < BALANCE_TOL_MW:
+        lo, hi = swing_goal(final['Gen'], slack, epc)
+        print(f'----- Balancing round {i + 1}: swing at {swing:.1f} MW' + (f' (goal {lo:.0f} to {hi:.0f} MW)' if (lo, hi) != (0.0, 0.0) else '') + ' -----')
+        if lo - BALANCE_TOL_MW < swing < hi + BALANCE_TOL_MW:
             exhausted = False
             break
-        targets = balance_targets(final, swing, swing_buses, balance_skips(SimAuto, final, scaled))
+        m = min(BALANCE_TOL_MW, (hi - lo) / 2)
+        aim = float(np.clip(swing, lo + m, hi - m))
+        targets = balance_targets(final, swing - aim, swing_buses, balance_skips(SimAuto, final, scaled))
         if tables is not None:
             tables.append(targets)
         run = scale.Run(f'balance{i + 1}', moved=targets, before=swing)
@@ -1007,21 +1062,30 @@ def midrun_balancer(SimAuto):
     Returns (after_step, runs) for scale.iterate_to_gen_load_targets(). After each step, if the swing is outside
     its band (swing_band()), moves it onto the whole case's gen (balance_targets()), and keeps that in
     the scaling still to come (rescale_targets()). If a balance leaves the swing outside the band (e.g. gens at MWMax),
-    the band is widened to where it got to, plus a margin (BALANCE_TRIGGER_MW, or 10% of the band if that's 0), so the
-    next balance waits until the swing has moved that much further. The swing itself is never moved.
-    A balance aims the swing at 0 MW, or at the nearest point a quarter of the band inside its edges if 0 is not there.
+    the band is widened to where it got to, plus a margin (the giant swing: BALANCE_TRIGGER_MW, or 10% of the band if
+    that's 0; the case's own slack: 10% of its limits), so the next balance waits until the swing has moved that much
+    further. The swing itself is never moved. A balance aims the giant swing at 0 MW, or at the nearest point a quarter
+    of the band inside its edges if 0 is not there; the case's own slack just back inside the middle half of its
+    limits (the final balance, balance_swing(), takes it to its goal).
     runs: a scale.Run per balance (`midrun<N>`), filled in as they run.
     """
     slack = prep.slack_buses(SimAuto)
-    lo, hi = swing_band(pw.get_df(SimAuto, 'Gen', GEN_FIELDS), slack)
+    gen0 = pw.get_df(SimAuto, 'Gen', GEN_FIELDS)
+    lo, hi = swing_band(gen0, slack)
+    own_slack = len(swing_units(gen0, slack)) and not (swing_units(gen0, slack)['ID'] == prep.SWING_ID).any()
     if not (np.isfinite(lo) or np.isfinite(hi)):
         print('Midrun balancing off: balance_trigger_mw is 0 and balance_at_swing_limits is false.')
-    # Balance to a point inside the band, not to 0: with a swing whose MWMin is 0, 0 is the band's edge, and the next
-    # step down would set off another balance. The final balance still takes the swing to 0.
-    if np.isfinite(lo) and np.isfinite(hi):
-        aim = float(np.clip(0.0, lo + 0.25 * (hi - lo), hi - 0.25 * (hi - lo)))
-    else:
-        aim = float(np.clip(0.0, lo, hi))
+
+    def aim_for(swing):
+        # Balance to a point inside the band, not to its edge, so the next small drift doesn't set off another balance.
+        if own_slack:       # The case's own slack: just back inside the middle half of its limits (the final balance
+            if np.isfinite(lo) and np.isfinite(hi):     # takes it to its EPC MW).
+                return float(np.clip(swing, lo + 0.25 * (hi - lo), hi - 0.25 * (hi - lo)))
+            return float(np.clip(swing, lo, hi))
+        # The giant swing: 0, or with a swing whose MWMin is 0 (0 is the band's edge) a quarter of the band inside.
+        if np.isfinite(lo) and np.isfinite(hi):
+            return float(np.clip(0.0, lo + 0.25 * (hi - lo), hi - 0.25 * (hi - lo)))
+        return float(np.clip(0.0, lo, hi))
     state = {'lo': lo, 'hi': hi}
     runs: list[scale.Run] = []
 
@@ -1032,7 +1096,7 @@ def midrun_balancer(SimAuto):
             return
         print(f'----- Swing at {swing:.1f} MW, outside {state["lo"]:.0f} to {state["hi"]:.0f} MW: balancing onto gen -----')
         final = {'Load': pw.get_df(SimAuto, 'Load', LOAD_FIELDS), 'Gen': gen}
-        moved = balance_targets(final, swing - aim, swing_buses, balance_skips(SimAuto, final, targets))
+        moved = balance_targets(final, swing - aim_for(swing), swing_buses, balance_skips(SimAuto, final, targets))
         label = f'Balance {len(runs) + 1} (main scaling at {progress} of {scale.RESOLUTION})'
         run = scale.Run(f'midrun{len(runs) + 1}', moved=moved, before=swing, at=f'{progress} of {scale.RESOLUTION}')
         runs.append(run)
@@ -1049,7 +1113,7 @@ def midrun_balancer(SimAuto):
         run.after = after
         if not lo <= after <= hi:
             finite = np.isfinite(lo) and np.isfinite(hi)
-            margin = BALANCE_TRIGGER_MW or (0.1 * (hi - lo) if finite else 0.0)
+            margin = (0.1 * (hi - lo) if finite else 0.0) if own_slack or not BALANCE_TRIGGER_MW else BALANCE_TRIGGER_MW
             state['lo'], state['hi'] = min(lo, after - margin), max(hi, after + margin)
             notes.append(f'band widened to {state["lo"]:.0f}..{state["hi"]:.0f} MW')
         else:

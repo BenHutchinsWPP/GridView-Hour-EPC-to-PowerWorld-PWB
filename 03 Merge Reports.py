@@ -13,6 +13,7 @@ def _hour_row(hour: str, sheets: dict[str, pd.DataFrame]) -> dict:
     row = dict.fromkeys(HOUR_COLUMNS, np.nan)
     row['Hour'] = hour
     runs = sheets.get('runs')
+    # Near 0 with a giant swing; with the case's own slack, its end MW (its goal is its EPC MW, or within its limits).
     row['Final Swing MW'] = runs['Swing MW After'].iloc[-1] if runs is not None and len(runs) else np.nan
     areas = sheets.get('areas')
     if areas is not None and len(areas):

@@ -4,6 +4,7 @@ branch statuses, distributed generation loads). Step 02 targets each gen & load 
 The preparation both modes share is in prep.py.
 """
 from pathlib import Path
+import numpy as np
 import pandas as pd
 from . import prep, pw, scale
 
@@ -418,7 +419,8 @@ TARGET_FIELDS = {
     table: {'ObjectID': str, 'BusNum': int, 'BusName': str, 'NomkV': float, 'ID': str,
             **{s: str for s in scale.STATUS[table]}, **{c: float for c in scale.SCALED[table]},
             # Gens: the swing balances raise them up to MWMax, spread by area & GenType like area mode.
-            **({'MWMax': float, 'AreaNumber': int, 'UnitTypeCode': str, 'FuelTypeCode': str} if table == 'Gen' else {})}
+            **({'MW': float, 'MWMin': float, 'MWMax': float, 'AreaNumber': int, 'UnitTypeCode': str, 'FuelTypeCode': str}
+               if table == 'Gen' else {})}
     for table in scale.STATUS
 }
 
@@ -451,6 +453,7 @@ def build_targets(gv: dict[str,pd.DataFrame], case: dict[str,pd.DataFrame], swin
 
         fields = [*statuses, *scale.SCALED[table]]
         df = case[table].merge(gv_df[['ObjectID', *fields]], on='ObjectID', how='left', suffixes=('', '_Target'))
+        df['In EPC'] = df['ObjectID'].isin(gv_df['ObjectID'])
         for f in fields:
             df[f'{f}_Seed'] = df[f]
 
@@ -470,3 +473,16 @@ def build_targets(gv: dict[str,pd.DataFrame], case: dict[str,pd.DataFrame], swin
     gen_df.loc[swing, 'Status_Target'] = 'Closed'
     scale.exclude(gen_df, swing, 'Swing Unit')
     return targets
+
+def swing_epc(targets: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """
+    area.swing_epc() for topology targets: the case's own slack gens (Closed in the seed) whose key is in the EPC, with
+    'Seed MW' (its solved MW) and 'EPC MW' (kept within its MWMin to MWMax). Empty if there is a giant swing.
+    """
+    g = targets['Gen']
+    if (g['ID'] == prep.SWING_ID).any():
+        return pd.DataFrame(columns=['Seed MW', 'EPC MW'], dtype=float)
+    s = g[(g['ExclusionReason'] == 'Swing Unit') & g['In EPC'] & (g['Status_Seed'] == 'Closed')]
+    lo = s[['MWMin', 'MWMax']].min(axis=1).fillna(-np.inf)
+    hi = s[['MWMin', 'MWMax']].max(axis=1).fillna(np.inf)
+    return pd.DataFrame({'Seed MW': s['MW'].astype(float), 'EPC MW': s['MWSetPoint_Target'].astype(float).clip(lower=lo, upper=hi)})

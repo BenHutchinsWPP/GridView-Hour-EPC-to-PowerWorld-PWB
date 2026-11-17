@@ -966,7 +966,43 @@ def test_slack_bus_gens_are_the_swing_when_there_is_no_giant_swing():
     scale.iterate_to_gen_load_targets(sa, load_ramp_targets(), after_step=after_step)
     assert len(log) >= 1 and ('Gen', '9') not in sa.applied
     area.balance_swing(sa)
-    assert abs(area.swing_mw(sa.table('Gen'), [9])[0]) < area.BALANCE_TOL_MW and ('Gen', '9') not in sa.applied
+    # s1's key isn't in the EPC: it only has to end within its limits (0 to 1000 MW), not at 0.
+    assert -area.BALANCE_TOL_MW < area.swing_mw(sa.table('Gen'), [9])[0] < 1000 + area.BALANCE_TOL_MW
+    assert ('Gen', '9') not in sa.applied
+
+def test_own_slack_ends_at_its_epc_mw_when_its_key_is_in_the_epc():
+    gen = gens([('s1', 1, '1', 'Closed', 'GT', 100.0, 1000.0, 0.0), ('g1', 1, '2', 'Closed', 'GT', 100.0, 5000.0, 0.0),
+                ('g2', 1, '3', 'Closed', 'HY', 100.0, 5000.0, 0.0)]).assign(BusNum=[9, 1, 2], MW=0.0, NomkV=230.0, BusName='b')
+    load = loads([('l1', 1, 'Closed', 200.0, 0.0, 0.0, 20.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
+    epc_gen = gens([('s1', 1, '1', 'Closed', 'GT', 300.0, 1000.0, 0.0)]).assign(BusNum=9)
+    swing = area.swing_epc(epc_gen, gen.assign(MW=[150.0, 0.0, 0.0]), [9])
+    assert swing.to_dict('index') == {'s1': {'Seed MW': 150.0, 'EPC MW': 300.0}}
+    assert area.swing_goal(gen, [9], swing) == (300.0, 300.0) and area.swing_goal(gen, [9]) == (0.0, 1000.0)
+    giant = pd.concat([gen, gens([('xx', 1, 'xx', 'Closed', '', 0.0, 2e4, -2e4)]).assign(BusNum=9)])
+    assert area.swing_epc(epc_gen, giant, [9]).empty and area.swing_goal(giant, [9], swing) == (0.0, 0.0)
+    sa = SwingSimAuto(gen, load, slack=[9])
+    after_step, log = area.midrun_balancer(sa)
+    scale.iterate_to_gen_load_targets(sa, load_ramp_targets(), after_step=after_step)
+    area.balance_swing(sa, epc=swing)
+    assert abs(area.swing_mw(sa.table('Gen'), [9])[0] - 300.0) < area.BALANCE_TOL_MW and ('Gen', '9') not in sa.applied
+    # The goal stays within the slack's limits: an EPC MW past MWMax, or a slack Open in the EPC (0) under MWMin 50.
+    lim = gen.assign(MWMin=[50.0, 0.0, 0.0])
+    assert area.swing_goal(lim, [9], pd.DataFrame({'EPC MW': [1500.0]}, index=['s1'])) == (1000.0, 1000.0)
+    assert area.swing_epc(epc_gen.assign(Status='Open'), lim.assign(MW=150.0), [9]).loc['s1', 'EPC MW'] == 50.0
+    assert area.swing_goal(lim.assign(MWMax=np.nan), [9]) == (50.0, np.inf)               # A blank limit: unlimited.
+    assert area.swing_band(lim.assign(MWMin=2000.0), [9]) == (1000.0, 2000.0)             # Swapped limits: in order.
+    # Topology: the same, from its targets.
+    tg = targets_df(ObjectID=['s1', 's2', 'g1'], ID='1', MW=[150.0, 10.0, 0.0], MWMin=[0.0, 0.0, 0.0], MWMax=[1000.0, 100.0, 500.0],
+                    Status_Seed='Closed', MWSetPoint_Target=[300.0, 500.0, 10.0], **{'In EPC': [True, True, True]})
+    tg['ExclusionReason'] = ['Swing Unit', 'Swing Unit', '']
+    assert topo.swing_epc({'Gen': tg}).to_dict('index') == {'s1': {'Seed MW': 150.0, 'EPC MW': 300.0}, 's2': {'Seed MW': 10.0, 'EPC MW': 100.0}}
+    assert topo.swing_epc({'Gen': tg.assign(ID=['xx', '1', '1'])}).empty
+    # The pre-balance makes up the slack's move too: seed 150 -> EPC 300 leaves 150 MW less for the other gens.
+    t = load_ramp_targets()
+    t['Load']['SMW_Target'] = 200.0
+    t['Gen']['MWSetPoint'], t['Gen']['MWSetPoint_Target'], t['Gen']['MWMax'] = 400.0, 400.0, 1000.0
+    area.prebalance_targets(t, swing_change=-150.0)
+    assert t['Gen'].loc['g1', 'MWSetPoint_Target'] == 250.0 and t['Load'].loc['l1', 'SMW_Target'] == 200.0
 
 def ledger_run(mutate=None, slack=(99,), makeup=False):
     """Midrun + final balances, a diverging gen (g3, bus 4) and the areas sheet of the result. slack: slack buses (99 has xx)."""
@@ -1460,7 +1496,7 @@ def test_step_02_estimates_losses_and_clears_untouched_dist_gen():
         sa.losses, sa.count_dist = {1: 10.0}, True
         moves = []
         real = area.prebalance_targets
-        area.prebalance_targets = lambda t, loss_change=0.0: moves.append(loss_change) or real(t, loss_change)
+        area.prebalance_targets = lambda t, loss_change=0.0, **k: moves.append(loss_change) or real(t, loss_change, **k)
         try:
             step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')
         finally:
@@ -1535,7 +1571,7 @@ def test_step_02_excludes_units_outside_the_main_island_before_the_prebalance():
         seen = []
         real_pb, real_write = area.prebalance_targets, pw.write_excel
         plans = []
-        area.prebalance_targets = lambda t, loss_change=0.0: seen.append(t['Gen'].loc['h1', 'ExclusionReason']) or real_pb(t, loss_change)
+        area.prebalance_targets = lambda t, loss_change=0.0, **k: seen.append(t['Gen'].loc['h1', 'ExclusionReason']) or real_pb(t, loss_change, **k)
         step.pw.write_excel = lambda fp, sheets: plans.append({k: v.copy() for k, v in sheets.items()}) or real_write(fp, sheets)
         try:
             step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')

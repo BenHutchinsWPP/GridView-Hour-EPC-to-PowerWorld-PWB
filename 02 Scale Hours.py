@@ -62,7 +62,8 @@ def create_case(SimAuto, gv_fp, out_fp):
     if area_mode:
         targets, reports = area.compute_targets(SimAuto, gv_fp, pw_fp)
     else:
-        targets, reports = topo.compute_pw_targets(SimAuto, gv_fp, pw_fp, dummy_bus_fp), {}
+        targets = topo.compute_pw_targets(SimAuto, gv_fp, pw_fp, dummy_bus_fp)
+        reports = {'swing': topo.swing_epc(targets)}
     pretest = []
     if run['pretest_gens']:
         gen_df = targets['Gen'] = scale.test_gen_targets_parallel(pw_fp, targets['Gen'])
@@ -79,7 +80,9 @@ def create_case(SimAuto, gv_fp, out_fp):
         if losses is not None and len(losses):
             print(f'Losses: seed {losses["Seed Loss MW"].sum():,.0f} MW, estimated {losses["Est. Loss MW"].sum():,.0f} MW '
                   f'at the target load (loss_exponent {area.LOSS_EXPONENT:g}).')
-        moved = area.prebalance_targets(targets, loss_change)
+        # The case's own slack gens whose key is in the EPC end at their EPC MW: the other gens make up their move.
+        swing_change = float((reports['swing']['Seed MW'] - reports['swing']['EPC MW']).sum())
+        moved = area.prebalance_targets(targets, loss_change, swing_change=swing_change)
         if moved is not None:
             pre_runs = [scale.Run('prebalance', moved=moved, note='targets moved before scaling')]
     log_fp = out_dir / (gv_fp.stem + '_Log.xlsx')
@@ -127,7 +130,7 @@ def create_case(SimAuto, gv_fp, out_fp):
             makeup_tables.clear()
             runs.append(scale.Run('makeup', note=f'failed: {e!r}'))
     if run['balance_swing']:
-        runs += area.balance_swing(SimAuto, targets, tables=balance_tables)
+        runs += area.balance_swing(SimAuto, targets, tables=balance_tables, epc=reports['swing'])
     # Read back from PowerWorld, so the log shows what the case holds rather than what the scaling meant to do.
     final = area.read_case(SimAuto) if area_mode else {t: pw.get_df(SimAuto, t, f) for t, f in topo.TARGET_FIELDS.items()}
     final_loss = area.area_losses(SimAuto) if area_mode else None      # The areas sheet's Final Loss MW.

@@ -17,7 +17,8 @@ create_giant_swing = true
 swing_bus = "slack"
 # Move MW off the swing onto the whole case's gen (load is never moved; one factor on every gen, so each area & GenType
 # moves by the same share): during scaling whenever the swing is further than
-# [area] balance_trigger_mw from 0, and after scaling until it is ~0 MW. The swing unit itself is never moved.
+# [area] balance_trigger_mw from 0, and after scaling until it is at its goal: the giant swing 0 MW; the case's own slack
+# its EPC MW if its key is in the EPC, else anywhere within its MWMin..MWMax. The swing unit itself is never moved.
 balance_swing = true
 
 # Seed preparation (step 01).
@@ -53,8 +54,9 @@ loss_exponent = 2.0
 makeup = true
 balance_tol_mw = 1.0
 balance_max_rounds = 10
-# While scaling, balance once the swing goes outside its band: further than balance_trigger_mw from 0 (0 = not used),
-# or (balance_at_swing_limits) past the swing unit's own MWMax / MWMin. With both, whichever comes first.
+# While scaling, balance once the giant swing goes outside its band: further than balance_trigger_mw from 0 (0 = not
+# used), or (balance_at_swing_limits) past its MWMax / MWMin. With both, whichever comes first. Without a giant swing,
+# the case's own slack is balanced only once it goes past its own MWMin / MWMax (these two settings don't apply).
 balance_trigger_mw = 1000.0
 balance_at_swing_limits = false
 # Stop before scaling if more than this share of the EPC's generation (|MW|) has no GenType (its unit and fuel codes are
