@@ -196,6 +196,15 @@ def island_reason(df: pd.DataFrame, island_by_bus: pd.Series | None) -> pd.Serie
     reason = island.map(lambda i: 'No island' if pd.isna(i) else f'Island {int(i)}, not the main island')
     return reason.where(island != MAIN_ISLAND, '').astype(object)
 
+def epc_off_island(df: pd.DataFrame, island_by_bus: pd.Series | None) -> pd.Series:
+    """
+    Per EPC row: True if its bus is in the seed but outside the main island (a blank island too). A bus not in the seed
+    is False: the PWB has nothing there to turn off, so the EPC row keeps counting. All False without island_by_bus.
+    """
+    if island_by_bus is None or not len(df):
+        return pd.Series(False, index=df.index)
+    return df['BusNum'].isin(island_by_bus.index) & (df['BusNum'].map(island_by_bus) != MAIN_ISLAND)
+
 def is_island_reason(reason: pd.Series) -> pd.Series:
     return reason.astype(str).str.startswith(('Island ', 'No island'))
 

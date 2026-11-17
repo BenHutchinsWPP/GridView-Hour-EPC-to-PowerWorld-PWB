@@ -1685,7 +1685,7 @@ def test_balance_skips_units_outside_the_main_island():
 
 def test_step_02_excludes_units_outside_the_main_island_before_the_prebalance():
     # h1 (bus 2) is in island 2: excluded with that reason, turned off before scaling, not counted by the pre-balance.
-    # The EPC's 50 MW of Hydro has no main-island unit left to take it: Unmet, and the areas row adds up.
+    # The EPC's e2 (50 MW Hydro) sits on bus 2 too: left out of the targets, so Hydro has Target 0, Unmet 0, and the Note says both.
     gen, load = two_cases()
     epc_gen = gens([('e1', 1, '1', 'Closed', 'GT', 150.0, 1000.0, 0.0), ('e2', 1, '2', 'Closed', 'HY', 50.0, 1000.0, 0.0)]).assign(BusNum=[1, 2], MW=0.0, NomkV=230.0, BusName='b')
     epc_load = loads([('e1', 1, 'Closed', 300.0, 0.0, 0.0, 30.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
@@ -1709,8 +1709,37 @@ def test_step_02_excludes_units_outside_the_main_island_before_the_prebalance():
     exc = sheets['exceptions'].set_index('ObjectID')
     assert exc.loc['h1', 'Reason'] == 'main: Island 2, not the main island'
     hydro = sheets['areas'].set_index('Group').loc['Hydro']
-    assert (hydro['Seed MW'], hydro['Unmet MW'], hydro['Final MW']) == (0.0, 50.0, 0.0)
+    assert (hydro['Seed MW'], hydro['Target MW'], hydro['Unmet MW'], hydro['Final MW']) == (0.0, 0.0, 0.0, 0.0)
     assert 'outside main island, turned off: 100.0 MW' in hydro['Note'] and 'unexplained' not in hydro['Note']
+    assert 'EPC outside main island, left out: 50.0 MW' in hydro['Note']
+
+def test_epc_units_on_islanded_seed_buses_are_left_out_of_the_targets():
+    # (a) EPC hydro e2 and EPC load e2 on bus 2 (island 2) are out of Target MW and the Note says so; (c) bus 4 has a blank
+    # island: dropped; (b) EPC X1 on bus 77 (not in the seed) still counts, netted when negative. Not counted in the Note:
+    # an Open EPC gen, a DC tie, a non-conforming load.
+    case_gen = gens([('h1', 1, '1', 'Closed', 'HY', 100.0, 200.0, 0.0), ('h2', 1, '2', 'Closed', 'HY', 100.0, 200.0, 0.0)]).assign(BusNum=[1, 2])
+    epc_gen = gens([('e1', 1, '1', 'Closed', 'HY', 150.0, 200.0, 0.0), ('e2', 1, '2', 'Closed', 'HY', 40.0, 200.0, 0.0),
+                    ('e3', 1, '3', 'Closed', 'HY', 30.0, 200.0, 0.0), ('e4', 1, '4', 'Open', 'HY', 20.0, 200.0, 0.0),
+                    ('e5', 1, '5', 'Closed', 'DC', 10.0, 200.0, -200.0)]).assign(BusNum=[1, 2, 4, 2, 2])
+    case_load = loads([('l1', 1, 'Closed', 100.0, 0.0, 0.0, 10.0)])
+    epc_load = loads([('l1', 1, 'Closed', 120.0, 0.0, 0.0, 10.0), ('e2', 1, 'Closed', 50.0, 0.0, 0.0, 5.0),
+                      ('X1', 1, 'Closed', -30.0, 0.0, 0.0, 0.0), ('nc', 1, 'Closed', 7.0, 0.0, 0.0, 0.0)]).assign(BusNum=[1, 2, 77, 2])
+    epc_load.loc[3, 'AGC'] = 'NO'
+    islands = pd.Series([1.0, 2.0, np.nan], index=[1, 2, 4])
+    with saved_settings():
+        area.SCALE_NONCONFORMING = False
+        targets, reports = area.build_targets({'Gen': epc_gen, 'Load': epc_load}, {'Gen': case_gen, 'Load': case_load}, island_by_bus=islands)
+    g = reports['area_gen'].set_index('GenType')
+    assert g.loc['Hydro', 'Target MW'] == 150.0                                  # e2 (40) and e3 (30, blank island) are out.
+    assert reports['area_load'].set_index('AreaNumber').loc[1, 'Target MW'] == 90.0     # 120 - 30 netted; e2 (50) out; nc not counted.
+    assert reports['islanded_epc'].to_dict() == {(1, 'Hydro'): 70.0, (1, 'Load'): 50.0}
+    out = area.areas(None, reports, targets).set_index('Group')
+    assert 'EPC outside main island, left out: 70.0 MW' in out.loc['Hydro', 'Note']
+    assert 'EPC outside main island, left out: 50.0 MW' in out.loc['Load', 'Note']
+    # (d) Without islands nothing is left out.
+    targets, reports = area.build_targets({'Gen': epc_gen, 'Load': epc_load}, {'Gen': case_gen, 'Load': case_load})
+    assert reports['islanded_epc'].empty and reports['area_gen'].set_index('GenType').loc['Hydro', 'Target MW'] == 220.0
+    assert scale.epc_off_island(epc_load, None).sum() == 0
 
 def test_islanded_units_take_no_share_of_the_area_targets():
     # Two hydro units at 100 MW, h2 in island 2. The EPC's 150 MW all goes to h1; h2 stays at 100, excluded.

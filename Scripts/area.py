@@ -510,8 +510,23 @@ def build_targets(epc: dict[str, pd.DataFrame], case: dict[str, pd.DataFrame], s
     (the main island's units carry the whole area target), and are left out of the area seed totals, like
     non-conforming loads. Those Closed in the seed are added back as excluded rows targeted Open at 0 MW (turned off
     before scaling), so the log names them (scale.island_reason()); reports['islanded'] has their seed MW per
-    (AreaNumber, Group).
+    (AreaNumber, Group). The EPC's gens/loads on such buses are left out of the targets too (scale.epc_off_island(); an
+    EPC bus not in the seed keeps counting): reports['islanded_epc'] has the MW the targets would have counted
+    (Closed; not DC ties, swing-bus gens, or non-conforming loads) per (AreaNumber, Group).
     """
+    epc = dict(epc)
+    off = {t: scale.epc_off_island(epc[t], island_by_bus) for t in ('Gen', 'Load')}
+    og, ol = epc['Gen'][off['Gen']], epc['Load'][off['Load']]
+    og = scalable_gens(og)
+    og = og[closed(og) & ~og['BusNum'].isin(swing_buses)]
+    ol = ol[closed(ol)]
+    if not SCALE_NONCONFORMING:
+        ol = ol[conforming(ol)]
+    islanded_epc = pd.concat([_by_group(og, og['MWSetPoint'].fillna(0.0), classify_gen_type(og)), _by_group(ol, ol['SMW'].fillna(0.0))])
+    if off['Gen'].any() or off['Load'].any():
+        print(f"EPC: {off['Gen'].sum()} gens ({og['MWSetPoint'].sum():.1f} MW) and {off['Load'].sum()} loads ({ol['SMW'].sum():.1f} MW) "
+              f"on buses outside the seed's main island left out of the targets.")
+    epc = {t: epc[t][~off[t]] for t in ('Gen', 'Load')}
     case_reason = {t: scale.island_reason(case[t], island_by_bus) for t in ('Gen', 'Load')}
     islanded = {t: case[t][case_reason[t] != ''].assign(ExclusionReason=case_reason[t]) for t in ('Gen', 'Load')}
     case = {t: case[t][case_reason[t] == ''] for t in ('Gen', 'Load')}
@@ -538,7 +553,7 @@ def build_targets(epc: dict[str, pd.DataFrame], case: dict[str, pd.DataFrame], s
     off_swing = lambda df: df[~df['BusNum'].isin(swing_buses)]
     gen, gen_report = gen_targets(off_swing(epc['Gen']), off_swing(case['Gen']))
     gen, load, islanded_mw = _add_islanded(gen, load, islanded['Gen'], islanded['Load'])
-    return {'Gen': gen, 'Load': load}, {'area_load': load_report, 'area_gen': gen_report, 'islanded': islanded_mw,
+    return {'Gen': gen, 'Load': load}, {'area_load': load_report, 'area_gen': gen_report, 'islanded': islanded_mw, 'islanded_epc': islanded_epc,
                                         'nonconforming': nonc_ids, 'swing': swing_epc(epc['Gen'], case['Gen'], swing_buses)}
 
 def _nonconforming_report(load_report: pd.DataFrame, case_nonc: pd.DataFrame, keyed: pd.Series,
@@ -684,7 +699,7 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
         parts['Online Final'] = _by_group(gen, 1.0, classify_gen_type(gen)).add(_by_group(load, 1.0), fill_value=0.0)
 
     index = plan.index
-    for s in parts.values():
+    for s in [*parts.values(), reports.get('islanded', pd.Series(dtype=float)), reports.get('islanded_epc', pd.Series(dtype=float))]:
         index = index.union(s.index)
     loss = reports.get('area_loss', pd.DataFrame(columns=['Seed Loss MW', 'Est. Loss MW'], dtype=float))
     if final_loss is not None:
@@ -724,7 +739,9 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
                     .reindex(index).fillna(0.0))
     note = pd.Series([('outside main island, turned off: ' + (f'{mw - on:.1f} MW' if not on else f'{mw:.1f} MW, of which {on:.1f} MW stayed on'))
                       if mw else '' for mw, on in zip(islanded, still_on)], index=index)
-    out['Note'] = ['; '.join(filter(None, [n, i])) for n, i in zip(out['Note'], note)]
+    epc_off = reports.get('islanded_epc', pd.Series(dtype=float)).reindex(index).fillna(0.0)
+    epc_note = ['EPC outside main island, left out: ' + f'{mw:.1f} MW' if mw else '' for mw in epc_off]
+    out['Note'] = ['; '.join(filter(None, [n, i, e])) for n, i, e in zip(out['Note'], note, epc_note)]
     return out.reset_index()[AREAS_COLUMNS]
 
 def _area_notes(out: pd.DataFrame, plan: pd.DataFrame, ledger: pd.Series) -> list[str]:
