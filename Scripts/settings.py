@@ -87,6 +87,8 @@ def load(fp: Path = DEFAULT_FP) -> dict:
         raise ValueError(f'{fp}: [run] mode must be one of {MODES}, not {run["mode"]!r}')
     if not (run['swing_bus'] in ('slack', 'max_fault_duty') or type(run['swing_bus']) is int):
         raise ValueError(f"{fp}: [run] swing_bus must be 'slack', 'max_fault_duty' or a bus number")
+    if area.LOSS_EXPONENT < 0:
+        raise ValueError(f'{fp}: [area] loss_exponent must be 0 or more, not {area.LOSS_EXPONENT}')
     gen_types = set(area.GEN_TYPES)
     bad = {v for m in (area.UNIT_GENTYPE, area.FUEL_GENTYPE) for v in m.values() if v is not None and v not in gen_types}
     bad |= (area.ALL_ON_TYPES | area.OFF_AT_ZERO_TYPES) - gen_types

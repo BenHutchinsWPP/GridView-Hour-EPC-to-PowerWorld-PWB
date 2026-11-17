@@ -6,7 +6,7 @@ GridView hour. Gens are brought online or taken offline only to suit each bucket
 The targets are:
 - Load, per AreaNumber: the EPC's total load MW and Mvar (constant power + current + impedance, at nominal voltage,
   Closed loads only; the EPC's distributed generation is ignored, as in pcm-to-pf).
-  In the PWB, distributed generation is set Open & 0, constant current and impedance load go to 0, and the constant
+  In the PWB, distributed generation is set Open & 0 (on loads not scaled too: dist_gen_cleanup(), after scaling), constant current and impedance load go to 0, and the constant
   power MW / Mvar are scaled so the area total matches. Each load's starting share is its S + I + Z total.
   Positive and negative load are matched separately: each area's positive loads are scaled to the EPC's positive total
   for that area, and its negative loads (DC converters, generation modelled as load) to the EPC's negative total.
@@ -420,13 +420,24 @@ def build_targets(epc: dict[str, pd.DataFrame], case: dict[str, pd.DataFrame], s
     gen, gen_report = gen_targets(off_swing(epc['Gen']), off_swing(case['Gen']))
     return {'Gen': gen, 'Load': load}, {'area_load': load_report, 'area_gen': gen_report}
 
-def open_load_cleanup(case_load: pd.DataFrame) -> pd.DataFrame:
-    """Open loads with distributed generation left on: set it Open & 0 (no effect on the solution)."""
-    df = case_load[~closed(case_load) & (conforming(case_load) | SCALE_NONCONFORMING) & ((case_load['DistStatus'] == 'Closed') | (case_load['DistMWInput'] != 0) | (case_load['DistMvarInput'] != 0))]
-    return df.assign(DistStatus='Open', DistMWInput=0.0, DistMvarInput=0.0)
+def dist_gen_cleanup(case_load: pd.DataFrame) -> pd.DataFrame:
+    """
+    Every load with distributed generation still on: set it Open & 0. GridView ignores distributed generation, so no
+    hour keeps any. Step 02 writes it after the main scaling, before the final balance (which takes up what it removes):
+    by then it is left only on loads the scaling never touched (Open, non-conforming) or didn't finish (held, excluded).
+    dist_gen_removed() is what that takes off the case.
+    """
+    on = (case_load['DistStatus'] == 'Closed') | (case_load['DistMWInput'] != 0) | (case_load['DistMvarInput'] != 0)
+    df = case_load[on]
+    return df.assign(DistStatus='Open', DistMWInput=0.0, DistMvarInput=0.0, DistMW_Seed=df['DistMWInput'].where(
+        closed(df) & (df['DistStatus'] == 'Closed'), 0.0))
+
+def dist_gen_removed(cleanup: pd.DataFrame) -> float:
+    """MW of distributed generation a dist_gen_cleanup() table takes off the case (it injected only where Closed)."""
+    return float(cleanup['DistMW_Seed'].sum()) if len(cleanup) else 0.0
 
 AREAS_COLUMNS = ['AreaNumber', 'Group', 'Seed MW', 'Target MW', 'Unmet MW', 'Not Reached MW', 'Balance MW', 'Final MW', 'Error MW',
-                 'Target Mvar', 'Final Mvar', 'Online Seed', 'Online Final', 'Note']
+                 'Target Mvar', 'Final Mvar', 'Online Seed', 'Online Final', 'Seed Loss MW', 'Est. Loss MW', 'Final Loss MW', 'Note']
 LEDGER_TOL_MW = 1.0     # A row's Final further than this from its ledger is noted as unexplained.
 
 def _by_group(df: pd.DataFrame, value, group=None) -> pd.Series:
@@ -443,7 +454,7 @@ def _gen_group(df: pd.DataFrame) -> pd.Series:
     return classify_gen_type(df) if len(df) else pd.Series(dtype=object)
 
 def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame], targets: dict[str, pd.DataFrame] | None = None,
-          balance_tables=(), swing_buses=()) -> pd.DataFrame:
+          balance_tables=(), swing_buses=(), final_loss: pd.Series | None = None) -> pd.DataFrame:
     """
     The `areas` sheet: a row per (AreaNumber, Group), Group a GenType or 'Load' (AREAS_COLUMNS). The ledger per row:
         Final = Target - Unmet - Not Reached + Balance
@@ -453,6 +464,8 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
     final: read_case() of the scaled case, or None before scaling (Final columns blank). targets: the main tables after
     scaling (None: nothing reached or balanced). balance_tables: balance_targets() tables of the final balance rounds,
     after scaling (balance_swing(..., tables=)). Gens on swing_buses are left out, as in build_targets().
+    Losses go on each area's Load row: Seed and Est. from reports['area_loss'] (loss_estimate()), Final from final_loss
+    (area_losses() of the scaled case). An area with losses but no load gets a Load row for them.
     """
     key = ['AreaNumber', 'Group']
     plan = pd.concat([reports['area_gen'].rename(columns={'GenType': 'Group'}),
@@ -486,6 +499,12 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
     index = plan.index
     for s in parts.values():
         index = index.union(s.index)
+    loss = reports.get('area_loss', pd.DataFrame(columns=['Seed Loss MW', 'Est. Loss MW'], dtype=float))
+    if final_loss is not None:
+        loss = loss.join(final_loss.rename('Final Loss MW'), how='outer')
+    loss = loss[(loss.fillna(0.0) != 0).any(axis=1)]
+    if len(loss):
+        index = index.union(pd.MultiIndex.from_arrays([loss.index, ['Load'] * len(loss)], names=key))
     index = index.sort_values()
     out = pd.DataFrame(index=index)
     for c in ('Seed MW', 'Target MW', 'Unmet MW', 'Target Mvar', 'Seed Online'):
@@ -500,6 +519,11 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
         out[c] = parts[c].reindex(index, fill_value=0.0) if final is not None else np.nan
     out.loc[out.index.get_level_values('Group') != 'Load', 'Final Mvar'] = np.nan
     out['Error MW'] = out['Final MW'] - out['Target MW']
+    is_load = out.index.get_level_values('Group') == 'Load'
+    areas_of = out.index.get_level_values('AreaNumber')
+    for c in ('Seed Loss MW', 'Est. Loss MW', 'Final Loss MW'):
+        col = loss[c] if c in loss else pd.Series(dtype=float)
+        out[c] = np.where(is_load, col.reindex(areas_of).to_numpy() if c in loss else np.nan, np.nan)
     ledger = out['Target MW'] - out['Unmet MW'] - out['Not Reached MW'] + out['Balance MW']
     out['Note'] = _area_notes(out, plan.reindex(index), ledger)
     return out.reset_index()[AREAS_COLUMNS]
@@ -540,8 +564,48 @@ def compute_targets(SimAuto, gv_fp, pw_fp) -> tuple[dict, dict]:
     pw.open_case(SimAuto, pw_fp)
     case = read_case(SimAuto)
     slack = prep.slack_buses(SimAuto)
+    seed_loss = area_losses(SimAuto)
     SimAuto.CloseCase()
-    return build_targets(epc, case, swing_buses=slack)
+    targets, reports = build_targets(epc, case, swing_buses=slack)
+    reports['area_loss'] = loss_estimate(targets, reports['area_load'], seed_loss)
+    return targets, reports
+
+# ------------------ Losses ------------------
+# Each area's losses are expected to go as (its target load / its seed load) ** LOSS_EXPONENT: I^2 R gives 2.
+# 0: losses are taken to stay at their seed values. The areas sheet has Seed, Est. and Final Loss MW to check it by.
+LOSS_EXPONENT = 2.0
+LOSS_RATIO_MAX = 2.0    # An area's load ratio is capped at this (a small-load area could otherwise get huge losses).
+
+def area_losses(SimAuto) -> pd.Series:
+    """LossMW of each area of the open case, by AreaNumber."""
+    df = pw.get_df(SimAuto, 'Area', {'Number': int, 'LossMW': float})
+    return pd.Series(df['LossMW'].to_numpy(), index=pd.Index(df['Number'].to_numpy(), name='AreaNumber'), dtype=float)
+
+def loss_estimate(targets: dict[str, pd.DataFrame], area_load: pd.DataFrame, seed_loss: pd.Series) -> pd.DataFrame:
+    """
+    Seed and estimated target LossMW per area (columns 'Seed Loss MW', 'Est. Loss MW', index AreaNumber). An area's load
+    is its positive Closed load MW in the targets (negative loads, e.g. DC converters, left out), plus its
+    non-conforming load when that isn't scaled (area_load's 'Seed Non-conforming MW', which keeps its seed value).
+    The ratio is capped at LOSS_RATIO_MAX (printed). An area with no seed load keeps its seed losses.
+    """
+    if LOSS_EXPONENT < 0:
+        raise ValueError(f'loss_exponent must be 0 or more, not {LOSS_EXPONENT}')
+    l = targets['Load']
+    l = l[scale.included(l)]
+    def total(suffix):
+        p = l[[c + suffix for c in LOAD_P]].sum(axis=1).where(l['Status' + suffix] == 'Closed', 0.0).clip(lower=0.0)
+        return p.groupby(l['AreaNumber']).sum()
+    fixed = pd.Series(dtype=float)
+    if not SCALE_NONCONFORMING and 'Seed Non-conforming MW' in area_load:
+        fixed = area_load.set_index('AreaNumber')['Seed Non-conforming MW'].clip(lower=0.0)
+    seed, target = total('').add(fixed, fill_value=0.0), total('_Target').add(fixed, fill_value=0.0)
+    ratio = (target / seed).where(seed > 0, 1.0).reindex(seed_loss.index, fill_value=1.0)
+    capped = ratio[ratio > LOSS_RATIO_MAX]
+    if len(capped):
+        print(f'Losses: load ratio capped at {LOSS_RATIO_MAX:g} in area(s) '
+              + ', '.join(f'{a} ({r:.1f})' for a, r in capped.items()) + '.')
+    ratio = ratio.clip(lower=0.0, upper=LOSS_RATIO_MAX)
+    return pd.DataFrame({'Seed Loss MW': seed_loss, 'Est. Loss MW': seed_loss * ratio ** LOSS_EXPONENT})
 
 # ------------------ Swing balancing ------------------
 BALANCE_TOL_MW = 1.0        # Stop balancing once the swing is within this of 0 MW...
@@ -618,21 +682,26 @@ def balance_targets(final: dict[str, pd.DataFrame], swing: float, swing_buses, s
         df['ExclusionReason'] = ''
     return {t: df.set_index('ObjectID') for t, df in targets.items()}
 
-def prebalance_targets(targets: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame] | None:
+def prebalance_targets(targets: dict[str, pd.DataFrame], loss_change: float = 0.0) -> dict[str, pd.DataFrame] | None:
     """
-    Before scaling: moves the targets so that, losses aside, scaling leaves the swing where it is. The change in
-    gen + dist gen - load from now to the targets would otherwise land on the swing as it scales (and set off a midrun
-    balance every few steps). Same rule as a balance: half onto gen (in proportion to target MW, capped at MWMax, the
-    rest onto load), half onto load (one factor on its MW and Mvar targets). Only included rows Closed in the target
-    with a positive target move. Returns the moved tables for the `runs` sheet (mw_changes()), or None if nothing moved.
+    Before scaling: moves the targets so that scaling leaves the swing where it is. The change in
+    load - gen - dist gen + losses from now to the targets would otherwise land on the swing as it scales (and set off a
+    midrun balance every few steps). Gens and loads count only while Closed (an Open one injects nothing, whatever its MW).
+    loss_change: estimated target losses less seed losses (loss_estimate()). Same rule as a balance: half onto gen (in
+    proportion to target MW, capped at MWMax, the rest onto load), half onto load (one factor on its MW and Mvar
+    targets). Only included rows Closed in the target with a positive target move. Returns the moved tables for the `runs` sheet (mw_changes()), or None if
+    nothing moved.
     """
     g, l = targets['Gen'], targets['Load']
     g_in, l_in = g[scale.included(g)], l[scale.included(l)]
-    p, p_target = l_in[LOAD_P].sum(axis=1), l_in[[f'{c}_Target' for c in LOAD_P]].sum(axis=1)
+    on = lambda df, suffix: df['Status' + suffix] == 'Closed'
+    p = l_in[LOAD_P].sum(axis=1).where(on(l_in, ''), 0.0)
+    p_target = l_in[[f'{c}_Target' for c in LOAD_P]].sum(axis=1).where(on(l_in, '_Target'), 0.0)
+    gen_mw = lambda suffix: g_in['MWSetPoint' + suffix].where(on(g_in, suffix), 0.0).sum()
     def dist(suffix):       # Dist gen injects only while the load and its dist gen are both Closed.
-        on = (l_in['Status' + suffix] == 'Closed') & (l_in['DistStatus' + suffix] == 'Closed')
-        return l_in['DistMWInput' + suffix].where(on, 0.0).sum()
-    swing = (p_target - p).sum() - (g_in['MWSetPoint_Target'] - g_in['MWSetPoint']).sum() - (dist('_Target') - dist(''))
+        return l_in['DistMWInput' + suffix].where(on(l_in, suffix) & (l_in['DistStatus' + suffix] == 'Closed'), 0.0).sum()
+    swing = ((p_target - p).sum() - (gen_mw('_Target') - gen_mw('')) - (dist('_Target') - dist(''))
+             + loss_change)
     if abs(swing) < 1.0:
         return None
 
@@ -651,7 +720,8 @@ def prebalance_targets(targets: dict[str, pd.DataFrame]) -> dict[str, pd.DataFra
         l.loc[load.index, f'{c}_Target'] = l.loc[load.index, f'{c}_Target'] * k
 
     left = swing - (new.sum() - seed.sum()) + load_p.sum() * (k - 1)
-    print(f'Targets balanced before scaling: {swing:+.0f} MW would have landed on the swing; '
+    print(f'Targets balanced before scaling: {swing:+.0f} MW would have landed on the swing'
+          + (f' (losses {loss_change:+.0f} MW)' if abs(loss_change) >= 1.0 else '') + '; '
           f'gen {new.sum() - seed.sum():+.0f} MW, load {load_p.sum() * (k - 1):+.0f} MW'
           + (f'; {left:+.0f} MW could not be placed and stays on the swing.' if abs(left) >= 1.0 else '.'))
     return {'Gen': pd.DataFrame({'MWSetPoint': new, 'MWSetPoint_Seed': seed}),

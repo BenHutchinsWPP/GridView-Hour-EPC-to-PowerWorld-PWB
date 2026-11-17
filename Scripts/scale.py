@@ -111,12 +111,16 @@ def test_gen_targets_parallel(pw_fp: Path, gen_df: pd.DataFrame) -> pd.DataFrame
     return pd.concat(results).sort_values(by='Success')
 
 def report_gen_load_balance(targets: dict[str,pd.DataFrame]) -> pd.DataFrame:
-    """Prints seed and target gen and load MW in one line, and warns if the target imbalance is high."""
+    """
+    Prints seed and target gen and load MW in one line, and warns if the target imbalance is high. Only Closed gens and
+    loads count (an Open one injects nothing, whatever its MW); dist gen only where its load and itself are Closed.
+    """
     gen_df, load_df = targets['Gen'], targets['Load']
     def totals(suffix):
-        gen_mw = gen_df['MWSetPoint' + suffix].sum()
-        dist_mw = load_df['DistMWInput' + suffix].sum()
-        load_mw = sum(load_df[c + suffix].sum() for c in ('SMW', 'IMW', 'ZMW'))
+        gen_on, load_on = gen_df['Status' + suffix] == 'Closed', load_df['Status' + suffix] == 'Closed'
+        gen_mw = gen_df['MWSetPoint' + suffix].where(gen_on, 0.0).sum()
+        dist_mw = load_df['DistMWInput' + suffix].where(load_on & (load_df['DistStatus' + suffix] == 'Closed'), 0.0).sum()
+        load_mw = sum(load_df[c + suffix].where(load_on, 0.0).sum() for c in ('SMW', 'IMW', 'ZMW'))
         return [gen_mw, dist_mw, load_mw, gen_mw + dist_mw - load_mw]
 
     total_delta_df = pd.DataFrame(
@@ -379,7 +383,7 @@ def retry_held(SimAuto, targets, label: str):
 class Run:
     """
     One scaling run, for the `exceptions` and `runs` sheets.
-    name: 'main', 'midrun<N>' or 'balance<N>'. log: what iterate_to_gen_load_targets() returned (or the error's `.log`).
+    name: 'prebalance', 'main', 'midrun<N>', 'distgen' or 'balance<N>'. log: what iterate_to_gen_load_targets() returned (or the error's `.log`).
     moved: a balance's balance_targets() tables, after scaling (None for the main run). before / after: the swing's MW
     around the run (NaN: not measured). at: a midrun balance's main progress, e.g. '50 of 100'. note: short flags.
     """

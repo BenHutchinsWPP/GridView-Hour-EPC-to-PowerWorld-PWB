@@ -41,6 +41,10 @@ manual_unit_types = ["DC"]              # Unit types never scaled (adjusted by h
 # Non-conforming loads (load AGC = NO in PowerWorld): false = never scaled or balanced, and left out of both cases'
 # area load totals.
 scale_nonconforming = false
+# Before scaling, the targets are balanced for the change in losses too: each area's losses (LossMW) are expected to go
+# as (its target load / its seed load) ** loss_exponent. 2 = I^2 R; 0 = losses stay at their seed values. The areas
+# sheet shows Seed, Est. and Final Loss MW, to check it by.
+loss_exponent = 2.0
 balance_tol_mw = 1.0
 balance_max_rounds = 10
 # While scaling, balance once the swing goes outside its band: further than balance_trigger_mw from 0 (0 = not used),

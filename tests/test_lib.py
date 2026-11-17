@@ -52,6 +52,8 @@ class FakeSimAuto:
         values = {'Vpu': '1.0', 'IslandNumber': '1', 'BusIsStarBus:1': 'NO', 'BusNomVolt': '230'}
         return ('', [[str(n) if f in ('Busnum', 'Number') else values.get(f, '0') for f in fields] for n in (1, 2)])
 
+LOAD_P_ALL = scale.SCALED['Load']
+
 def targets_df(**cols):
     df = pd.DataFrame(cols).set_index('ObjectID')
     df['ExclusionReason'] = ''
@@ -376,11 +378,17 @@ def test_gen_targets_leave_dc_ties_alone():
     assert df.index.tolist() == ['g1'] and df.loc['g1', 'MWSetPoint_Target'] == 60
     assert report['GenType'].tolist() == ['Thermal']
 
-def test_open_load_cleanup():
-    case = loads([('l1', 1, 'Closed', 100.0, 0.0, 0.0, 10.0), ('lo', 1, 'Open', 50.0, 0.0, 0.0, 0.0)])
-    cleanup = area.open_load_cleanup(case)
-    assert cleanup['ObjectID'].tolist() == ['lo'] and cleanup['DistMWInput'].tolist() == [0.0]
-    assert len(area.open_load_cleanup(case.assign(AGC='NO'))) == 0     # Non-conforming: untouched.
+def test_dist_gen_cleanup_clears_every_load_still_carrying_it():
+    # lo is Open: cleared, but it injected nothing. ln is non-conforming and Closed: cleared, and its 5 MW leave the
+    # case. lx's dist gen is already Open & 0: nothing to write. lz's is Open but not 0: cleared, 0 MW removed.
+    case = loads([('lo', 1, 'Open', 50.0, 0.0, 0.0, 0.0), ('ln', 1, 'Closed', 50.0, 0.0, 0.0, 0.0),
+                  ('lx', 1, 'Open', 50.0, 0.0, 0.0, 0.0), ('lz', 1, 'Closed', 50.0, 0.0, 0.0, 0.0)]).assign(AGC=['YES', 'NO', 'YES', 'YES'])
+    case.loc[2, ['DistStatus', 'DistMWInput', 'DistMvarInput']] = ['Open', 0.0, 0.0]
+    case.loc[3, 'DistStatus'] = 'Open'
+    cleanup = area.dist_gen_cleanup(case)
+    assert cleanup['ObjectID'].tolist() == ['lo', 'ln', 'lz'] and (cleanup['DistMWInput'] == 0).all() and (cleanup['DistStatus'] == 'Open').all()
+    assert area.dist_gen_removed(cleanup) == 5.0
+    assert area.dist_gen_removed(area.dist_gen_cleanup(case.iloc[2:3])) == 0.0  # Nothing to clear.
 
 def test_area_targets_through_the_engine():
     case = loads([('l1', 1, 'Closed', 60.0, 20.0, 20.0, 10.0), ('l2', 1, 'Closed', 100.0, 0.0, 0.0, 10.0)])
@@ -567,6 +575,8 @@ class SwingSimAuto(FakeSimAuto):
             on = df['Status'] == 'Closed'
             ld = self.table('Load')
             p = ld.loc[ld['Status'] == 'Closed', ['SMW', 'IMW', 'ZMW']].sum().sum()
+            if getattr(self, 'count_dist', False):     # Opt-in: dist gen injects while its load and itself are Closed.
+                p -= ld.loc[(ld['Status'] == 'Closed') & (ld['DistStatus'] == 'Closed'), 'DistMWInput'].sum()
             df['MW'] = df['MWSetPoint']
             sw = (df['ID'] == 'xx') | df['BusNum'].isin(self.slack)
             df.loc[sw, 'MW'] = p - df.loc[on & ~sw, 'MWSetPoint'].sum()
@@ -575,6 +585,8 @@ class SwingSimAuto(FakeSimAuto):
     def GetParametersMultipleElementRect(self, table, fields, filter_group):
         if table in self.base:
             return ('', [[str(v) for v in row] for row in self.table(table)[fields].itertuples(index=False)])
+        if table == 'Area':
+            return ('', [[str(n), str(mw)] for n, mw in getattr(self, 'losses', {}).items()])
         if table == 'Bus':
             buses = sorted(set(self.base['Gen']['BusNum']) | set(self.base['Load']['BusNum']))
             values = {'Vpu': '1.0', 'IslandNumber': '1', 'BusIsStarBus:1': 'NO', 'BusNomVolt': '230'}
@@ -992,6 +1004,16 @@ def test_repo_settings_file_loads():
         for (m, k), v in saved.items():
             setattr(m, k, v)
 
+def test_settings_reject_a_negative_loss_exponent():
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        fp = Path(d) / 's.toml'
+        fp.write_text('[area]\nloss_exponent = -1.0\n')
+        try:
+            settings.load(fp)
+            assert False, 'a negative loss_exponent must be rejected'
+        except ValueError as e:
+            assert 'loss_exponent' in str(e)
+
 def test_settings_apply_and_reject():
     import tempfile
     saved = (scale.EXCLUDE_VMIN, dict(area.UNIT_GENTYPE), set(area.ALL_ON_TYPES), list(area.GEN_TYPES))
@@ -1270,27 +1292,120 @@ def test_prebalanced_targets_need_no_midrun_balance():
 
 def test_prebalance_targets_counts_only_what_will_move():
     # l1's dist gen (40 MW, Closed) goes to 0: +40 MW onto the swing. l2's dist gen is Open: its 30 MW never injected.
-    # Gens: gx is excluded and g_open goes Open, so neither moves; gcap (target 300) is already above its MWMax (200),
-    # so it isn't raised and g1 takes the gen half (+20). Load half: -20 over l1 and l2 (factor 0.9).
+    # l3 is Open in both: its 100 MW never counts. g_open goes Closed -> Open (MW unchanged): its 50 MW leave: +50.
+    # gx is excluded: not counted, not moved. gcap (target 300) is already above its MWMax (200), so it isn't raised.
+    # +90 in all: g1 takes the gen half (+45); load half -45 over l1 and l2 (factor 0.775).
     gen = targets_df(ObjectID=['g1', 'gx', 'g_open', 'gcap'], BusNum=[1, 2, 3, 4], ID='1', Status='Closed',
                      Status_Target=['Closed', 'Closed', 'Open', 'Closed'], MWSetPoint=[100.0, 100.0, 50.0, 300.0],
-                     MWSetPoint_Target=[100.0, 100.0, 50.0, 300.0], MWMax=[1000.0, 1000.0, 1000.0, 200.0])
+                     MWSetPoint_Target=[100.0, 150.0, 50.0, 300.0], MWMax=[1000.0, 1000.0, 1000.0, 200.0])
     gen.loc['gx', 'ExclusionReason'] = 'PVQV'
-    load = targets_df(ObjectID=['l1', 'l2'], BusNum=[5, 6], ID='1', Status='Closed', Status_Target='Closed',
-                      DistStatus=['Closed', 'Open'], DistStatus_Target='Open',
-                      **{c: [0.0, 0.0] for c in scale.SCALED['Load']}, **{f'{c}_Target': [0.0, 0.0] for c in scale.SCALED['Load']})
-    for c in ('SMW', 'SMW_Target'):
-        load[c] = 100.0
-    load['DistMWInput'] = [40.0, 30.0]
+    load = targets_df(ObjectID=['l1', 'l2', 'l3'], BusNum=[5, 6, 7], ID='1', Status=['Closed', 'Closed', 'Open'],
+                      Status_Target=['Closed', 'Closed', 'Open'], DistStatus=['Closed', 'Open', 'Closed'], DistStatus_Target='Open',
+                      **{c: [0.0] * 3 for c in scale.SCALED['Load']}, **{f'{c}_Target': [0.0] * 3 for c in scale.SCALED['Load']})
+    load['SMW'], load['SMW_Target'] = 100.0, 100.0
+    load['DistMWInput'] = [40.0, 30.0, 20.0]
     area.prebalance_targets({'Gen': gen, 'Load': load})
-    assert gen['MWSetPoint_Target'].round(9).to_dict() == {'g1': 120.0, 'gx': 100.0, 'g_open': 50.0, 'gcap': 300.0}
-    assert load['SMW_Target'].round(9).tolist() == [90.0, 90.0]
+    assert gen['MWSetPoint_Target'].round(9).to_dict() == {'g1': 145.0, 'gx': 150.0, 'g_open': 50.0, 'gcap': 300.0}
+    assert load['SMW_Target'].round(9).tolist() == [77.5, 77.5, 100.0]
+
+def test_prebalance_targets_counts_losses():
+    # Targets balanced by themselves; losses fall 40 MW: gens -20, load +20.
+    t = load_ramp_targets()
+    t['Load']['SMW_Target'] = 1100.0
+    t['Gen']['MWSetPoint_Target'], t['Gen']['MWMax'] = 1000.0, 2000.0
+    assert area.prebalance_targets(t, 0.0) is None
+    area.prebalance_targets(t, loss_change=-40.0)
+    assert abs(t['Gen'].loc['g1', 'MWSetPoint_Target'] - 980.0) < 1e-9
+    assert abs(t['Load'].loc['l1', 'SMW_Target'] - 1120.0) < 1e-9
+
+def test_loss_estimate_scales_each_area_with_its_load():
+    # Area 1: 200 -> 100 MW of scaled load plus 100 MW non-conforming: 300 -> 200, losses 9 * (2/3)^2 = 4.
+    # Area 2: no seed load: keeps its losses. Area 3: no loads in the targets: ratio 1.
+    load = targets_df(ObjectID=['l1', 'l2', 'lo'], BusNum=[1, 2, 3], ID='1', AreaNumber=[1, 2, 1], Status=['Closed', 'Closed', 'Open'],
+                      Status_Target=['Closed', 'Closed', 'Open'], **{c: [0.0] * 3 for c in LOAD_P_ALL},
+                      **{f'{c}_Target': [0.0] * 3 for c in LOAD_P_ALL})
+    load['SMW'], load['SMW_Target'] = [200.0, 0.0, 500.0], [100.0, 50.0, 0.0]
+    area_load = pd.DataFrame({'AreaNumber': [1, 2], 'Seed Non-conforming MW': [100.0, 0.0]})
+    est = area.loss_estimate({'Load': load}, area_load, pd.Series({1: 9.0, 2: 3.0, 3: 5.0}))
+    assert est['Est. Loss MW'].round(9).to_dict() == {1: 4.0, 2: 3.0, 3: 5.0} and est['Seed Loss MW'].to_dict() == {1: 9.0, 2: 3.0, 3: 5.0}
+    area.LOSS_EXPONENT = 0.0
+    try:
+        assert (area.loss_estimate({'Load': load}, area_load, pd.Series({1: 9.0}))['Est. Loss MW'] == 9.0).all()
+    finally:
+        area.LOSS_EXPONENT = 2.0
+    # Scaled non-conforming load is in the targets already: not added again. Area 1: 200 -> 100, losses 9 / 4.
+    area.SCALE_NONCONFORMING = True
+    try:
+        assert area.loss_estimate({'Load': load}, area_load, pd.Series({1: 9.0}))['Est. Loss MW'].round(9).tolist() == [2.25]
+    finally:
+        area.SCALE_NONCONFORMING = False
+
+def test_loss_estimate_uses_positive_load_and_caps_the_ratio():
+    # Area 1: 100 MW load beside a -95 MW DC load; the load goes to 150. Net 5 -> 55 would give losses x121.
+    # Positive load: 100 -> 150, losses 10 * 1.5^2 = 22.5. Area 2: 10 -> 100 MW: ratio capped at 2, losses x4.
+    load = targets_df(ObjectID=['l1', 'dc', 'l2'], BusNum=[1, 2, 3], ID='1', AreaNumber=[1, 1, 2], Status='Closed', Status_Target='Closed',
+                      **{c: [0.0] * 3 for c in LOAD_P_ALL}, **{f'{c}_Target': [0.0] * 3 for c in LOAD_P_ALL})
+    load['SMW'], load['SMW_Target'] = [100.0, -95.0, 10.0], [150.0, -95.0, 100.0]
+    est = area.loss_estimate({'Load': load}, pd.DataFrame({'AreaNumber': [1, 2]}), pd.Series({1: 10.0, 2: 1.0}))
+    assert est['Est. Loss MW'].round(9).to_dict() == {1: 22.5, 2: 4.0}
+    area.LOSS_EXPONENT = -1.0
+    try:
+        area.loss_estimate({'Load': load}, pd.DataFrame({'AreaNumber': [1]}), pd.Series({1: 10.0}))
+        assert False, 'a negative loss_exponent must be rejected'
+    except ValueError:
+        pass
+    finally:
+        area.LOSS_EXPONENT = 2.0
+
+def test_areas_shows_final_losses_without_a_plan_estimate():
+    case = gens([('g1', 1, '1', 'Closed', 'GT', 100.0, 1000.0, 0.0)])
+    targets, reports = area.build_targets({'Load': loads([]), 'Gen': case}, {'Load': loads([]), 'Gen': case})
+    out = area.areas(None, reports, final_loss=pd.Series({1: 7.0}))
+    row = out[out['Group'] == 'Load'].iloc[0]
+    assert len(out) == 2 and row['Final Loss MW'] == 7.0 and pd.isna(row['Seed Loss MW'])
+
+def test_report_gen_load_balance_counts_only_closed_units():
+    gen = targets_df(ObjectID=['g1', 'g2'], Status=['Closed', 'Open'], Status_Target=['Open', 'Closed'],
+                     MWSetPoint=[100.0, 50.0], MWSetPoint_Target=[100.0, 50.0])
+    load = targets_df(ObjectID=['l1', 'l2'], Status=['Closed', 'Open'], Status_Target='Closed', DistStatus='Closed', DistStatus_Target='Open',
+                      **{c: [10.0, 10.0] for c in scale.SCALED['Load']}, **{f'{c}_Target': [10.0, 10.0] for c in scale.SCALED['Load']})
+    out = scale.report_gen_load_balance({'Gen': gen, 'Load': load})
+    assert out['Base Case'].tolist() == [100.0, 10.0, 30.0, 80.0] and out['Target Case'].tolist() == [50.0, 0.0, 60.0, -10.0]
 
 def test_prebalance_targets_does_not_raise_gens_without_mwmax():
     t = load_ramp_targets()                                                       # Topology tables: no MWMax column.
     area.prebalance_targets(t)
     assert t['Gen'].loc['g1', 'MWSetPoint_Target'] == 100.0                       # Load took all of it.
     assert abs(t['Load'].loc['l1', 'SMW_Target'] - 200.0) < 1e-9
+
+def test_step_02_estimates_losses_and_clears_untouched_dist_gen():
+    # Seed losses 10 MW; area 1's load goes 200 -> 300 MW (non-conforming ln's 50 MW stays): (350/250)^2 * 10 = 19.6.
+    gen, load = two_cases()
+    load = pd.concat([load, loads([('ln', 1, 'Closed', 50.0, 0.0, 0.0, 0.0)]).assign(BusNum=4, NomkV=230.0, BusName='b', AGC='NO')], ignore_index=True)
+    epc_gen = gens([('e1', 1, '1', 'Closed', 'GT', 150.0, 1000.0, 0.0), ('e2', 1, '2', 'Closed', 'HY', 50.0, 1000.0, 0.0)]).assign(BusNum=[1, 2], MW=0.0, NomkV=230.0, BusName='b')
+    epc_load = loads([('e1', 1, 'Closed', 300.0, 0.0, 0.0, 30.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        step = load_step_02(Path(d), 'area')
+        sa = CaseSimAuto({'h1.epc': (epc_gen, epc_load), 'Prepared.pwb': (gen, load)}, slack=[99])
+        sa.losses, sa.count_dist = {1: 10.0}, True
+        moves = []
+        real = area.prebalance_targets
+        area.prebalance_targets = lambda t, loss_change=0.0: moves.append(loss_change) or real(t, loss_change)
+        try:
+            step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')
+        finally:
+            area.prebalance_targets = real
+        sheets = pd.read_excel(step.out_dir / 'h1_Log.xlsx', sheet_name=None)
+    assert abs(moves[0] - 9.6) < 1e-9
+    out = sa.saved['h1.pwb']
+    assert out['Load'].loc['ln', 'DistStatus'] == 'Open' and out['Load'].loc['ln', 'DistMWInput'] == 0.0
+    assert out['Load'].loc['ln', 'SMW'] == 50.0                                  # Non-conforming: its load is left as is.
+    run = sheets['runs'].set_index('Run').loc['distgen']                         # ln's 5 MW leave: the swing takes them.
+    assert abs(run['Swing MW After'] - run['Swing MW Before'] - 5.0) < 1e-6 and 'cleared on 1 loads (5 MW)' in run['Note']
+    assert sheets['runs']['Run'].tolist().index('distgen') == sheets['runs']['Run'].tolist().index('main') + 1
+    row = sheets['areas'].set_index('Group').loc['Load']
+    assert (row['Seed Loss MW'], round(row['Est. Loss MW'], 9), row['Final Loss MW']) == (10.0, 19.6, 10.0)
+    assert sheets['areas'].set_index('Group').loc['Thermal', ['Seed Loss MW', 'Est. Loss MW', 'Final Loss MW']].isna().all()
 
 if __name__ == '__main__':
     tests = [f for name, f in dict(globals()).items() if name.startswith('test_')]

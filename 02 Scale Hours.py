@@ -38,6 +38,25 @@ def summary_line(hour, log, area_mode):
             line += f'; worst error area {worst["AreaNumber"]} {worst["Group"]} {worst["Error MW"]:.0f} MW'
     return line
 
+def clear_dist_gen(SimAuto, swing) -> list[scale.Run]:
+    """
+    GridView ignores distributed generation: sets it Open & 0 on every load still carrying it (loads the scaling never
+    touched or didn't finish), one solve-checked edit, bisected if it diverges. The final balance (if balance_swing)
+    takes up the MW. Returns a `distgen` run for the runs sheet (none if nothing was left), whose Note names the loads
+    which kept theirs.
+    """
+    left = area.dist_gen_cleanup(pw.get_df(SimAuto, 'Load', area.LOAD_FIELDS))
+    if not len(left):
+        return []
+    before = swing()
+    failed = pw.set_df_bisect(SimAuto, 'Load', left, ['BusNum', 'ID', 'DistStatus', 'DistMWInput', 'DistMvarInput'])
+    done = left.drop(index=failed)
+    kept = (f'{len(failed)} kept theirs (the case diverged without it): ' + ', '.join(left.loc[failed, 'ObjectID'].head(5))
+            + (' ...' if len(failed) > 5 else '')) if failed else ''
+    note = '; '.join(filter(None, [f'dist gen cleared on {len(done)} loads ({area.dist_gen_removed(done):,.0f} MW)', kept]))
+    print(note[0].upper() + note[1:] + '.')
+    return [scale.Run('distgen', before=before, after=swing(), note=note)]
+
 def create_case(SimAuto, gv_fp, out_fp):
     area_mode = run['mode'] != 'topology'
     if area_mode:
@@ -55,17 +74,22 @@ def create_case(SimAuto, gv_fp, out_fp):
     pre_runs = []
     if run['balance_swing']:
         # Fold the targets' own imbalance in now, so the swing doesn't drift (and set off balances) as they scale.
-        moved = area.prebalance_targets(targets)
+        losses = reports.get('area_loss')       # Area mode only.
+        loss_change = float((losses['Est. Loss MW'] - losses['Seed Loss MW']).sum()) if losses is not None else 0.0
+        if losses is not None and len(losses):
+            print(f'Losses: seed {losses["Seed Loss MW"].sum():,.0f} MW, estimated {losses["Est. Loss MW"].sum():,.0f} MW '
+                  f'at the target load (loss_exponent {area.LOSS_EXPONENT:g}).')
+        moved = area.prebalance_targets(targets, loss_change)
         if moved is not None:
             pre_runs = [scale.Run('prebalance', moved=moved, note='targets moved before scaling')]
     log_fp = out_dir / (gv_fp.stem + '_Log.xlsx')
 
-    def build_log(runs, final, balance_tables=(), swing_buses=(), exception_runs=()):
+    def build_log(runs, final, balance_tables=(), swing_buses=(), exception_runs=(), final_loss=None):
         log = {'exceptions': scale.exceptions([*exception_runs, *runs], targets, final), 'runs': scale.runs_sheet(runs)}
         if area_mode:
             # Before scaling (final None) nothing has been reached or balanced yet: the plan alone.
             scaled = targets if final is not None else None
-            log = {'areas': area.areas(final, reports, scaled, balance_tables, swing_buses), **log}
+            log = {'areas': area.areas(final, reports, scaled, balance_tables, swing_buses, final_loss), **log}
         return log
 
     # The plan first, so that a failure during the hour's long scaling still leaves it.
@@ -75,10 +99,6 @@ def create_case(SimAuto, gv_fp, out_fp):
         print(f'WARNING: could not write {log_fp.name} (open in Excel?): {e!r}.')
 
     pw.open_case(SimAuto, pw_fp)
-    if area_mode:
-        # Open loads aren't scaled, but their distributed generation is set Open & 0 too.
-        case_load = pw.get_df(SimAuto, 'Load', area.LOAD_FIELDS)
-        pw.set_df(SimAuto, 'Load', area.open_load_cleanup(case_load), ['BusNum', 'ID', 'DistStatus', 'DistMWInput', 'DistMvarInput'])
     pvqv = pd.read_csv(pvqv_fp) if run['use_pvqv'] else None
     balance_tables = []
     slack = prep.slack_buses(SimAuto)
@@ -94,17 +114,19 @@ def create_case(SimAuto, gv_fp, out_fp):
     # Main last of the runs during scaling (its midrun balances happened inside it), so its After is where scaling left
     # the swing; the final balance rounds follow. The last row's After is where the swing ended.
     runs = [*pre_runs, *midrun_runs, scale.Run('main', log, before=before, after=swing())]
+    runs += clear_dist_gen(SimAuto, swing)
     if run['balance_swing']:
         runs += area.balance_swing(SimAuto, targets, tables=balance_tables)
     # Read back from PowerWorld, so the log shows what the case holds rather than what the scaling meant to do.
     final = area.read_case(SimAuto) if area_mode else {t: pw.get_df(SimAuto, t, f) for t, f in topo.TARGET_FIELDS.items()}
+    final_loss = area.area_losses(SimAuto) if area_mode else None      # The areas sheet's Final Loss MW.
     swing_buses = prep.slack_buses(SimAuto)
     if not pw.solve(SimAuto):
         print('WARNING: the case does not solve at the end of scaling. Saved as it is.')
     # Save the case first: a log which can't be built or written (e.g. open in Excel) mustn't cost the solved hour.
     pw.save_case(SimAuto, out_fp, run['case_format'])
     try:
-        log = build_log(runs, final, balance_tables, swing_buses)
+        log = build_log(runs, final, balance_tables, swing_buses, final_loss=final_loss)
         print(summary_line(gv_fp.stem, log, area_mode))
         pw.write_excel(log_fp, log)
     except Exception as e:     # Never lose the hour over its log.
