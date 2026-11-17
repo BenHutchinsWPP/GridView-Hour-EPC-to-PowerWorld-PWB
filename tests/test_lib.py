@@ -577,9 +577,13 @@ def test_commitment_headroom_and_capacity_types():
     assert 'h1' not in st and df.loc['h2', 'MWSetPoint_Target'] == 40.0  # Hydro (a match type): committed like Thermal.
     assert st['s1'] == 'Open' and 's2' not in st           # Solar target 0: all off.
     assert df.loc['s1', 'MWSetPoint_Target'] == 0
-    # Storage target 0: seed statuses, at 0 MW.
+    # Storage target 0: offline, like Wind and Solar. Left out of off_at_zero_types: seed statuses, at 0 MW.
     case = gens([('b1', 1, '1', 'Closed', 'BA', 5.0, 50.0, -50.0), ('b2', 1, '2', 'Open', 'BA', 0.0, 50.0, -50.0)])
     df, _ = area.gen_targets(gens([]), case)
+    assert df['Status_Target'].to_dict() == {'b1': 'Open'} and df['MWSetPoint_Target'].tolist() == [0.0]
+    with saved_settings():
+        area.OFF_AT_ZERO_TYPES = {'Wind', 'Solar'}
+        df, _ = area.gen_targets(gens([]), case)
     assert df['Status_Target'].to_dict() == {'b1': 'Closed'} and df['MWSetPoint_Target'].tolist() == [0.0]
 
 def test_capacity_types_ignore_unit_epc_values_and_run_flat():
@@ -863,7 +867,7 @@ def test_target_zero_takes_every_committed_unit_offline():
     case = gens([('t1', 1, '1', 'Closed', 'GT', 10.0, 431.58, 0.0), ('t2', 1, '2', 'Closed', 'ST', 10.0, 556.86, 0.0), ('t3', 1, '3', 'Closed', 'CC', 10.0, 99.99, 0.0)])
     df, _ = area.gen_targets(gens([]), case)
     assert (df['Status_Target'] == 'Open').all()
-    # Storage keeps its seed status at 0, and a unit with no capacity is left alone.
+    # A unit with no capacity is left alone.
     rows = gens([('b1', 1, '1', 'Closed', 'BA', 5.0, 50.0, -50.0), ('c1', 1, '2', 'Closed', 'SC', 0.0, 0.0, 0.0)])
     assert area.commit(rows, 0.0, 'Thermal', set()).tolist() == [False, True]
 

@@ -309,7 +309,7 @@ COMMIT = True       # False: keep every unit's seed status.
 # target), whatever each unit's EPC MW or status.
 CAPACITY_TYPES = {'Wind', 'Solar', 'Battery Storage'}
 # At a target of 0, these go offline. The other CAPACITY_TYPES keep their seed statuses, at 0 MW.
-OFF_AT_ZERO_TYPES = {'Wind', 'Solar'}
+OFF_AT_ZERO_TYPES = {'Wind', 'Solar', 'Battery Storage'}
 # Match (every other type: Thermal, Hydro, Unknown): units take their EPC MW key by key, the rest their seed MW, and the
 # group is scaled to its total. Units are committed as follows when a group has nothing to scale, or is capped.
 # They start from the seed's online units, so that the target is at most COMMIT_MAX_CF of the
