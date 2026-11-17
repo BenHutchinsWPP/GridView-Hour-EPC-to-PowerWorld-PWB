@@ -605,6 +605,7 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None,
     Held gens/loads (including those on buses outside the voltage band) are retried after each step, and again at the end.
     pvqv_df: optional PVQV sensitivities. If given, gens/loads with a large linear dV estimate are excluded up front.
     after_step: optional function(SimAuto, targets, progress), called after each step (e.g. area.midrun_balancer()).
+        If it returns a number, the next step is at most that (at least 1), e.g. to keep the swing from moving too far.
     label: names this run in the printed progress, to tell a balance's own scaling from the main one.
     initial_step: first step (default INITIAL_STEP). Balances, a move of a few percent, start at MAX_STEP.
     """
@@ -679,8 +680,7 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None,
             if statcom:
                 statcoms[statcom[0]] = statcom[1]
             log(start, goal, result, catch_up(SimAuto, targets, progress, step, bisect=False))
-            if after_step:
-                after_step(SimAuto, targets, progress)
+            cap = after_step(SimAuto, targets, progress) if after_step else None
             if t.ok and not failed_step:
                 step = min(step * 2, MAX_STEP)
             elif t.ok:
@@ -688,6 +688,8 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None,
             elif failed_step:
                 step = failed_step      # The gens/loads which diverged are held now, so go back to the larger step.
             failed_step = None
+            if cap is not None:
+                step = min(step, max(1, int(cap)))
 
         retry_held(SimAuto, targets, label)
         set_gen_load_status(SimAuto, targets, label)

@@ -1057,46 +1057,85 @@ def makeup(SimAuto, targets: dict[str, pd.DataFrame], tables: list | None = None
     print(f'Make-up: {run.note}.')
     return [run]
 
-def midrun_balancer(SimAuto):
+def midrun_balancer(SimAuto, epc: pd.DataFrame | None = None):
     """
     Returns (after_step, runs) for scale.iterate_to_gen_load_targets(). After each step, if the swing is outside
-    its band (swing_band()), moves it onto the whole case's gen (balance_targets()), and keeps that in
-    the scaling still to come (rescale_targets()). If a balance leaves the swing outside the band (e.g. gens at MWMax),
-    the band is widened to where it got to, plus a margin (the giant swing: BALANCE_TRIGGER_MW, or 10% of the band if
-    that's 0; the case's own slack: 10% of its limits), so the next balance waits until the swing has moved that much
-    further. The swing itself is never moved. A balance aims the giant swing at 0 MW, or at the nearest point a quarter
-    of the band inside its edges if 0 is not there; the case's own slack just back inside the middle half of its
-    limits (the final balance, balance_swing(), takes it to its goal).
+    its band, moves it onto the whole case's gen (balance_targets()), and keeps that in the scaling still to come
+    (rescale_targets()). The swing itself is never moved.
+    - The giant swing: the band is swing_band(); a balance aims at 0 MW, or at the nearest point a quarter of the band
+      inside its edges if 0 is not there.
+    - The case's own slack: the pre-balance plans it to go from where it starts to its goal (swing_goal(), `epc`:
+      swing_epc()) as the scaling goes, so at each step it is expected at that point of the way. The band is that
+      point +/- BALANCE_TRIGGER_MW (0: not used), within its MWMin / MWMax; a balance aims back at that point. A
+      slack which strays far diverges (about 2 GW on the owner's case), so this keeps it near its plan.
+    If a balance leaves the swing outside the band (e.g. gens at MWMax), the band is widened to where it got to, plus
+    a margin (BALANCE_TRIGGER_MW, or 10% of the band if that's 0), so the next balance waits until the swing has moved
+    that much further.
+    Step size: after_step measures how fast the swing drifts from where it should be (per 1/RESOLUTION of progress)
+    and returns the largest next step which keeps that drift within BALANCE_TRIGGER_MW, so one big step can't carry
+    the swing far past its band before a balance sees it.
     runs: a scale.Run per balance (`midrun<N>`), filled in as they run.
     """
     slack = prep.slack_buses(SimAuto)
     gen0 = pw.get_df(SimAuto, 'Gen', GEN_FIELDS)
     lo, hi = swing_band(gen0, slack)
-    own_slack = len(swing_units(gen0, slack)) and not (swing_units(gen0, slack)['ID'] == prep.SWING_ID).any()
-    if not (np.isfinite(lo) or np.isfinite(hi)):
+    units0 = swing_units(gen0, slack)
+    own_slack = bool(len(units0)) and not (units0['ID'] == prep.SWING_ID).any()
+    if own_slack:
+        start = swing_mw(gen0, slack)[0]
+        end = float(np.clip(start, *swing_goal(gen0, slack, epc)))     # Where the pre-balance planned it to end.
+    trigger = BALANCE_TRIGGER_MW or np.inf
+    if not own_slack and not (np.isfinite(lo) or np.isfinite(hi)):
         print('Midrun balancing off: balance_trigger_mw is 0 and balance_at_swing_limits is false.')
 
-    def aim_for(swing):
-        # Balance to a point inside the band, not to its edge, so the next small drift doesn't set off another balance.
-        if own_slack:       # The case's own slack: just back inside the middle half of its limits (the final balance
-            if np.isfinite(lo) and np.isfinite(hi):     # takes it to its EPC MW).
-                return float(np.clip(swing, lo + 0.25 * (hi - lo), hi - 0.25 * (hi - lo)))
-            return float(np.clip(swing, lo, hi))
-        # The giant swing: 0, or with a swing whose MWMin is 0 (0 is the band's edge) a quarter of the band inside.
+    def expected(progress):
+        return float(np.clip(start + (end - start) * progress / scale.RESOLUTION, lo, hi))
+
+    def band(progress):
+        if not own_slack:
+            return state['lo'], state['hi']
+        ref = expected(progress)
+        return max(lo, ref - trigger) - state['extra'], min(hi, ref + trigger) + state['extra']
+
+    # The case's own slack is aimed this far inside its limits at least, so a balance onto a planned point at a limit
+    # (an EPC MW at its Pmax) leaves it room to drift before the next one, instead of a balance every 1% step.
+    inside = min(BALANCE_TRIGGER_MW / 2 if BALANCE_TRIGGER_MW else np.inf, 0.25 * (hi - lo) if np.isfinite(hi - lo) else np.inf)
+    inside = inside if np.isfinite(inside) else 0.0
+
+    def aim_for(swing, progress):
+        if own_slack:
+            return float(np.clip(expected(progress), lo + inside, hi - inside))
+        # Balance to a point inside the band, not to its edge, so the next small drift doesn't set off another balance:
+        # 0, or with a swing whose MWMin is 0 (0 is the band's edge) a quarter of the band inside.
         if np.isfinite(lo) and np.isfinite(hi):
             return float(np.clip(0.0, lo + 0.25 * (hi - lo), hi - 0.25 * (hi - lo)))
         return float(np.clip(0.0, lo, hi))
-    state = {'lo': lo, 'hi': hi}
+    def ref(progress):     # Where the swing should be.
+        return expected(progress) if own_slack else aim_for(0.0, progress)
+    state = {'lo': lo, 'hi': hi, 'extra': 0.0, 'p': 0, 'dev': swing_mw(gen0, slack)[0] - ref(0)}
     runs: list[scale.Run] = []
+
+    def step_cap(progress, swing_now, swing_after):
+        # Drift per unit of progress since the last check, away from where the swing should be; the next step may
+        # carry the swing at most to the edge of its band (as widened) in the direction it drifts.
+        dev_now, dev_after = swing_now - ref(progress), swing_after - ref(progress)
+        rate = (dev_now - state['dev']) / max(progress - state['p'], 1)
+        state['p'], state['dev'] = progress, dev_after
+        b_lo, b_hi = band(progress)
+        room = (b_hi - swing_after) if rate > 0 else (swing_after - b_lo)
+        if not np.isfinite(room) or abs(rate) < 1e-9:
+            return None
+        return max(1, int(room / abs(rate)))
 
     def after_step(SimAuto, targets, progress):
         gen = pw.get_df(SimAuto, 'Gen', GEN_FIELDS)
         swing, swing_buses = swing_mw(gen, slack)
-        if state['lo'] <= swing <= state['hi']:
-            return
-        print(f'----- Swing at {swing:.1f} MW, outside {state["lo"]:.0f} to {state["hi"]:.0f} MW: balancing onto gen -----')
+        b_lo, b_hi = band(progress)
+        if b_lo <= swing <= b_hi:
+            return step_cap(progress, swing, swing)
+        print(f'----- Swing at {swing:.1f} MW, outside {b_lo:.0f} to {b_hi:.0f} MW: balancing onto gen -----')
         final = {'Load': pw.get_df(SimAuto, 'Load', LOAD_FIELDS), 'Gen': gen}
-        moved = balance_targets(final, swing - aim_for(swing), swing_buses, balance_skips(SimAuto, final, targets))
+        moved = balance_targets(final, swing - aim_for(swing, progress), swing_buses, balance_skips(SimAuto, final, targets))
         label = f'Balance {len(runs) + 1} (main scaling at {progress} of {scale.RESOLUTION})'
         run = scale.Run(f'midrun{len(runs) + 1}', moved=moved, before=swing, at=f'{progress} of {scale.RESOLUTION}')
         runs.append(run)
@@ -1111,7 +1150,14 @@ def midrun_balancer(SimAuto):
         rescale_targets(targets, moved)
         after, _ = swing_mw(pw.get_df(SimAuto, 'Gen', GEN_FIELDS), slack)
         run.after = after
-        if not lo <= after <= hi:
+        if own_slack:
+            state['extra'] = 0.0
+            n_lo, n_hi = band(progress)
+            if not n_lo <= after <= n_hi:
+                margin = BALANCE_TRIGGER_MW or (0.1 * (hi - lo) if np.isfinite(hi - lo) else 0.0)
+                state['extra'] = max(n_lo - after, after - n_hi) + margin
+                notes.append(f'band widened by {state["extra"]:.0f} MW')
+        elif not lo <= after <= hi:
             finite = np.isfinite(lo) and np.isfinite(hi)
             margin = (0.1 * (hi - lo) if finite else 0.0) if own_slack or not BALANCE_TRIGGER_MW else BALANCE_TRIGGER_MW
             state['lo'], state['hi'] = min(lo, after - margin), max(hi, after + margin)
@@ -1119,5 +1165,6 @@ def midrun_balancer(SimAuto):
         else:
             state['lo'], state['hi'] = lo, hi
         run.note = '; '.join(notes)
+        return step_cap(progress, swing, after)
 
     return after_step, runs

@@ -113,7 +113,7 @@ def create_case(SimAuto, gv_fp, out_fp):
     midrun_runs = []
     if run['balance_swing']:
         # Balance the swing whenever it drifts far during scaling, and again at the end.
-        after_step, midrun_runs = area.midrun_balancer(SimAuto)
+        after_step, midrun_runs = area.midrun_balancer(SimAuto, reports['swing'])
         log = scale.iterate_to_gen_load_targets(SimAuto, targets, pvqv, after_step)
     else:
         log = scale.iterate_to_gen_load_targets(SimAuto, targets, pvqv)

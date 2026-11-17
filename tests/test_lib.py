@@ -970,6 +970,41 @@ def test_slack_bus_gens_are_the_swing_when_there_is_no_giant_swing():
     assert -area.BALANCE_TOL_MW < area.swing_mw(sa.table('Gen'), [9])[0] < 1000 + area.BALANCE_TOL_MW
     assert ('Gen', '9') not in sa.applied
 
+def test_own_slack_with_wide_limits_is_kept_near_its_plan_while_scaling():
+    # s1 can run -10 to +10 GW, but strays of ~2 GW diverge: it is balanced back once it is balance_trigger_mw (1000)
+    # from where the plan expects it (here its start, 0 MW: its key isn't in the EPC). Load +3000 MW, no pre-balance.
+    gen = gens([('s1', 1, '1', 'Closed', 'GT', 0.0, 1e4, -1e4), ('g1', 1, '2', 'Closed', 'GT', 100.0, 5000.0, 0.0),
+                ('g2', 1, '3', 'Closed', 'HY', 100.0, 5000.0, 0.0)]).assign(BusNum=[9, 1, 2], MW=0.0, NomkV=230.0, BusName='b')
+    load = loads([('l1', 1, 'Closed', 200.0, 0.0, 0.0, 20.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
+    sa = SwingSimAuto(gen, load, slack=[9])
+    after_step, log = area.midrun_balancer(sa)
+    seen = []
+    def watch(SimAuto, targets, progress):
+        seen.append(area.swing_mw(sa.table('Gen'), [9])[0])         # Before any balance: what the step left.
+        return after_step(SimAuto, targets, progress)
+    scale.iterate_to_gen_load_targets(sa, load_ramp_targets(), after_step=watch)
+    assert len(log) >= 1 and all(abs(r.after) < 1.0 for r in log)                      # Back to its plan, 0 MW.
+    assert max(abs(x) for x in seen) < 1100 and ('Gen', '9') not in sa.applied           # The step is capped too.
+    # With an EPC goal, the plan moves from start to goal as scaling goes: at 50 of 100, half way.
+    swing = pd.DataFrame({'Seed MW': [0.0], 'EPC MW': [800.0]}, index=['s1'])
+    sa = SwingSimAuto(gen, load, slack=[9])
+    after_step, log = area.midrun_balancer(sa, swing)
+    sa.base['Load']['SMW'] += 2000.0                                                    # Swing jumps to ~2000.
+    after_step(sa, {t: df.assign(HeldReason='') for t, df in load_ramp_targets().items()}, 50)
+    assert len(log) == 1 and abs(log[0].after - 400.0) < 1.0
+
+def test_own_slack_planned_at_its_limit_does_not_balance_every_step():
+    # s1 is at its MWMax (0 MW) and stays planned there; load +3000 MW, no pre-balance. Balancing aims 500 MW inside
+    # (half of balance_trigger_mw), so the drift has room: a few balances, not one per 1% step.
+    gen = gens([('s1', 1, '1', 'Closed', 'GT', 0.0, 0.0, -1e4), ('g1', 1, '2', 'Closed', 'GT', 100.0, 5000.0, 0.0),
+                ('g2', 1, '3', 'Closed', 'HY', 100.0, 5000.0, 0.0)]).assign(BusNum=[9, 1, 2], MW=0.0, NomkV=230.0, BusName='b')
+    load = loads([('l1', 1, 'Closed', 200.0, 0.0, 0.0, 20.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
+    sa = SwingSimAuto(gen, load, slack=[9])
+    after_step, log = area.midrun_balancer(sa)
+    out = scale.iterate_to_gen_load_targets(sa, load_ramp_targets(), after_step=after_step)
+    assert 1 <= len(log) <= 10 and len(out['step_df']) <= 25, (len(log), len(out['step_df']))
+    assert all(abs(r.after + 500.0) < 1.0 for r in log)                                # 500 MW inside its MWMax.
+
 def test_own_slack_ends_at_its_epc_mw_when_its_key_is_in_the_epc():
     gen = gens([('s1', 1, '1', 'Closed', 'GT', 100.0, 1000.0, 0.0), ('g1', 1, '2', 'Closed', 'GT', 100.0, 5000.0, 0.0),
                 ('g2', 1, '3', 'Closed', 'HY', 100.0, 5000.0, 0.0)]).assign(BusNum=[9, 1, 2], MW=0.0, NomkV=230.0, BusName='b')
@@ -981,7 +1016,7 @@ def test_own_slack_ends_at_its_epc_mw_when_its_key_is_in_the_epc():
     giant = pd.concat([gen, gens([('xx', 1, 'xx', 'Closed', '', 0.0, 2e4, -2e4)]).assign(BusNum=9)])
     assert area.swing_epc(epc_gen, giant, [9]).empty and area.swing_goal(giant, [9], swing) == (0.0, 0.0)
     sa = SwingSimAuto(gen, load, slack=[9])
-    after_step, log = area.midrun_balancer(sa)
+    after_step, log = area.midrun_balancer(sa, swing)
     scale.iterate_to_gen_load_targets(sa, load_ramp_targets(), after_step=after_step)
     area.balance_swing(sa, epc=swing)
     assert abs(area.swing_mw(sa.table('Gen'), [9])[0] - 300.0) < area.BALANCE_TOL_MW and ('Gen', '9') not in sa.applied
@@ -1230,7 +1265,9 @@ def test_midrun_balance_failure_keeps_the_hour_and_its_network_log():
     assert log and log[0].note.startswith('stopped: Could not solve')
     assert log[0].log['statcom_bus_df']['BusNum'].tolist() == [7]                   # The STATCOM it added is listed.
     ex = scale.exceptions(log, None, None)
-    assert ex[['Table', 'ObjectID', 'BusNum', 'Reason']].values.tolist() == [['STATCOM', '7 SC', 7, 'midrun1: STATCOM added']]
+    # Each failed balance listed it (steps are capped now, so the swing is caught again before it runs far).
+    assert ex[['Table', 'ObjectID', 'BusNum']].values.tolist() == [['STATCOM', '7 SC', 7]]
+    assert ex['Reason'].iloc[0].startswith('midrun1: STATCOM added')
 
 def test_balance_starts_at_the_largest_step():
     log = scale.iterate_to_gen_load_targets(FakeSimAuto(), scaling_targets(gen_status='Closed')[0], initial_step=scale.MAX_STEP)
