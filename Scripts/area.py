@@ -897,36 +897,53 @@ def balance_swing(SimAuto, scaled: dict[str, pd.DataFrame] | None = None, tables
     runs: list[scale.Run] = []
     exhausted = True
     for i in range(BALANCE_MAX_ROUNDS):
-        final = read_case(SimAuto)
-        swing, swing_buses = swing_mw(final['Gen'], slack)
-        lo, hi = swing_goal(final['Gen'], slack, epc)
-        print(f'----- Balancing round {i + 1}: swing at {swing:.1f} MW' + (f' (goal {lo:.0f} to {hi:.0f} MW)' if (lo, hi) != (0.0, 0.0) else '') + ' -----')
-        if lo - BALANCE_TOL_MW < swing < hi + BALANCE_TOL_MW:
-            exhausted = False
-            break
-        m = min(BALANCE_TOL_MW, (hi - lo) / 2)
-        aim = float(np.clip(swing, lo + m, hi - m))
-        targets = balance_targets(final, swing - aim, swing_buses, balance_skips(SimAuto, final, scaled))
-        if tables is not None:
-            tables.append(targets)
-        run = scale.Run(f'balance{i + 1}', moved=targets, before=swing)
-        runs.append(run)
         try:
-            run.log = scale.iterate_to_gen_load_targets(SimAuto, targets, label=f'Final balance {i + 1}', initial_step=scale.MAX_STEP)
-        except pw.SimAutoError as e:
-            # Keep the hour: the case is solved at the last good checkpoint, and `targets` holds what was applied.
-            print(f'WARNING: Final balance {i + 1} stopped: {e}')
-            run.log, run.note = getattr(e, 'log', {}), f'stopped: {e}'
+            if not _balance_round(SimAuto, i, slack, epc, scaled, tables, runs):
+                exhausted = False
+                break
+        except Exception as e:      # Keep the rounds that ran (their tables are in `tables`, with what each applied).
+            print(f'WARNING: Final balance {i + 1} failed: {e!r}')
+            if runs and runs[-1].name == f'balance{i + 1}':     # It failed inside its own scaling: note it on its row.
+                runs[-1].note = '; '.join(filter(None, [runs[-1].note, f'failed: {e!r}']))
+            else:
+                runs.append(scale.Run(f'balance{i + 1}', note=f'failed: {e!r}'))
             exhausted = False
             break
-    swing, _ = swing_mw(read_case(SimAuto)['Gen'], slack)
+    try:
+        swing, _ = swing_mw(read_case(SimAuto)['Gen'], slack)
+    except Exception:
+        swing = np.nan
     for run, nxt in zip(runs, runs[1:]):
-        run.after = nxt.before
+        run.after = nxt.before if pd.notna(nxt.before) else swing     # A failed round has no Before.
     if runs:
         runs[-1].after = swing
         if exhausted:
             runs[-1].note = '; '.join(filter(None, [runs[-1].note, 'stopped at max rounds']))
     return runs
+
+def _balance_round(SimAuto, i, slack, epc, scaled, tables, runs) -> bool:
+    """One balance_swing() round; False once the swing is at its goal or the round's scaling stopped."""
+    final = read_case(SimAuto)
+    swing, swing_buses = swing_mw(final['Gen'], slack)
+    lo, hi = swing_goal(final['Gen'], slack, epc)
+    print(f'----- Balancing round {i + 1}: swing at {swing:.1f} MW' + (f' (goal {lo:.0f} to {hi:.0f} MW)' if (lo, hi) != (0.0, 0.0) else '') + ' -----')
+    if lo - BALANCE_TOL_MW < swing < hi + BALANCE_TOL_MW:
+        return False
+    m = min(BALANCE_TOL_MW, (hi - lo) / 2)
+    aim = float(np.clip(swing, lo + m, hi - m))
+    targets = balance_targets(final, swing - aim, swing_buses, balance_skips(SimAuto, final, scaled))
+    if tables is not None:
+        tables.append(targets)
+    run = scale.Run(f'balance{i + 1}', moved=targets, before=swing)
+    runs.append(run)
+    try:
+        run.log = scale.iterate_to_gen_load_targets(SimAuto, targets, label=f'Final balance {i + 1}', initial_step=scale.MAX_STEP)
+    except pw.SimAutoError as e:
+        # Keep the hour: the case is solved at the last good checkpoint, and `targets` holds what was applied.
+        print(f'WARNING: Final balance {i + 1} stopped: {e}')
+        run.log, run.note = getattr(e, 'log', {}), f'stopped: {e}'
+        return False
+    return True
 
 def rescale_targets(targets: dict[str, pd.DataFrame], moved: dict[str, pd.DataFrame]):
     """

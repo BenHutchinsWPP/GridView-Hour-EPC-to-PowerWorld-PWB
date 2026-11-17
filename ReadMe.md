@@ -29,9 +29,9 @@ Area mode: first draft (2026-11-15), first written in `~/projects/areascale` (th
     - `exceptions` (both modes): a row per gen, load, STATCOM or opened branch which is not on plan, with a `Reason` naming the run (`main`, `midrun<N>`, `makeup`, `balance<N>`).
     - `runs` (both modes): a row per scaling run (`prebalance`, `main`, `midrun<N>`, `distgen`, `makeup`, `balance<N>`): swing before and after, MW moved, steps, diverged steps and a note.
     Not logged: the per-unit plan, shunt switching in the seed preparation.
-  - `<hour>.pwb`. EPCs which already have an output `.pwb` are skipped; delete it to redo that hour. If one EPC fails, the error is printed and the rest continue.
+  - `<hour>.pwb`. EPCs which already have an output `.pwb` are skipped; delete it to redo that hour. If one EPC fails, the error is printed and the rest continue. A failure while clearing distributed generation, or in the final balance, does not lose the hour: the case is saved as it is, and the `runs` sheet has a `distgen` / `balance` row with a `failed: ...` note. Topology mode stops at the start if step 01 left no `Prepared/DummyBus.aux`.
   - Note: It may take ~1-2 hours per EPC, depending on your CPU's speed.
-- Run `03 Merge Reports.py` to merge every hour's log into `03 Merge Reports.xlsx`.
+- Run `03 Merge Reports.py` to merge every hour's log into `03 Merge Reports.xlsx`. Its `hours` sheet has a `Status` column: `ok` when the hour's `runs` sheet has a `main` row and no later run failed or stopped; `check` when one did (make-up, dist gen clearing or a balance: the swing may be off its goal); else `incomplete` (the hour failed or never finished: the log is only the plan, or is missing its result; its `areas` rows are still merged, but show the plan).
 - Code layout: `Scripts/pw.py` talks to PowerWorld. `Scripts/prep.py` holds the seed preparation both modes share, `Scripts/topo.py` the topology mode's matching and targets, and `Scripts/area.py` the area mode's targets and the swing balancing. `Scripts/scale.py` moves the case to the targets. `Scripts/settings.py` reads `settings.toml`. `tests/test_lib.py` runs without PowerWorld: `python tests/test_lib.py`.
 
 ## Settings
@@ -43,7 +43,7 @@ Area mode: first draft (2026-11-15), first written in `~/projects/areascale` (th
 - `pretest_gens`, `use_pvqv`: extra scaling exclusions, off by default. Turn them on for a case which is hard to solve. `use_pvqv` needs step 01's `compute_pvqv` (on by default).
 - `[scale] add_statcoms`, `drop_collapsed`: last-ditch solve aids, on by default (see [Iterate to Gen and Load Targets](#iterate-to-gen-and-load-targets)).
 
-The other sections (`[area]`, `[scale]`, `[prep]`, `[topology]`, `[pw]`) set the tuning constants of the `Scripts/` file they name: e.g. `[scale] exclude_vmin` sets `EXCLUDE_VMIN` in `Scripts/scale.py`. The code holds the defaults, so a setting left out of the file keeps its default, and a misspelt one is an error. `[area.unit_gentype]` / `[area.fuel_gentype]` add to or override the GenType maps.
+The other sections (`[area]`, `[scale]`, `[prep]`, `[topology]`, `[pw]`) set the tuning constants of the `Scripts/` file they name: e.g. `[scale] exclude_vmin` sets `EXCLUDE_VMIN` in `Scripts/scale.py`. The code holds the defaults, so a setting left out of the file keeps its default, and a misspelt one is an error. Only the settings in the shipped `settings.toml` (including the commented-out `[scale] max_workers`) are accepted: other upper-case names in the code (`RESOLUTION`, `STATCOM_ID`, ...) are not settings. Every value is checked before any is applied, so a rejected file changes nothing: e.g. `1 <= initial_step <= max_step <= 100`, `step_solves` and `final_max_rounds` at least 1, `exclude_vmin` below `exclude_vmax`, `commit_max_cf` above 0 and at most 1, `balance_tol_mw` above 0, `swing_mw_min` below `swing_mw_max`, `max_workers` a whole number of 1 or more. `[area.unit_gentype]` / `[area.fuel_gentype]` add to or override the GenType maps.
 
 # Process Notes
 

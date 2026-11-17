@@ -135,7 +135,10 @@ def create_giant_swing(SimAuto, bus_num: int) -> pd.DataFrame:
     """
     # Get current bus information at the swing bus.
     bus_df = pw.get_df(SimAuto, 'Bus', {'Number': int, 'Name': str, 'NomkV': float, 'Vpu': float})
-    bus_row = bus_df.loc[bus_df['Number'] == bus_num].iloc[0]
+    at_bus = bus_df.loc[bus_df['Number'] == bus_num]
+    if at_bus.empty:
+        raise ValueError(f'The giant swing bus {bus_num} is not in the case. Set swing_bus to a bus number in it, "slack" or "max_fault_duty".')
+    bus_row = at_bus.iloc[0]
 
     swing_dict = {
         'BusNum': bus_num

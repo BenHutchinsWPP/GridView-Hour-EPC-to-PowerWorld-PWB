@@ -555,11 +555,9 @@ def test_thermal_scaling_down_takes_smallest_units_off_first():
 def test_commitment_off_keeps_seed_statuses():
     case = gens([('g1', 1, '1', 'Closed', 'GT', 50.0, 100.0, 0.0), ('g2', 1, '2', 'Open', 'GT', 0.0, 400.0, 0.0)])
     epc = gens([('e1', 1, '9', 'Closed', 'GT', 150.0, 300.0, 0.0)])
-    area.COMMIT = False
-    try:
+    with saved_settings():
+        area.COMMIT = False
         df, report = area.gen_targets(epc, case)
-    finally:
-        area.COMMIT = True
     assert df['Status_Target'].to_dict() == {'g1': 'Closed'} and df['MWSetPoint_Target'].tolist() == [100.0]
     assert report['Unmet MW'].tolist() == [50.0]
 
@@ -593,12 +591,10 @@ def test_nonconforming_loads_are_left_alone():
     assert (r['Target MW'], r['Seed Non-conforming MW'], r['EPC Non-conforming MW']) == (150, 500, 900)
     bal = area.balance_targets({'Gen': gens([('g1', 1, '1', 'Closed', 'GT', 100.0, 300.0, 0.0)]), 'Load': case}, 50.0, [])
     assert bal['Load'].empty                                                     # Balancing never moves load.
-    area.SCALE_NONCONFORMING = True
-    try:
+    with saved_settings():
+        area.SCALE_NONCONFORMING = True
         targets, _ = area.build_targets({'Load': epc, 'Gen': gens([])}, {'Load': case, 'Gen': gens([])})
         assert targets['Load']['SMW_Target'].sum() == 1050
-    finally:
-        area.SCALE_NONCONFORMING = False
 
 def test_build_targets_leaves_slack_bus_gens_out_of_both_cases():
     # Identical cases: the slack-bus unit's 300 MW is not loaded onto g1, and the area still matches by key.
@@ -735,13 +731,21 @@ def test_rescale_targets():
 # ------------------ review fixes ------------------
 @contextmanager
 def saved_settings():
-    """Module settings (upper-case globals) as they are now, put back afterwards."""
-    saved = {(m, k): v for m in settings.MODULES.values() for k, v in vars(m).items() if k.isupper()}
+    """Module settings (upper-case globals, and pw's print flags) as they are now, put back afterwards."""
+    saved = module_settings()
+    prints = pw.print_opened, pw.print_solve_errors
     try:
         yield
     finally:
-        for (m, k), v in saved.items():
-            setattr(m, k, v)
+        restore_settings(saved)
+        pw.print_opened, pw.print_solve_errors = prints
+
+def module_settings():
+    return {(m, k): v for m in settings.MODULES.values() for k, v in vars(m).items() if k.isupper()}
+
+def restore_settings(saved):
+    for (m, k), v in saved.items():
+        setattr(m, k, v)
 
 def test_nonconforming_is_decided_by_key():
     # l2 is non-conforming in the PWB only. The EPC's l2 (500 MW) must not be loaded onto l1.
@@ -889,8 +893,10 @@ def load_step_02(folder: Path, mode: str):
     """'02 Scale Hours.py' (not importable by name), pointed at `folder`. SimAuto isn't connected: no win32com needed."""
     spec = importlib.util.spec_from_file_location('step_02', Path(__file__).resolve().parents[1] / '02 Scale Hours.py')
     step = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(step)
-    step.run['mode'] = mode
+    saved = module_settings()
+    spec.loader.exec_module(step)           # Loads settings.toml: the owner's choices must not reach the tests.
+    restore_settings(saved)
+    step.run = dict(settings.RUN_DEFAULTS, mode=mode)
     step.gv_dir, step.out_dir = folder / 'HourEPCs', folder / 'Output'
     step.pw_fp, step.pvqv_fp, step.dummy_bus_fp = folder / 'Prepared.pwb', folder / 'pvqv.csv', folder / 'DummyBus.aux'
     for d in (step.gv_dir, step.out_dir):
@@ -960,6 +966,7 @@ def test_step_02_topology_mode_aims_its_own_slack_at_its_epc_value():
     with saved_settings(), tempfile.TemporaryDirectory() as d:
         step = load_step_02(Path(d), 'topology')
         step.run['balance_swing'] = True
+        area.BALANCE_TRIGGER_MW = 100.0
         sa = TwoIslands({'h1.epc': (epc_gen, epc_load), 'Prepared.pwb': (gen, load)}, slack=[2, 5])
         sa.islands = {5: '2'}
         real, got = step.topo.compute_pw_targets, {}
@@ -975,6 +982,10 @@ def test_step_02_topology_mode_aims_its_own_slack_at_its_epc_value():
     swing = got['reports']['swing']
     assert swing.index.tolist() == ['s1'] and swing['EPC MW'].tolist() == [300.0], swing
     assert abs(runs['Swing MW After'].iloc[-1] - 300.0) <= area.BALANCE_TOL_MW, runs
+    # The pre-balance counts the slack's planned +200 MW: the other gens take only the rest of the load's +300 (105 with dist gen)...
+    assert runs['Run'].iloc[0] == 'prebalance' and abs(runs['Gen MW Moved'].iloc[0] - 105.0) < 1e-6, runs
+    # ...and the midrun balancer expects the slack to ride up to 300 MW with the scaling (trigger 100), so it never balances.
+    assert not runs['Run'].str.startswith('midrun').any(), runs
 
 def test_slack_bus_gens_are_the_swing_when_there_is_no_giant_swing():
     # Bus 9 is the slack bus: its unit carries the imbalance, and neither balance writes to it.
@@ -1332,16 +1343,23 @@ def test_merge_reports_merges_hour_logs():
         exc_a = pd.DataFrame({'Table': ['Gen', 'STATCOM'], 'ObjectID': ['g1', 'SC1']}).reindex(columns=scale.EXCEPTION_COLUMNS)
         runs_a = pd.DataFrame({'Run': ['main', 'balance1'], 'Swing MW After': [10.0, 25.0]}).reindex(columns=scale.RUN_COLUMNS)
         pw.write_excel(out_dir / 'HourA_Log.xlsx', {'areas': areas_a, 'exceptions': exc_a, 'runs': runs_a})
-        runs_b = pd.DataFrame({'Run': ['main'], 'Swing MW After': [7.0]}).reindex(columns=scale.RUN_COLUMNS)
+        runs_b = pd.DataFrame({'Run': ['main', 'balance1'], 'Swing MW After': [9.0, 7.0],      # Final balance ran out of rounds.
+                               'Note': ['', 'stopped at max rounds']}).reindex(columns=scale.RUN_COLUMNS)
         pw.write_excel(out_dir / 'HourB_Log.xlsx', {'areas': pd.DataFrame(columns=area.AREAS_COLUMNS),
                                                     'exceptions': pd.DataFrame(), 'runs': runs_b})
+        # HourC: the plan's log, left by a failed hour (no runs): not a result, but its areas rows are still merged.
+        areas_c = pd.DataFrame({'AreaNumber': [2], 'Group': ['Load'], 'Target MW': [50.0]}).reindex(columns=area.AREAS_COLUMNS)
+        pw.write_excel(out_dir / 'HourC_Log.xlsx', {'areas': areas_c, 'exceptions': pd.DataFrame(),
+                                                    'runs': pd.DataFrame(columns=scale.RUN_COLUMNS)})
         target = merge_reports.merge(out_dir)
         sheets = pd.read_excel(target, sheet_name=None)
     assert set(sheets) == {'hours', 'areas', 'exceptions', 'runs'}, set(sheets)
     for name in ('areas', 'exceptions', 'runs'):
         assert sheets[name].columns[0] == 'Hour', name
-    assert len(sheets['hours']) == 2
+    assert len(sheets['hours']) == 3
     hours = sheets['hours'].set_index('Hour')
+    assert hours['Status'].to_dict() == {'HourA': 'ok', 'HourB': 'check', 'HourC': 'incomplete'}
+    assert sheets['areas'].loc[sheets['areas']['Hour'] == 'HourC', 'Target MW'].tolist() == [50.0]
     assert hours.loc['HourA', 'Final Swing MW'] == 25.0 and hours.loc['HourB', 'Final Swing MW'] == 7.0
     assert hours.loc['HourA', 'Balance MW'] == 3.0
     assert hours.loc['HourA', 'Worst Error MW'] == -4.0
@@ -1470,17 +1488,13 @@ def test_loss_estimate_scales_each_area_with_its_load():
     area_load = pd.DataFrame({'AreaNumber': [1, 2], 'Seed Non-conforming MW': [100.0, 0.0]})
     est = area.loss_estimate({'Load': load}, area_load, pd.Series({1: 9.0, 2: 3.0, 3: 5.0}))
     assert est['Est. Loss MW'].round(9).to_dict() == {1: 4.0, 2: 3.0, 3: 5.0} and est['Seed Loss MW'].to_dict() == {1: 9.0, 2: 3.0, 3: 5.0}
-    area.LOSS_EXPONENT = 0.0
-    try:
+    with saved_settings():
+        area.LOSS_EXPONENT = 0.0
         assert (area.loss_estimate({'Load': load}, area_load, pd.Series({1: 9.0}))['Est. Loss MW'] == 9.0).all()
-    finally:
-        area.LOSS_EXPONENT = 2.0
     # Scaled non-conforming load is in the targets already: not added again. Area 1: 200 -> 100, losses 9 / 4.
-    area.SCALE_NONCONFORMING = True
-    try:
+    with saved_settings():
+        area.SCALE_NONCONFORMING = True
         assert area.loss_estimate({'Load': load}, area_load, pd.Series({1: 9.0}))['Est. Loss MW'].round(9).tolist() == [2.25]
-    finally:
-        area.SCALE_NONCONFORMING = False
 
 def test_loss_estimate_uses_positive_load_and_caps_the_ratio():
     # Area 1: 100 MW load beside a -95 MW DC load; the load goes to 150. Net 5 -> 55 would give losses x121.
@@ -1844,6 +1858,177 @@ def test_a_unit_at_its_target_is_not_held_for_voltage_and_gets_its_status():
     g = t['Gen']
     assert g.loc['g2', 'Status'] == 'Open' and g.loc['g2', 'ExclusionReason'] == '' and g.loc['g2', 'Progress'] == scale.RESOLUTION
     assert 'g2' not in set(scale.exceptions([], t)['ObjectID'])
+
+# ------------------ robustness (settings, merge, step 02, prep) ------------------
+def test_settings_allowed_keys_are_the_shipped_files_keys():
+    import tomllib
+    text = (Path(__file__).resolve().parents[1] / 'settings.toml').read_text(encoding='utf-8')
+    data = tomllib.loads(text)
+    assert set(data['run']) == set(settings.RUN_DEFAULTS)
+    assert set(data) - {'run'} == set(settings.SETTINGS)
+    for section, keys in settings.SETTINGS.items():
+        shipped = set(data[section])
+        if section == 'scale':
+            assert '# max_workers =' in text     # Commented out in the file: the default is the CPU count.
+            shipped.add('max_workers')
+        assert shipped == keys, (section, shipped ^ keys)
+        assert all(hasattr(settings.MODULES[section], k.upper()) for k in keys), section
+
+def test_settings_reject_values_that_hang_or_disable_the_engine_and_change_nothing():
+    first = '[topology]\ntap_threshold = 0.3\n'      # Valid, and read before the bad value: must not stick either.
+    bad = ['[scale]\nmax_step = 0\n', '[scale]\ninitial_step = 0\n', '[scale]\ninitial_step = -5\n',
+           '[scale]\ninitial_step = 50\nmax_step = 25\n', '[scale]\nmax_step = 101\n', '[scale]\ninitial_step = 2.5\n',
+           '[scale]\nstep_solves = 0\n', '[scale]\nfinal_max_rounds = 0\n',
+           '[scale]\nexclude_vmin = 1.2\n', '[scale]\nexclude_vmin = 1.12\n', '[scale]\nexclude_vmax = 0.8\n',
+           '[scale]\nmax_workers = 0\n', '[scale]\nmax_workers = "eight"\n', '[scale]\nmax_workers = 2.5\n',
+           '[pw]\nmva_mismatch_threshold = 0\n', '[area]\ncommit_max_cf = 0\n', '[area]\ncommit_max_cf = 1.5\n',
+           '[area]\nbalance_max_rounds = -1\n', '[area]\nbalance_trigger_mw = -1.0\n', '[area]\nbalance_tol_mw = 0\n',
+           '[area]\nloss_exponent = 3.0\nbalance_tol_mw = 0\n',
+           '[prep]\nswing_mw_min = 50000.0\n', '[prep]\nswing_mw_max = -30000.0\n', '[prep]\nswing_mw_max = -20000.0\n']
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        fp = Path(d) / 's.toml'
+        before = module_settings()
+        for text in bad:
+            fp.write_text(first + text)
+            try:
+                settings.load(fp)
+                assert False, text
+            except ValueError:
+                pass
+            assert module_settings() == before, text         # A rejected file changes nothing (LOSS_EXPONENT included).
+        # The edges which are allowed.
+        for text in ['[scale]\ninitial_step = 1\nmax_step = 1\nstep_solves = 1\nfinal_max_rounds = 1\nmax_workers = 1\n',
+                     '[scale]\ninitial_step = 100\nmax_step = 100\n', '[area]\nbalance_max_rounds = 0\nbalance_trigger_mw = 0\ncommit_max_cf = 1.0\n',
+                     '[prep]\nswing_mw_max = 1.0\nswing_mw_min = 0.0\n']:
+            fp.write_text(text)
+            settings.load(fp)
+
+def test_settings_reject_names_which_are_code_not_settings():
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        fp = Path(d) / 's.toml'
+        for text in ['[area]\nload_p = ["SMW"]\n', '[prep]\nswing_id = "yy"\n', '[scale]\nstatcom_id = "x"\n',
+                     '[scale]\nmain_island = 2\n', '[scale]\nresolution = 10\n', '[area]\nstatus = {}\n']:
+            fp.write_text(text)
+            try:
+                settings.load(fp)
+                assert False, text
+            except ValueError as e:
+                assert 'unknown setting' in str(e), e
+
+def test_loading_step_02_leaves_the_owners_settings_out_of_the_tests():
+    # The step imports settings.toml. Whatever it holds (here: a file which turns on balancing off and commit off), the
+    # tests start from the code defaults and the default [run] switches, and the print flags are put back.
+    with tempfile.TemporaryDirectory() as d:
+        fp = Path(d) / 'owner.toml'
+        fp.write_text('[run]\nbalance_swing = false\npretest_gens = true\n[area]\ncommit = false\nmakeup = false\n')
+        real = settings.load.__defaults__
+        original = pw.print_opened, pw.print_solve_errors
+        pw.print_opened = pw.print_solve_errors = True       # The step turns both off at import.
+        flags = True, True
+        with saved_settings():
+            before = module_settings()
+            settings.load.__defaults__ = (fp,)
+            try:
+                step = load_step_02(Path(d), 'area')
+            finally:
+                settings.load.__defaults__ = real
+            assert module_settings() == before and area.COMMIT is True and area.MAKEUP is True
+            assert step.run == dict(settings.RUN_DEFAULTS, mode='area')
+        assert (pw.print_opened, pw.print_solve_errors) == flags
+        pw.print_opened, pw.print_solve_errors = original
+
+def test_step_02_stops_clearly_when_topology_mode_has_no_dummy_bus_file():
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        step = load_step_02(Path(d), 'area')
+        step.check_inputs()                                  # Area mode needs neither file.
+        step.run['mode'] = 'topology'
+        try:
+            step.check_inputs()
+            assert False
+        except SystemExit as e:
+            assert 'DummyBus.aux' in str(e) and 'topology mode' in str(e)
+        step.dummy_bus_fp.write_text('')
+        step.check_inputs()
+
+def test_giant_swing_on_a_bus_not_in_the_case_is_a_clear_error():
+    sa = FakeSimAuto()
+    try:
+        prep.create_giant_swing(sa, 424242)
+        assert False
+    except ValueError as e:
+        assert '424242' in str(e) and 'not in the case' in str(e)
+    assert not sa.applied
+
+def step_02_hour_with_a_failure(fail_balance=False, fail_distgen=False):
+    """Runs one area-mode hour in step 02. A non-conforming load (l2, not in the EPC) lets the test push the swing off by
+    50 MW after the main run and again after balance round 1, outside what the ledger counts. fail_balance: the read at the
+    start of balance round 2 raises. fail_distgen: the dist gen cleanup raises. Returns (runs sheet, areas sheet, case out)."""
+    gen, load = two_cases()
+    load = pd.concat([load, loads([('l2', 1, 'Closed', 30.0, 0.0, 0.0, 3.0)]).assign(BusNum=4, NomkV=230.0, BusName='b', AGC='NO')], ignore_index=True)
+    epc_gen = gens([('e1', 1, '1', 'Closed', 'GT', 150.0, 1000.0, 0.0), ('e2', 1, '2', 'Closed', 'HY', 50.0, 1000.0, 0.0)]).assign(BusNum=[1, 2], MW=0.0, NomkV=230.0, BusName='b')
+    epc_load = loads([('e1', 1, 'Closed', 300.0, 0.0, 0.0, 30.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
+    calls, armed = [], []
+    with saved_settings(), tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(io.StringIO()):
+        step = load_step_02(Path(d), 'area')
+        sa = CaseSimAuto({'h1.epc': (epc_gen, epc_load), 'Prepared.pwb': (gen, load)}, slack=[99])
+        real_iterate, real_read, real_cleanup = scale.iterate_to_gen_load_targets, area.read_case, area.dist_gen_cleanup
+        def iterate(*args, **kwargs):
+            out = real_iterate(*args, **kwargs)
+            calls.append(kwargs.get('label'))
+            if fail_balance and len(calls) <= 2:
+                sa.base['Load'].loc[4, 'SMW'] += 50.0
+                if len(calls) == 2:
+                    armed.append(1)
+            return out
+        def read_case(*args, **kwargs):
+            if armed:
+                armed.clear()
+                raise RuntimeError('boom')
+            return real_read(*args, **kwargs)
+        def cleanup(*args, **kwargs):
+            raise RuntimeError('no dist gen')
+        scale.iterate_to_gen_load_targets, area.read_case = iterate, read_case
+        if fail_distgen:
+            area.dist_gen_cleanup = cleanup
+        try:
+            step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')
+        finally:
+            scale.iterate_to_gen_load_targets, area.read_case, area.dist_gen_cleanup = real_iterate, real_read, real_cleanup
+        assert (step.out_dir / 'h1.pwb').exists()
+        sheets = pd.read_excel(step.out_dir / 'h1_Log.xlsx', sheet_name=None, keep_default_na=False)
+    if fail_balance:
+        assert calls[:2] == [None, 'Final balance 1'], calls         # Round 1 ran, then round 2's read raised.
+    return sheets['runs'], sheets['areas'], sa.saved['h1.pwb']
+
+def test_step_02_keeps_the_hour_when_the_final_balance_raises():
+    runs, areas, out = step_02_hour_with_a_failure(fail_balance=True)
+    assert runs['Run'].tolist()[-2:] == ['balance1', 'balance2'], runs                 # Round 1 is kept...
+    assert pd.to_numeric(runs['Swing MW After'], errors='coerce').notna().iloc[-2], runs  # ...with its After.
+    assert runs['Note'].iloc[-1].startswith("failed: RuntimeError('boom')"), runs
+    assert not areas['Note'].astype(str).str.contains('unexplained').any(), areas        # Round 1's table was kept.
+    assert areas.loc[areas['Group'] != 'Load', 'Balance MW'].abs().sum() > 1, areas
+
+def test_final_balance_failing_inside_its_scaling_keeps_one_row():
+    gen, load = swing_case()
+    sa = SwingSimAuto(gen, load)
+    sa.base['Load'].loc[3, 'SMW'] = 900.0                       # Swing at +700 MW.
+    real = scale.iterate_to_gen_load_targets
+    def boom(*a, **k):
+        raise RuntimeError('inside')
+    scale.iterate_to_gen_load_targets = boom
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            runs = area.balance_swing(sa)
+    finally:
+        scale.iterate_to_gen_load_targets = real
+    assert [r.name for r in runs] == ['balance1'] and "failed: RuntimeError('inside')" in runs[0].note
+    assert runs[0].before is not None and pd.notna(runs[0].after)
+
+def test_step_02_keeps_the_hour_when_the_dist_gen_cleanup_raises():
+    runs, areas, out = step_02_hour_with_a_failure(fail_distgen=True)
+    row = runs[runs['Run'] == 'distgen'].iloc[0]
+    assert row['Note'].startswith("failed: RuntimeError('no dist gen')"), runs
+    assert not areas['Note'].astype(str).str.contains('unexplained').any(), areas
 
 if __name__ == '__main__':
     tests = [f for name, f in dict(globals()).items() if name.startswith('test_')]

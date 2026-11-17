@@ -5,7 +5,7 @@ from Scripts import pw
 
 EXCEL_MAX_ROWS = 1_048_576
 MERGED_SHEETS = ['areas', 'exceptions', 'runs']     # Fixed sheet names written by step 02 (area mode: all three; topology: no areas).
-HOUR_COLUMNS = ['Hour', 'Final Swing MW', 'Unmet MW', 'Not Reached MW', 'Make-up MW', 'Balance MW', 'Worst Error MW', 'Worst AreaNumber',
+HOUR_COLUMNS = ['Hour', 'Status', 'Final Swing MW', 'Unmet MW', 'Not Reached MW', 'Make-up MW', 'Balance MW', 'Worst Error MW', 'Worst AreaNumber',
                 'Worst Group', 'Exceptions Gen/Load', 'Exceptions STATCOM', 'Exceptions Branch']
 
 def _hour_row(hour: str, sheets: dict[str, pd.DataFrame]) -> dict:
@@ -13,6 +13,13 @@ def _hour_row(hour: str, sheets: dict[str, pd.DataFrame]) -> dict:
     row = dict.fromkeys(HOUR_COLUMNS, np.nan)
     row['Hour'] = hour
     runs = sheets.get('runs')
+    # Step 02 writes the plan's log before scaling: without a `main` run the hour failed or never finished, and the
+    # columns below are the plan's (or blank), not a result.
+    if runs is None or 'Run' not in runs or not (runs['Run'] == 'main').any():
+        row['Status'] = 'incomplete'
+    else:       # Scaled, but a later run (make-up, dist gen, a balance) failed or stopped: the swing may be off its goal.
+        notes = runs['Note'].astype(str) if 'Note' in runs else pd.Series(dtype=str)
+        row['Status'] = 'check' if notes.str.contains(r'(?:^|; )(?:failed|stopped)').any() else 'ok'
     # Near 0 with a giant swing; with the case's own slack, its end MW (its goal is its EPC MW, or within its limits).
     row['Final Swing MW'] = runs['Swing MW After'].iloc[-1] if runs is not None and len(runs) else np.nan
     areas = sheets.get('areas')
@@ -39,7 +46,8 @@ def _hour_row(hour: str, sheets: dict[str, pd.DataFrame]) -> dict:
 def merge(out_dir: Path) -> Path:
     """
     Merges every <hour>_Log.xlsx in out_dir. Returns the workbook path ('03 Merge Reports.xlsx', beside out_dir).
-    Sheets: `hours` (one row per hour), then each of MERGED_SHEETS with an Hour column first. A merged sheet over Excel's
+    Sheets: `hours` (one row per hour; Status 'incomplete' = no `main` run in its log: the hour's areas rows are still
+    merged, but show the plan; 'check' = scaled, but a later run failed or stopped, so the swing may be off its goal), then each of MERGED_SHEETS with an Hour column first. A merged sheet over Excel's
     row limit is written as a CSV beside the workbook instead, and printed.
     """
     files = sorted(f for f in Path(out_dir).glob('*_Log.xlsx') if not f.name.startswith('~$'))  # Not Excel's lock files.

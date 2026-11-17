@@ -3,7 +3,7 @@ Reads settings.toml (repo root). No dependencies: tomllib is in Python 3.11+.
 
 [run] holds the switches the step scripts read, returned by load(). Every other section sets the constants of the module
 it names, by upper-cased key: [scale] exclude_vmin = 0.88 sets Scripts/scale.py's EXCLUDE_VMIN. The modules hold the
-defaults, so a key left out of the file keeps its default, and an unknown key is an error.
+defaults, so a key left out of the file keeps its default, and an unknown key (one not in SETTINGS) is an error.
 """
 import tomllib
 from pathlib import Path
@@ -26,8 +26,18 @@ RUN_DEFAULTS = {
     'balance_swing': True,
 }
 MODES = ('area', 'topology')
-# Tables a section may add to. Other dict attributes (STATUS, LOAD_FIELDS, ...) are code, not settings.
-MAPS = {(area, 'UNIT_GENTYPE'), (area, 'FUEL_GENTYPE')}
+# The keys each section accepts: those in the shipped settings.toml (max_workers is commented out there). Other upper-case
+# names in the modules (RESOLUTION, STATCOM_ID, LOAD_P, STATUS, ...) are code, not settings.
+SETTINGS = {
+    'pw': {'mva_mismatch_threshold'},
+    'prep': {'swing_mw_max', 'swing_mw_min', 'shunt_vlow', 'shunt_vhigh', 'shunt_max_iterations'},
+    'topology': {'tap_threshold', 'unsupported_gv_branch_types'},
+    'area': {'commit', 'commit_max_cf', 'all_on_types', 'off_at_zero_types', 'manual_unit_types', 'scale_nonconforming',
+             'loss_exponent', 'makeup', 'balance_tol_mw', 'balance_max_rounds', 'balance_trigger_mw',
+             'balance_at_swing_limits', 'max_unknown_share', 'gen_types', 'unit_gentype', 'fuel_gentype'},
+    'scale': {'add_statcoms', 'drop_collapsed', 'exclude_vmin', 'exclude_vmax', 'statcom_vpu', 'statcom_vnom_min',
+              'collapse_vpu', 'pvqv_dv_limit', 'initial_step', 'max_step', 'step_solves', 'final_max_rounds', 'max_workers'},
+}
 # Code letter sets / maps: compared against upper-cased codes.
 CODE_KEYS = {(area, 'UNIT_GENTYPE'), (area, 'FUEL_GENTYPE'), (area, 'MANUAL_UNIT_TYPES')}
 FUEL = 'fuel'   # In [area.unit_gentype]: decide by the fuel type.
@@ -50,10 +60,47 @@ def _check_type(fp, what: str, default, value, allow_int: bool = False):
     if want is not None and got != want and not (allow_int and got == 'number'):
         raise ValueError(f'{fp}: {what} must be {want}, not {value!r}')
 
+def _need(fp, ok: bool, what: str):
+    if not ok:
+        raise ValueError(f'{fp}: {what}')
+
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+def _check_ranges(fp, get):
+    """Rejects values which hang the engine or silently disable it. `get(module, NAME)`: the value the file would set."""
+    for name in ('INITIAL_STEP', 'MAX_STEP', 'STEP_SOLVES', 'FINAL_MAX_ROUNDS'):
+        _need(fp, _is_int(get(scale, name)), f'[scale] {name.lower()} must be a whole number')
+    _need(fp, _is_int(get(area, 'BALANCE_MAX_ROUNDS')), '[area] balance_max_rounds must be a whole number')
+    workers = get(scale, 'MAX_WORKERS')
+    _need(fp, workers is None or (_is_int(workers) and workers >= 1), f'[scale] max_workers must be a whole number of 1 or more, not {workers!r}')
+    _need(fp, 1 <= get(scale, 'INITIAL_STEP') <= get(scale, 'MAX_STEP') <= scale.RESOLUTION,
+          f'[scale] needs 1 <= initial_step <= max_step <= {scale.RESOLUTION}, not {get(scale, "INITIAL_STEP")}, {get(scale, "MAX_STEP")}')
+    _need(fp, get(scale, 'STEP_SOLVES') >= 1, f'[scale] step_solves must be 1 or more, not {get(scale, "STEP_SOLVES")}')
+    _need(fp, get(scale, 'FINAL_MAX_ROUNDS') >= 1, f'[scale] final_max_rounds must be 1 or more, not {get(scale, "FINAL_MAX_ROUNDS")}')
+    _need(fp, get(scale, 'EXCLUDE_VMIN') < get(scale, 'EXCLUDE_VMAX'),
+          f'[scale] exclude_vmin ({get(scale, "EXCLUDE_VMIN")}) must be below exclude_vmax ({get(scale, "EXCLUDE_VMAX")})')
+    _need(fp, get(pw, 'MVA_MISMATCH_THRESHOLD') > 0, f'[pw] mva_mismatch_threshold must be above 0, not {get(pw, "MVA_MISMATCH_THRESHOLD")}')
+    _need(fp, 0 < get(area, 'COMMIT_MAX_CF') <= 1, f'[area] commit_max_cf must be above 0 and at most 1, not {get(area, "COMMIT_MAX_CF")}')
+    _need(fp, get(area, 'BALANCE_MAX_ROUNDS') >= 0, f'[area] balance_max_rounds must be 0 or more, not {get(area, "BALANCE_MAX_ROUNDS")}')
+    _need(fp, get(area, 'BALANCE_TRIGGER_MW') >= 0, f'[area] balance_trigger_mw must be 0 or more, not {get(area, "BALANCE_TRIGGER_MW")}')
+    _need(fp, get(area, 'BALANCE_TOL_MW') > 0, f'[area] balance_tol_mw must be above 0, not {get(area, "BALANCE_TOL_MW")}')
+    _need(fp, get(prep, 'SWING_MW_MIN') < get(prep, 'SWING_MW_MAX'),
+          f'[prep] swing_mw_min ({get(prep, "SWING_MW_MIN")}) must be below swing_mw_max ({get(prep, "SWING_MW_MAX")})')
+    _need(fp, get(area, 'LOSS_EXPONENT') >= 0, f'[area] loss_exponent must be 0 or more, not {get(area, "LOSS_EXPONENT")}')
+    gen_types = set(get(area, 'GEN_TYPES'))
+    bad = {v for n in ('UNIT_GENTYPE', 'FUEL_GENTYPE') for v in get(area, n).values() if v is not None and v not in gen_types}
+    bad |= (get(area, 'ALL_ON_TYPES') | get(area, 'OFF_AT_ZERO_TYPES')) - gen_types
+    _need(fp, not bad, f'GenTypes {sorted(bad)} are not in [area] gen_types {get(area, "GEN_TYPES")}')
+
 def load(fp: Path = DEFAULT_FP) -> dict:
-    """Applies the file's module settings, and returns the [run] settings (defaults filled in)."""
+    """
+    Applies the file's module settings, and returns the [run] settings (defaults filled in). Every value is checked
+    before any is applied: a rejected file changes nothing.
+    """
     data = tomllib.loads(Path(fp).read_text(encoding='utf-8'))
     run = dict(RUN_DEFAULTS)
+    new = {}        # (module, NAME) -> the value to set.
     for section, values in data.items():
         if section == 'run':
             unknown = set(values) - set(RUN_DEFAULTS)
@@ -67,12 +114,10 @@ def load(fp: Path = DEFAULT_FP) -> dict:
             raise ValueError(f'{fp}: unknown section [{section}]. Sections: run, {", ".join(MODULES)}')
         module = MODULES[section]
         for key, value in values.items():
-            name = key.upper()
-            if not hasattr(module, name):
+            if key not in SETTINGS[section]:
                 raise ValueError(f'{fp}: unknown setting [{section}] {key}')
+            name = key.upper()
             current = getattr(module, name)
-            if isinstance(current, dict) and (module, name) not in MAPS:
-                raise ValueError(f'{fp}: [{section}] {key} is not a setting')
             _check_type(fp, f'[{section}] {key}', current, value)
             if (module, name) in CODE_KEYS:
                 value = {k.upper(): v for k, v in value.items()} if isinstance(value, dict) else [v.upper() for v in value]
@@ -81,17 +126,13 @@ def load(fp: Path = DEFAULT_FP) -> dict:
                 value = {**current, **{k: (None if v == FUEL else v) for k, v in value.items()}}
             elif isinstance(current, set):
                 value = set(value)
-            setattr(module, name, value)
+            new[(module, name)] = value
 
     if run['mode'] not in MODES:
         raise ValueError(f'{fp}: [run] mode must be one of {MODES}, not {run["mode"]!r}')
     if not (run['swing_bus'] in ('slack', 'max_fault_duty') or type(run['swing_bus']) is int):
         raise ValueError(f"{fp}: [run] swing_bus must be 'slack', 'max_fault_duty' or a bus number")
-    if area.LOSS_EXPONENT < 0:
-        raise ValueError(f'{fp}: [area] loss_exponent must be 0 or more, not {area.LOSS_EXPONENT}')
-    gen_types = set(area.GEN_TYPES)
-    bad = {v for m in (area.UNIT_GENTYPE, area.FUEL_GENTYPE) for v in m.values() if v is not None and v not in gen_types}
-    bad |= (area.ALL_ON_TYPES | area.OFF_AT_ZERO_TYPES) - gen_types
-    if bad:
-        raise ValueError(f'{fp}: GenTypes {sorted(bad)} are not in [area] gen_types {area.GEN_TYPES}')
+    _check_ranges(fp, lambda module, name: new.get((module, name), getattr(module, name)))
+    for (module, name), value in new.items():
+        setattr(module, name, value)
     return run

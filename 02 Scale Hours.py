@@ -115,7 +115,11 @@ def create_case(SimAuto, gv_fp, out_fp):
     # Main last of the runs during scaling (its midrun balances happened inside it), so its After is where scaling left
     # the swing; the final balance rounds follow. The last row's After is where the swing ended.
     runs = [*pre_runs, *midrun_runs, scale.Run('main', log, before=before, after=swing())]
-    runs += clear_dist_gen(SimAuto, swing)
+    try:
+        runs += clear_dist_gen(SimAuto, swing)
+    except Exception as e:     # Never lose the hour over its dist gen: it stays on the loads which kept it.
+        print(f'WARNING: clearing dist gen failed: {e!r}. Carrying on without it.')
+        runs.append(scale.Run('distgen', note=f'failed: {e!r}'))
     if area_mode and area.MAKEUP:
         # What excluded units didn't reach goes onto their group's other units, before the final balance.
         try:
@@ -125,7 +129,11 @@ def create_case(SimAuto, gv_fp, out_fp):
             makeup_tables.clear()
             runs.append(scale.Run('makeup', note=f'failed: {e!r}'))
     if run['balance_swing']:
-        runs += area.balance_swing(SimAuto, targets, tables=balance_tables, epc=reports['swing'])
+        try:
+            runs += area.balance_swing(SimAuto, targets, tables=balance_tables, epc=reports['swing'])
+        except Exception as e:     # Last resort: balance_swing() keeps its own failed rounds; never lose the hour.
+            print(f'WARNING: final balance failed: {e!r}. Saving the case as it is.')
+            runs.append(scale.Run('balance', note=f'failed: {e!r}'))
     # Read back from PowerWorld, so the log shows what the case holds rather than what the scaling meant to do.
     final = area.read_case(SimAuto) if area_mode else {t: pw.get_df(SimAuto, t, f) for t, f in topo.TARGET_FIELDS.items()}
     final_loss = area.area_losses(SimAuto) if area_mode else None      # The areas sheet's Final Loss MW.
@@ -144,10 +152,16 @@ def create_case(SimAuto, gv_fp, out_fp):
 
     SimAuto.CloseCase()
 
-if(__name__=='__main__'):
-    print(f'Mode: {run["mode"]}')
+def check_inputs():
+    """Stops with a clear message if step 01 didn't leave what this run's settings need."""
     if run['use_pvqv'] and not pvqv_fp.exists():
         raise SystemExit(f'use_pvqv needs {pvqv_fp}: run step 01 with compute_pvqv = true.')
+    if run['mode'] == 'topology' and not dummy_bus_fp.exists():
+        raise SystemExit(f'Topology mode needs {dummy_bus_fp}: run step 01 in topology mode first.')
+
+if(__name__=='__main__'):
+    print(f'Mode: {run["mode"]}')
+    check_inputs()
     # Created here, not at import: multiprocessing workers re-import this module.
     SimAuto = pw.connect()
     gv_fps = sorted(gv_dir.glob('*.epc'))
