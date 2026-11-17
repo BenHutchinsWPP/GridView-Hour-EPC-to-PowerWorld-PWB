@@ -62,8 +62,7 @@ def create_case(SimAuto, gv_fp, out_fp):
     if area_mode:
         targets, reports = area.compute_targets(SimAuto, gv_fp, pw_fp)
     else:
-        targets = topo.compute_pw_targets(SimAuto, gv_fp, pw_fp, dummy_bus_fp)
-        reports = {'swing': topo.swing_epc(targets)}
+        targets, reports = topo.compute_pw_targets(SimAuto, gv_fp, pw_fp, dummy_bus_fp)
     pretest = []
     if run['pretest_gens']:
         gen_df = targets['Gen'] = scale.test_gen_targets_parallel(pw_fp, targets['Gen'])
@@ -110,13 +109,9 @@ def create_case(SimAuto, gv_fp, out_fp):
     slack = prep.slack_buses(SimAuto)
     swing = lambda: area.swing_mw(pw.get_df(SimAuto, 'Gen', area.GEN_FIELDS), slack)[0]
     before = swing()
-    midrun_runs = []
-    if run['balance_swing']:
-        # Balance the swing whenever it drifts far during scaling, and again at the end.
-        after_step, midrun_runs = area.midrun_balancer(SimAuto, reports['swing'])
-        log = scale.iterate_to_gen_load_targets(SimAuto, targets, pvqv, after_step)
-    else:
-        log = scale.iterate_to_gen_load_targets(SimAuto, targets, pvqv)
+    # Balance the swing whenever it drifts far during scaling, and again at the end.
+    after_step, midrun_runs = area.midrun_balancer(SimAuto, reports['swing']) if run['balance_swing'] else (None, [])
+    log = scale.iterate_to_gen_load_targets(SimAuto, targets, pvqv, after_step)
     # Main last of the runs during scaling (its midrun balances happened inside it), so its After is where scaling left
     # the swing; the final balance rounds follow. The last row's After is where the swing ended.
     runs = [*pre_runs, *midrun_runs, scale.Run('main', log, before=before, after=swing())]

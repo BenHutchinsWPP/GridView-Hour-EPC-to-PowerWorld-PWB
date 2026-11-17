@@ -77,7 +77,7 @@ gen_types = ["Solar", "Hydro", "Wind", "Thermal", "Battery Storage", "Unknown"]
 
 [scale]
 # Last-ditch solve aids. They change the network (in both modes), only to keep the case solving; every change is listed
-# in the scale log (statcom_bus_df, dropped_branch_df) for review. true / false.
+# in the log's `exceptions` sheet for review. true / false.
 add_statcoms = true         # Add a STATCOM (ID "SC") on the lowest-voltage bus below statcom_vpu.
 drop_collapsed = true       # Open branches into network sections below collapse_vpu.
 exclude_vmin = 0.88         # Hold gens/loads back from scaling while their bus is outside this band.

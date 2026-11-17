@@ -471,7 +471,7 @@ def retry_held(SimAuto, targets, label: str):
 class Run:
     """
     One scaling run, for the `exceptions` and `runs` sheets.
-    name: 'prebalance', 'main', 'midrun<N>', 'distgen' or 'balance<N>'. log: what iterate_to_gen_load_targets() returned (or the error's `.log`).
+    name: 'prebalance', 'main', 'midrun<N>', 'distgen', 'makeup', 'pretest' or 'balance<N>'. log: what iterate_to_gen_load_targets() returned (or the error's `.log`).
     moved: a balance's balance_targets() tables, after scaling (None for the main run). before / after: the swing's MW
     around the run (NaN: not measured). at: a midrun balance's main progress, e.g. '50 of 100'. note: short flags.
     """
@@ -640,7 +640,6 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None,
             **{table.lower(): df[~included(df)] for table, df in targets.items()}
             ,'step_df': pd.DataFrame(step_log)
             ,'statcom_bus_df': pd.DataFrame({"BusNum": list(statcoms), "Closed": list(statcoms.values())})
-            ,**{f'{table.lower()}_pvqv': bus_df for table, bus_df in pvqv.items()}
             ,'dropped_branch_df': pd.DataFrame({"ObjectID": dropped_branches})
         }
 

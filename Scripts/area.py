@@ -2,26 +2,8 @@
 Step 02 targets: scale the PWB to the GridView hour by area, not element by element.
 
 Topology is not matched: nothing is created or deleted, and no branch or load is opened or closed to match the
-GridView hour. Gens are brought online or taken offline only to suit each bucket's target (unit commitment, below).
-The targets are:
-- Load, per AreaNumber: the EPC's total load MW and Mvar (constant power + current + impedance, at nominal voltage,
-  Closed loads only; the EPC's distributed generation is ignored, as in pcm-to-pf).
-  In the PWB, distributed generation is set Open & 0 (on loads not scaled too: dist_gen_cleanup(), after scaling), constant current and impedance load go to 0, and the constant
-  power MW / Mvar are scaled so the area total matches. Each load's starting share is its S + I + Z total.
-  Positive and negative load are matched separately: each area's positive loads are scaled to the EPC's positive total
-  for that area, and its negative loads (DC converters, generation modelled as load) to the EPC's negative total.
-- Generation, per (AreaNumber, GenType): the EPC's total MWSetPoint of Closed gens of that type in that area.
-  The PWB's Closed gens of that type in that area share it in proportion to MWMax (the same capacity factor on each),
-  capped at MWMax. What can't be placed is reported as Unmet MW; with MAKEUP it goes onto the area's other GenTypes.
-  DC ties (unit type DC) are left alone in both cases: they are set by hand.
-- Unit commitment (COMMIT): within each (area, GenType) bucket, gens are brought online or taken offline to suit the
-  target (see commit()). Load statuses never change.
-- Exception: an area whose list of loads (or gens) has exactly the same keys in both cases has each one targeted to its
-  own EPC value (0 if Open in the EPC), instead of being scaled as a group. With COMMIT, such gens also take their EPC status.
-
-After that, whatever is left on the swing is balanced out over the whole case, all on generation (load stays on its targets)
-(see balance_targets()), so the swing ends at its goal (swing_goal(): the giant swing at 0 MW; the case's own slack at its
-EPC MW, or within its limits). This moves the area totals off their targets by that much.
+GridView hour. The rules (load and gen targets per area, unit commitment, make-up, balancing the swing) are in
+ReadMe.md, "Area Mode".
 
 Working tables are in the shape Scripts/scale.py expects (see its docstring), plus AreaNumber, GenType and Method.
 """
@@ -216,34 +198,17 @@ def capacity_share(target: float, cap: pd.Series) -> pd.Series:
     total = cap.sum()
     return cap * (min(target / total, 1.0) if total > 0 else 0.0)
 
-def proportional_fill(target: float, weight: pd.Series, cap: pd.Series) -> pd.Series:
-    """
-    Spreads target (>= 0) over units in proportion to weight (>= 0), at most cap each: units which reach their cap stay
-    there and the rest is spread again over the others. Units with weight 0 get 0. Less than target if all are capped.
-    """
-    x = pd.Series(0.0, index=weight.index)
-    free = weight > 0
-    remaining = target
-    while free.any() and remaining > 1e-9:
-        share = remaining * weight[free] / weight[free].sum()
-        over = share > cap[free]
-        if not over.any():
-            x[free] = share
-            break
-        hit = over[over].index
-        x[hit] = cap[hit]
-        remaining -= cap[hit].sum()
-        free[hit] = False
-    return x
-
 def gen_keys(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     """(AreaNumber, GenType) of each gen; one area / one group for a table without the columns (some test tables)."""
     area = df['AreaNumber'] if 'AreaNumber' in df else pd.Series(0, index=df.index)
     group = classify_gen_type(df) if 'UnitTypeCode' in df and len(df) else pd.Series('All', index=df.index, dtype=object)
     return area, group
 
-def _fill(target: float, weight: np.ndarray, cap: np.ndarray) -> np.ndarray:
-    """proportional_fill() on numpy arrays (target >= 0, weight >= 0, cap >= 0)."""
+def proportional_fill(target: float, weight: np.ndarray, cap: np.ndarray) -> np.ndarray:
+    """
+    Spreads target (>= 0) over units in proportion to weight (>= 0), at most cap each (>= 0): units which reach their cap
+    stay there and the rest is spread again over the others. Units with weight 0 get 0. Less than target if all are capped.
+    """
     x = np.zeros(len(weight))
     free = weight > 0
     remaining = target
@@ -275,9 +240,9 @@ def spread_by_group(ask: pd.Series, mw: pd.Series, cap: pd.Series, area: pd.Seri
         if abs(a) < 1e-9 or not len(rows):
             return a
         if a > 0:
-            add = _fill(a, m[rows], np.clip(c[rows] - m[rows] - x[rows], 0.0, None))
+            add = proportional_fill(a, m[rows], np.clip(c[rows] - m[rows] - x[rows], 0.0, None))
         else:
-            add = -_fill(-a, m[rows], np.clip(m[rows] + x[rows], 0.0, None))
+            add = -proportional_fill(-a, m[rows], np.clip(m[rows] + x[rows], 0.0, None))
         x[rows] += add
         return a - add.sum()
     left: dict = {}         # area -> {sign: (MW left, groups asked that way)}
@@ -385,7 +350,8 @@ def dispatch_bucket(rows: pd.DataFrame, target: float, gen_type: str, epc_online
         if factor < LOW_FACTOR_WARNING:
             print(f'WARNING: area {rows["AreaNumber"].iloc[0]} {gen_type} scaled to {factor:.0%} of its basis; '
                   f'its units stay online at low output.')
-        mw = against + sign * proportional_fill(want, along, cap.where(cap > along, along))
+        fill = proportional_fill(want, along.to_numpy(float), cap.where(cap > along, along).to_numpy(float))
+        mw = against + sign * pd.Series(fill, index=rows.index)
         left = want - (mw - against).abs().sum()
         if left > 1e-6 and COMMIT:
             off = rows[status != 'Closed']
@@ -562,7 +528,7 @@ def _add_islanded(gen: pd.DataFrame, load: pd.DataFrame, i_gen: pd.DataFrame, i_
             df[f'{c}_Seed'] = df[c]
             df[f'{c}_Target'] = df[c]
         scale.turn_off_targets(df, table, df.index == df.index)
-    i_gen['GenType'] = classify_gen_type(i_gen) if len(i_gen) else pd.Series(dtype=object)
+    i_gen['GenType'] = classify_gen_type(i_gen)
     i_gen['Planned MW'], i_load['Planned MW'] = 0.0, 0.0
     mw = pd.concat([_by_group(i_gen, i_gen['MWSetPoint'], i_gen['GenType']), _by_group(i_load, i_load[LOAD_P].sum(axis=1))])
     scale.print_islanded({'Gen': len(i_gen), 'Load': len(i_load)}, set(i_gen['ExclusionReason']) | set(i_load['ExclusionReason']))
@@ -599,9 +565,6 @@ def _by_group(df: pd.DataFrame, value, group=None) -> pd.Series:
         return pd.Series(dtype=float, index=pd.MultiIndex.from_arrays([[], []], names=['AreaNumber', 'Group']))
     return frame.groupby(['AreaNumber', 'Group'])['v'].sum()
 
-def _gen_group(df: pd.DataFrame) -> pd.Series:
-    return classify_gen_type(df) if len(df) else pd.Series(dtype=object)
-
 def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame], targets: dict[str, pd.DataFrame] | None = None,
           balance_tables=(), swing_buses=(), final_loss: pd.Series | None = None, makeup_tables=()) -> pd.DataFrame:
     """
@@ -629,7 +592,7 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
         g, l = targets['Gen'], targets['Load']
         # Islanded rows are out of the ledger, as they are out of Seed, Target and Final (even one that stayed on).
         g, l = g[~scale.is_island_reason(g['ExclusionReason'])], l[~scale.is_island_reason(l['ExclusionReason'])]
-        gg = _gen_group(g)
+        gg = classify_gen_type(g)
         not_reached = (_by_group(g, g['MWSetPoint_Target'] - g['MWSetPoint'], gg)
                        .add(_by_group(l, p_of(l, [f'{c}_Target' for c in LOAD_P]) - p_of(l, LOAD_P)), fill_value=0.0))
         end_target = (_by_group(g, g['MWSetPoint_Target'], gg).add(_by_group(l, p_of(l, [f'{c}_Target' for c in LOAD_P])), fill_value=0.0))
@@ -641,7 +604,7 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
             g, l = t['Gen'], t['Load']
             g = g[~g['BusNum'].isin(swing_buses)]       # Left out of Final MW too (a second slack bus beside the giant swing).
             start = parts[col] if col in parts else _by_group(g.iloc[:0], [])
-            parts[col] = (start.add(_by_group(g, g['MWSetPoint'] - g['MWSetPoint_Seed'], _gen_group(g)), fill_value=0.0)
+            parts[col] = (start.add(_by_group(g, g['MWSetPoint'] - g['MWSetPoint_Seed'], classify_gen_type(g)), fill_value=0.0)
                           .add(_by_group(l, p_of(l, LOAD_P) - l['P_Seed']), fill_value=0.0))
     if final is not None:
         # Islanded units (excluded rows of the targets) are left out of Final MW, as they are out of Seed and Target.
@@ -649,9 +612,9 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
         load = final['Load'][closed(final['Load']) & (conforming(final['Load']) | SCALE_NONCONFORMING) & ~final['Load']['ObjectID'].isin(out_ids)]
         gen = scalable_gens(final['Gen'])
         gen = gen[closed(gen) & ~gen['BusNum'].isin(swing_buses) & ~gen['ObjectID'].isin(out_ids)]
-        parts['Final MW'] = _by_group(gen, gen['MWSetPoint'], _gen_group(gen)).add(_by_group(load, p_of(load, LOAD_P)), fill_value=0.0)
+        parts['Final MW'] = _by_group(gen, gen['MWSetPoint'], classify_gen_type(gen)).add(_by_group(load, p_of(load, LOAD_P)), fill_value=0.0)
         parts['Final Mvar'] = _by_group(load, p_of(load, LOAD_Q))
-        parts['Online Final'] = _by_group(gen, 1.0, _gen_group(gen)).add(_by_group(load, 1.0), fill_value=0.0)
+        parts['Online Final'] = _by_group(gen, 1.0, classify_gen_type(gen)).add(_by_group(load, 1.0), fill_value=0.0)
 
     index = plan.index
     for s in parts.values():
@@ -690,7 +653,7 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
     if final is not None and targets is not None:     # Island units whose turn-off diverged: still Closed at the end.
         on_g = final['Gen'][closed(final['Gen']) & final['Gen']['ObjectID'].isin(out_ids)]
         on_l = final['Load'][closed(final['Load']) & final['Load']['ObjectID'].isin(out_ids)]
-        still_on = (_by_group(on_g, on_g['MWSetPoint'], _gen_group(on_g)).add(_by_group(on_l, p_of(on_l, LOAD_P)), fill_value=0.0)
+        still_on = (_by_group(on_g, on_g['MWSetPoint'], classify_gen_type(on_g)).add(_by_group(on_l, p_of(on_l, LOAD_P)), fill_value=0.0)
                     .reindex(index).fillna(0.0))
     note = pd.Series([('outside main island, turned off: ' + (f'{mw - on:.1f} MW' if not on else f'{mw:.1f} MW, of which {on:.1f} MW stayed on'))
                       if mw else '' for mw, on in zip(islanded, still_on)], index=index)
@@ -758,8 +721,6 @@ def loss_estimate(targets: dict[str, pd.DataFrame], area_load: pd.DataFrame, see
     non-conforming load when that isn't scaled (area_load's 'Seed Non-conforming MW', which keeps its seed value).
     The ratio is capped at LOSS_RATIO_MAX (printed). An area with no seed load keeps its seed losses.
     """
-    if LOSS_EXPONENT < 0:
-        raise ValueError(f'loss_exponent must be 0 or more, not {LOSS_EXPONENT}')
     l = targets['Load']
     l = l[scale.included(l)]
     def total(suffix):
@@ -902,8 +863,7 @@ def prebalance_targets(targets: dict[str, pd.DataFrame], loss_change: float = 0.
 
     gen = g_in[(g_in['Status_Target'] == 'Closed') & (g_in['MWSetPoint_Target'] > 0)]
     seed = gen['MWSetPoint_Target']
-    cap = gen['MWMax'] if 'MWMax' in gen else seed         # No MWMax known (topology): gens aren't raised.
-    cap = cap.where(cap > seed, seed)                       # A target already above MWMax isn't raised.
+    cap = gen['MWMax'].where(gen['MWMax'] > seed, seed)     # A target already above MWMax isn't raised.
     new = seed + spread_evenly(swing, seed, cap, *gen_keys(gen))[0] if len(gen) else seed
     g.loc[gen.index, 'MWSetPoint_Target'] = new
 
@@ -971,9 +931,8 @@ def rescale_targets(targets: dict[str, pd.DataFrame], moved: dict[str, pd.DataFr
     works out the factor each moved row was moved by, and has scale.rescale() apply it to the rest of the scaling, so
     that keeps the balance instead of undoing it. Gen targets stay within MWMax.
     """
-    gen, load = moved['Gen'], moved['Load']
+    gen = moved['Gen']
     scale.rescale(targets['Gen'], gen['MWSetPoint'] / gen['MWSetPoint_Seed'], scale.SCALED['Gen'], cap=gen['MWMax'])
-    scale.rescale(targets['Load'], load[LOAD_P].sum(axis=1) / load['P_Seed'], LOAD_P + LOAD_Q)
 
 # ------------------ Make-up ------------------
 MAKEUP = True   # Keep area gen totals: plan Unmet and excluded units' shortfall go onto the group's, then the area's, other units.
@@ -996,7 +955,7 @@ def makeup_targets(final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFra
         out = df[~scale.included(df) & ~scale.is_island_reason(df['ExclusionReason'])]
         return _by_group(out, tgt(out) - cur(out), group(out) if group else None)
     tp = lambda df: df[[f'{c}_Target' for c in LOAD_P]].sum(axis=1)
-    s_gen = shortfall(targets['Gen'], lambda d: d['MWSetPoint'], lambda d: d['MWSetPoint_Target'], _gen_group)
+    s_gen = shortfall(targets['Gen'], lambda d: d['MWSetPoint'], lambda d: d['MWSetPoint_Target'], classify_gen_type)
     s_load = shortfall(targets['Load'], lambda d: d[LOAD_P].sum(axis=1), tp, None)
     s_gen, s_load = s_gen[s_gen.abs() >= 1.0], s_load[s_load.abs() >= 1.0]
     if not (len(s_gen) or len(s_load)):
@@ -1159,7 +1118,7 @@ def midrun_balancer(SimAuto, epc: pd.DataFrame | None = None):
                 notes.append(f'band widened by {state["extra"]:.0f} MW')
         elif not lo <= after <= hi:
             finite = np.isfinite(lo) and np.isfinite(hi)
-            margin = (0.1 * (hi - lo) if finite else 0.0) if own_slack or not BALANCE_TRIGGER_MW else BALANCE_TRIGGER_MW
+            margin = (0.1 * (hi - lo) if finite else 0.0) if not BALANCE_TRIGGER_MW else BALANCE_TRIGGER_MW
             state['lo'], state['hi'] = min(lo, after - margin), max(hi, after + margin)
             notes.append(f'band widened to {state["lo"]:.0f}..{state["hi"]:.0f} MW')
         else:

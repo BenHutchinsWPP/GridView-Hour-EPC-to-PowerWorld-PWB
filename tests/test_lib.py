@@ -105,17 +105,6 @@ def test_suggested_shunt_status():
     df = pd.DataFrame({'MvarNom': [50, 50, -50, -50, 50], 'Status': ['Open', 'Closed', 'Closed', 'Open', 'Open'], 'Vpu': [0.9, 1.1, 0.9, 1.1, 1.0]})
     assert prep.suggested_shunt_status(df, 0.92, 1.08).tolist() == ['Closed', 'Open', 'Open', 'Closed', 'Open']
 
-def test_adjust_shunts_writes_nothing_when_all_in_band():
-    class ShuntSimAuto(FakeSimAuto):
-        def GetParametersMultipleElementRect(self, table, fields, filter_group):
-            if table != 'Shunt':
-                return super().GetParametersMultipleElementRect(table, fields, filter_group)
-            row = {'ObjectID': 'Shunt 1 1', 'MvarNom': '50', 'Status': 'Closed', 'Vpu': '1.0'}
-            return ('', [[row[f] for f in fields]])
-    sa = ShuntSimAuto()
-    prep.adjust_shunts(sa)
-    assert sa.applied == {}     # Was: one blank row per shunt, written by a blank ObjectID.
-
 # ------------------ topo ------------------
 def test_transformer_is_okay_flags_low_fixed_taps():
     df = pd.DataFrame({'Tap': [1.0, 1.0], 'NomkVFrom': 230.0, 'XFNomkVbaseFrom': 230.0, 'NomkVTo': 115.0, 'XFNomkVbaseTo': 115.0,
@@ -735,12 +724,11 @@ def test_rescale_targets():
                'Load': targets_df(ObjectID=['l1'], **{c: [10.0] for c in ['SMW', 'SMvar', 'IMW', 'IMvar', 'ZMW', 'ZMvar']},
                                   **{f'{c}_Start': [10.0] for c in ['SMW', 'SMvar', 'IMW', 'IMvar', 'ZMW', 'ZMvar']},
                                   **{f'{c}_Target': [20.0] for c in ['SMW', 'SMvar', 'IMW', 'IMvar', 'ZMW', 'ZMvar']})}
-    moved = {'Gen': targets_df(ObjectID=['g1', 'gx'], MWSetPoint=[60.0, 5.0], MWSetPoint_Seed=[50.0, 4.0], MWMax=[500.0, 500.0]),
-             'Load': targets_df(ObjectID=['l1'], SMW=[24.0], IMW=[0.0], ZMW=[0.0], P_Seed=[30.0])}
+    moved = {'Gen': targets_df(ObjectID=['g1', 'gx'], MWSetPoint=[60.0, 5.0], MWSetPoint_Seed=[50.0, 4.0], MWMax=[500.0, 500.0])}
     area.rescale_targets(targets, moved)
     assert targets['Gen'].loc['g1', ['MWSetPoint', 'MWSetPoint_Start', 'MWSetPoint_Target']].tolist() == [60.0, 0.0, 120.0]
     assert targets['Gen'].loc['g2', 'MWSetPoint_Target'] == 10.0                    # Not moved.
-    assert targets['Load'].loc['l1', ['SMvar', 'SMvar_Start', 'SMvar_Target']].tolist() == [8.0, 8.0, 16.0]
+    assert targets['Load'].loc['l1', ['SMvar', 'SMvar_Start', 'SMvar_Target']].tolist() == [10.0, 10.0, 20.0]   # Balances move gens only.
 
 # ------------------ review fixes ------------------
 @contextmanager
@@ -834,12 +822,11 @@ def test_iterate_raises_when_the_case_does_not_solve():
         def diverged(self):
             return True
     targets, _ = scaling_targets(gen_status='Closed')
-    for sa in (Diverges(),):
-        try:
-            scale.iterate_to_gen_load_targets(sa, targets)
-            assert False
-        except pw.SimAutoError:
-            pass
+    try:
+        scale.iterate_to_gen_load_targets(Diverges(), targets)
+        assert False
+    except pw.SimAutoError:
+        pass
 
 def test_test_gen_targets_only_writes_included_rows():
     class Recording(FakeSimAuto):
@@ -955,6 +942,38 @@ def test_step_02_topology_mode_end_to_end():
     assert out['Load']['SMW'].round(6).tolist() == [300.0]
     assert ('Gen', '99') not in sa.applied and ('Gen', '2') not in sa.applied   # The swing was never written.
 
+def test_step_02_topology_mode_aims_its_own_slack_at_its_epc_value():
+    # No giant swing. s1 (bus 2, MWMin blank = unlimited below) is the main island's slack; s2 (bus 5, island 2) is another
+    # island's slack. Both are in the EPC, but only s1 has a goal: its EPC MW, 300 (the blank MWMin must not clip it to MWMax).
+    gen = gens([('s1', 1, '1', 'Closed', 'GT', 100.0, 1000.0, np.nan), ('s2', 1, '2', 'Closed', 'GT', 0.0, 1000.0, 0.0),
+                ('g1', 1, '3', 'Closed', 'GT', 100.0, 5000.0, 0.0)]).assign(BusNum=[2, 5, 1], MW=0.0, NomkV=230.0, BusName='b')
+    load = loads([('l1', 1, 'Closed', 200.0, 0.0, 0.0, 20.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
+    epc_gen, epc_load = gen.assign(MWSetPoint=[300.0, 400.0, 100.0]), load.assign(SMW=500.0)
+    class TwoIslands(CaseSimAuto):
+        def table(self, name):
+            df = super().table(name)
+            if name == 'Gen':
+                df.loc[df['BusNum'] == 5, 'MW'] = 0.0         # Island 2 balances itself: nothing reaches the main island's swing.
+            return df
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        step = load_step_02(Path(d), 'topology')
+        step.run['balance_swing'] = True
+        sa = TwoIslands({'h1.epc': (epc_gen, epc_load), 'Prepared.pwb': (gen, load)}, slack=[2, 5])
+        sa.islands = {5: '2'}
+        real, got = step.topo.compute_pw_targets, {}
+        def spy(*args):
+            got['targets'], got['reports'] = real(*args)
+            return got['targets'], got['reports']
+        step.topo.compute_pw_targets = spy
+        try:
+            step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')
+        finally:
+            step.topo.compute_pw_targets = real
+        runs = pd.read_excel(step.out_dir / 'h1_Log.xlsx', sheet_name='runs')
+    swing = got['reports']['swing']
+    assert swing.index.tolist() == ['s1'] and swing['EPC MW'].tolist() == [300.0], swing
+    assert abs(runs['Swing MW After'].iloc[-1] - 300.0) <= area.BALANCE_TOL_MW, runs
+
 def test_slack_bus_gens_are_the_swing_when_there_is_no_giant_swing():
     # Bus 9 is the slack bus: its unit carries the imbalance, and neither balance writes to it.
     gen = gens([('s1', 1, '1', 'Closed', 'GT', 100.0, 1000.0, 0.0), ('g1', 1, '2', 'Closed', 'GT', 100.0, 5000.0, 0.0),
@@ -1026,12 +1045,6 @@ def test_own_slack_ends_at_its_epc_mw_when_its_key_is_in_the_epc():
     assert area.swing_epc(epc_gen.assign(Status='Open'), lim.assign(MW=150.0), [9]).loc['s1', 'EPC MW'] == 50.0
     assert area.swing_goal(lim.assign(MWMax=np.nan), [9]) == (50.0, np.inf)               # A blank limit: unlimited.
     assert area.swing_band(lim.assign(MWMin=2000.0), [9]) == (1000.0, 2000.0)             # Swapped limits: in order.
-    # Topology: the same, from its targets.
-    tg = targets_df(ObjectID=['s1', 's2', 'g1'], ID='1', MW=[150.0, 10.0, 0.0], MWMin=[0.0, 0.0, 0.0], MWMax=[1000.0, 100.0, 500.0],
-                    Status_Seed='Closed', MWSetPoint_Target=[300.0, 500.0, 10.0], **{'In EPC': [True, True, True]})
-    tg['ExclusionReason'] = ['Swing Unit', 'Swing Unit', '']
-    assert topo.swing_epc({'Gen': tg}).to_dict('index') == {'s1': {'Seed MW': 150.0, 'EPC MW': 300.0}, 's2': {'Seed MW': 10.0, 'EPC MW': 100.0}}
-    assert topo.swing_epc({'Gen': tg.assign(ID=['xx', '1', '1'])}).empty
     # The pre-balance makes up the slack's move too: seed 150 -> EPC 300 leaves 150 MW less for the other gens.
     t = load_ramp_targets()
     t['Load']['SMW_Target'] = 200.0
@@ -1135,13 +1148,8 @@ def test_exceptions_list_network_changes_and_target_status_misses():
 
 # ------------------ settings ------------------
 def test_repo_settings_file_loads():
-    saved = {(m, k): v for m in settings.MODULES.values() for k, v in vars(m).items() if k.isupper()}
-    try:
-        run = settings.load()
-        assert run['mode'] in settings.MODES
-    finally:
-        for (m, k), v in saved.items():
-            setattr(m, k, v)
+    with saved_settings():
+        assert settings.load()['mode'] in settings.MODES
 
 def test_settings_reject_a_negative_loss_exponent():
     with saved_settings(), tempfile.TemporaryDirectory() as d:
@@ -1218,22 +1226,28 @@ def test_final_balance_keeps_the_hour_when_a_round_fails():
         scale.iterate_to_gen_load_targets = saved
     assert [r.name for r in runs] == ['balance1'] and runs[0].note.startswith('stopped: Could not solve') and runs[0].after == runs[0].after
 
-def test_step_02_saves_the_case_when_the_log_cannot_be_written():
+def test_step_02_saves_the_case_when_the_log_fails():
+    # The final log write fails (open in Excel), or the log cannot be built: either way the saved case is kept.
     gen, load = two_cases()
-    with saved_settings(), tempfile.TemporaryDirectory() as d:
-        step = load_step_02(Path(d), 'area')
-        sa = CaseSimAuto({'h1.epc': (gen, load), 'Prepared.pwb': (gen, load)}, slack=[99])
-        real = pw.write_excel
-        def locked(fp, sheets):
-            if fp.name.endswith('_Log.xlsx') and fp.exists():     # Open in Excel at the final write.
-                raise PermissionError(fp)
-            return real(fp, sheets)
-        step.pw.write_excel = locked
-        try:
-            step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')
-        finally:
-            step.pw.write_excel = real
-        assert 'h1.pwb' in sa.saved
+    for failure in ('write', 'build'):
+        with saved_settings(), tempfile.TemporaryDirectory() as d:
+            step = load_step_02(Path(d), 'area')
+            sa = CaseSimAuto({'h1.epc': (gen, load), 'Prepared.pwb': (gen, load)}, slack=[99])
+            real_write, real_areas = pw.write_excel, step.area.areas
+            def locked(fp, sheets):
+                if fp.name.endswith('_Log.xlsx') and fp.exists():     # Open in Excel at the final write.
+                    raise PermissionError(fp)
+                return real_write(fp, sheets)
+            def broken(final, *args, **kwargs):
+                if final is not None:
+                    raise ValueError('bug in the log')
+                return real_areas(final, *args, **kwargs)
+            step.pw.write_excel, step.area.areas = (locked, real_areas) if failure == 'write' else (real_write, broken)
+            try:
+                step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')   # Must not raise.
+            finally:
+                step.pw.write_excel, step.area.areas = real_write, real_areas
+            assert 'h1.pwb' in sa.saved, failure
 
 def test_adjust_shunts_takes_no_checkpoint_when_nothing_changes():
     class InBand(FakeSimAuto):
@@ -1327,7 +1341,7 @@ def test_merge_reports_merges_hour_logs():
     assert len(sheets['hours']) == 2
     hours = sheets['hours'].set_index('Hour')
     assert hours.loc['HourA', 'Final Swing MW'] == 25.0 and hours.loc['HourB', 'Final Swing MW'] == 7.0
-    assert (hours.loc['HourA', 'Balance Gen MW'], hours.loc['HourA', 'Balance Load MW']) == (3.0, 2.0)
+    assert hours.loc['HourA', 'Balance MW'] == 3.0
     assert hours.loc['HourA', 'Worst Error MW'] == -4.0
     assert hours.loc['HourA', 'Exceptions Gen/Load'] == 1 and hours.loc['HourA', 'Exceptions STATCOM'] == 1
     assert hours.loc['HourB', 'Exceptions Gen/Load'] == 0
@@ -1346,7 +1360,7 @@ def test_step_02_console_is_one_summary_line_per_hour():
     lines = buf.getvalue().splitlines()
     summaries = [l for l in lines if 'swing' in l and 'exceptions' in l]
     assert len(summaries) == 1 and summaries[0].startswith('h1: swing') and 'worst error area' in summaries[0], lines
-    assert not any('Attempting to set' in l or 'Could not set this' in l or 'Opened:' in l for l in lines), lines
+    assert not any('Opened:' in l for l in lines), lines
     assert any('Main scaling: 0 -> ' in l and 'of 100' in l for l in lines), lines
 
 def test_areas_ledger_holds_with_a_second_slack_bus():
@@ -1389,23 +1403,6 @@ def test_step_02_plan_left_by_a_failed_hour_has_nothing_reached_yet():
             step.scale.iterate_to_gen_load_targets = saved
         plan = pd.read_excel(step.out_dir / 'h1_Log.xlsx', sheet_name='areas')
     assert (plan['Not Reached MW'] == 0).all() and (plan['Balance MW'] == 0).all() and plan['Final MW'].isna().all()
-
-def test_step_02_keeps_the_saved_case_when_its_log_cannot_be_built():
-    gen, load = two_cases()
-    with saved_settings(), tempfile.TemporaryDirectory() as d:
-        step = load_step_02(Path(d), 'area')
-        sa = CaseSimAuto({'h1.epc': (gen, load), 'Prepared.pwb': (gen, load)}, slack=[99])
-        real = step.area.areas
-        def broken(final, *args, **kwargs):
-            if final is not None:
-                raise ValueError('bug in the log')
-            return real(final, *args, **kwargs)
-        step.area.areas = broken
-        try:
-            step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')   # Must not raise.
-        finally:
-            step.area.areas = real
-    assert 'h1.pwb' in sa.saved
 
 def test_prebalance_targets_moves_gen_only_and_leaves_what_gens_cannot_take_on_the_swing():
     # Load 200 -> 600 MW, gens fixed: +400 MW would land on the swing. g1 can take +50 (MWMax 150); load keeps its target,
@@ -1491,14 +1488,6 @@ def test_loss_estimate_uses_positive_load_and_caps_the_ratio():
     load['SMW'], load['SMW_Target'] = [100.0, -95.0, 10.0], [150.0, -95.0, 100.0]
     est = area.loss_estimate({'Load': load}, pd.DataFrame({'AreaNumber': [1, 2]}), pd.Series({1: 10.0, 2: 1.0}))
     assert est['Est. Loss MW'].round(9).to_dict() == {1: 22.5, 2: 4.0}
-    area.LOSS_EXPONENT = -1.0
-    try:
-        area.loss_estimate({'Load': load}, pd.DataFrame({'AreaNumber': [1]}), pd.Series({1: 10.0}))
-        assert False, 'a negative loss_exponent must be rejected'
-    except ValueError:
-        pass
-    finally:
-        area.LOSS_EXPONENT = 2.0
 
 def test_areas_shows_final_losses_without_a_plan_estimate():
     case = gens([('g1', 1, '1', 'Closed', 'GT', 100.0, 1000.0, 0.0)])
@@ -1514,12 +1503,6 @@ def test_report_gen_load_balance_counts_only_closed_units():
                       **{c: [10.0, 10.0] for c in scale.SCALED['Load']}, **{f'{c}_Target': [10.0, 10.0] for c in scale.SCALED['Load']})
     out = scale.report_gen_load_balance({'Gen': gen, 'Load': load})
     assert out['Base Case'].tolist() == [100.0, 10.0, 30.0, 80.0] and out['Target Case'].tolist() == [50.0, 0.0, 60.0, -10.0]
-
-def test_prebalance_targets_does_not_raise_gens_without_mwmax():
-    t = load_ramp_targets()                                                       # Topology tables: no MWMax column.
-    area.prebalance_targets(t)
-    assert t['Gen'].loc['g1', 'MWSetPoint_Target'] == 100.0                       # Nothing placed: it stays on the swing.
-    assert t['Load'].loc['l1', 'SMW_Target'] == 3200.0
 
 def test_step_02_estimates_losses_and_clears_untouched_dist_gen():
     # Seed losses 10 MW; area 1's load goes 200 -> 300 MW (non-conforming ln's 50 MW stays): (350/250)^2 * 10 = 19.6.

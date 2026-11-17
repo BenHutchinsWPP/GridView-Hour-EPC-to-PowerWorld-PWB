@@ -4,9 +4,8 @@ branch statuses, distributed generation loads). Step 02 targets each gen & load 
 The preparation both modes share is in prep.py.
 """
 from pathlib import Path
-import numpy as np
 import pandas as pd
-from . import prep, pw, scale
+from . import area, prep, pw, scale
 
 # ------------------ Tuning thresholds ------------------
 TAP_THRESHOLD = 0.15            # Transformer taps / nominal kV further than this from 1.0 PU are reset to 1.0.
@@ -424,8 +423,11 @@ TARGET_FIELDS = {
     for table in scale.STATUS
 }
 
-def compute_pw_targets(SimAuto, gv_fp: Path, pw_fp: Path, dummy_bus_fp: Path) -> dict[str,pd.DataFrame]:
-    """Returns {'Gen': df, 'Load': df} targets, taking the GridView EPC's gens & loads into the PWB case. See build_targets()."""
+def compute_pw_targets(SimAuto, gv_fp: Path, pw_fp: Path, dummy_bus_fp: Path) -> tuple[dict[str, pd.DataFrame], dict]:
+    """
+    Returns (targets {'Gen': df, 'Load': df}, reports {'swing': area.swing_epc() of the main island's gens}), taking the
+    GridView EPC's gens & loads into the PWB case. See build_targets().
+    """
     open_gv_case(SimAuto, gv_fp, dummy_bus_fp)
     gv = {table: pw.get_df(SimAuto, table, fields) for table, fields in TARGET_FIELDS.items()}
 
@@ -437,7 +439,8 @@ def compute_pw_targets(SimAuto, gv_fp: Path, pw_fp: Path, dummy_bus_fp: Path) ->
 
     targets = build_targets(gv, case, slack)
     scale.exclude_islands(targets, islands)     # Gens/loads outside the main island are turned off before scaling.
-    return targets
+    main_gen = case['Gen'][scale.island_reason(case['Gen'], islands) == '']    # A second island's slack has no goal.
+    return targets, {'swing': area.swing_epc(gv['Gen'], main_gen, slack)}
 
 def build_targets(gv: dict[str,pd.DataFrame], case: dict[str,pd.DataFrame], swing_buses=()) -> dict[str,pd.DataFrame]:
     """
@@ -453,7 +456,6 @@ def build_targets(gv: dict[str,pd.DataFrame], case: dict[str,pd.DataFrame], swin
 
         fields = [*statuses, *scale.SCALED[table]]
         df = case[table].merge(gv_df[['ObjectID', *fields]], on='ObjectID', how='left', suffixes=('', '_Target'))
-        df['In EPC'] = df['ObjectID'].isin(gv_df['ObjectID'])
         for f in fields:
             df[f'{f}_Seed'] = df[f]
 
@@ -473,16 +475,3 @@ def build_targets(gv: dict[str,pd.DataFrame], case: dict[str,pd.DataFrame], swin
     gen_df.loc[swing, 'Status_Target'] = 'Closed'
     scale.exclude(gen_df, swing, 'Swing Unit')
     return targets
-
-def swing_epc(targets: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """
-    area.swing_epc() for topology targets: the case's own slack gens (Closed in the seed) whose key is in the EPC, with
-    'Seed MW' (its solved MW) and 'EPC MW' (kept within its MWMin to MWMax). Empty if there is a giant swing.
-    """
-    g = targets['Gen']
-    if (g['ID'] == prep.SWING_ID).any():
-        return pd.DataFrame(columns=['Seed MW', 'EPC MW'], dtype=float)
-    s = g[(g['ExclusionReason'] == 'Swing Unit') & g['In EPC'] & (g['Status_Seed'] == 'Closed')]
-    lo = s[['MWMin', 'MWMax']].min(axis=1).fillna(-np.inf)
-    hi = s[['MWMin', 'MWMax']].max(axis=1).fillna(np.inf)
-    return pd.DataFrame({'Seed MW': s['MW'].astype(float), 'EPC MW': s['MWSetPoint_Target'].astype(float).clip(lower=lo, upper=hi)})
