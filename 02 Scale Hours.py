@@ -51,6 +51,13 @@ def create_case(SimAuto, gv_fp, out_fp):
         scale.exclude(gen_df, ~gen_df['Success'], 'Individual Gen Test Diverged')
         # Only for the plan written below: the main run's log lists these rows again, once scaling has run.
         pretest = [scale.Run('pretest', {'gen': gen_df[~gen_df['Success']]})]
+    scale.report_gen_load_balance(targets)
+    pre_runs = []
+    if run['balance_swing']:
+        # Fold the targets' own imbalance in now, so the swing doesn't drift (and set off balances) as they scale.
+        moved = area.prebalance_targets(targets)
+        if moved is not None:
+            pre_runs = [scale.Run('prebalance', moved=moved, note='targets moved before scaling')]
     log_fp = out_dir / (gv_fp.stem + '_Log.xlsx')
 
     def build_log(runs, final, balance_tables=(), swing_buses=(), exception_runs=()):
@@ -67,7 +74,6 @@ def create_case(SimAuto, gv_fp, out_fp):
     except Exception as e:     # Never lose the hour over its log.
         print(f'WARNING: could not write {log_fp.name} (open in Excel?): {e!r}.')
 
-    scale.report_gen_load_balance(targets)
     pw.open_case(SimAuto, pw_fp)
     if area_mode:
         # Open loads aren't scaled, but their distributed generation is set Open & 0 too.
@@ -87,7 +93,7 @@ def create_case(SimAuto, gv_fp, out_fp):
         log = scale.iterate_to_gen_load_targets(SimAuto, targets, pvqv)
     # Main last of the runs during scaling (its midrun balances happened inside it), so its After is where scaling left
     # the swing; the final balance rounds follow. The last row's After is where the swing ended.
-    runs = [*midrun_runs, scale.Run('main', log, before=before, after=swing())]
+    runs = [*pre_runs, *midrun_runs, scale.Run('main', log, before=before, after=swing())]
     if run['balance_swing']:
         runs += area.balance_swing(SimAuto, targets, tables=balance_tables)
     # Read back from PowerWorld, so the log shows what the case holds rather than what the scaling meant to do.

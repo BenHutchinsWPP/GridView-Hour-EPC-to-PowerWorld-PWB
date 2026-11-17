@@ -506,7 +506,8 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None,
                                 initial_step=None) -> dict[str,pd.DataFrame]:
     """
     Scales included gens & loads from their start to their targets. Returns the scale log sheets.
-    Steps are in 1/RESOLUTION units. Each step which solves doubles the next one (up to MAX_STEP),
+    Steps are in 1/RESOLUTION units. Each step which solves at its first size doubles the next one (up to MAX_STEP;
+    one which solved only once halved keeps its size),
     and each which diverges is retried at half the size. A 1/RESOLUTION step which still diverges is bisected:
     the gens/loads which diverge are held back at their last good values, and the rest go ahead.
     Held gens/loads (including those on buses outside the voltage band) are retried after each step, and again at the end.
@@ -588,8 +589,10 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None,
             log(start, goal, result, catch_up(SimAuto, targets, progress, step, bisect=False))
             if after_step:
                 after_step(SimAuto, targets, progress)
-            if t.ok:
+            if t.ok and not failed_step:
                 step = min(step * 2, MAX_STEP)
+            elif t.ok:
+                pass                    # Solved only once halved: keep this size (doubling back would fail again).
             elif failed_step:
                 step = failed_step      # The gens/loads which diverged are held now, so go back to the larger step.
             failed_step = None

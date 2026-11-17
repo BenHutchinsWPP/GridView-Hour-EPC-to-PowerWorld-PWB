@@ -209,6 +209,27 @@ def test_iterate_grows_step_while_solving():
     assert targets['Gen']['MWSetPoint'].tolist() == [50.0, 20.0]
     assert targets['Load']['SMW'].tolist() == [10.0, 8.0] and targets['Load'].loc['l2', 'Status'] == 'Closed'
 
+class BigStepDivergesSimAuto(FakeSimAuto):
+    """Moving g1 (bus 1) by more than 15 MW in one write diverges; g1 goes 10 -> 50 MW, so steps above 37% fail."""
+    big = False
+    def ChangeParametersMultipleElementRect(self, table, fields, rows):
+        for row in rows:
+            if table == 'Gen' and row[0] == '1' and 'MWSetPoint' in fields:
+                prev = float(self.applied.get(('Gen', '1'), {}).get('MWSetPoint', 10.0))
+                self.big |= abs(float(row[fields.index('MWSetPoint')]) - prev) > 15.0
+        return super().ChangeParametersMultipleElementRect(table, fields, rows)
+    def diverged(self):
+        return self.big or super().diverged()
+    def LoadState(self):
+        self.big = False
+        return super().LoadState()
+
+def test_iterate_keeps_the_step_after_a_halved_success():
+    # 25 solves; doubled to 50 diverges; 25 solves once halved, so the next step stays 25 (not 50, which would fail).
+    log = scale.iterate_to_gen_load_targets(BigStepDivergesSimAuto(), scaling_targets(gen_status='Closed')[0])
+    assert log['step_df'][['From', 'To']].values.tolist() == [[0, 25], [25, 75], [25, 50], [50, 75], [75, 100]]
+    assert results(log) == ['Solved', 'Diverged, halved step', 'Solved', 'Solved', 'Solved']
+
 def test_iterate_excludes_gens_which_diverge_closing_in():
     sa = FakeSimAuto(bad={'2'})  # Closing the gen on bus 2 diverges.
     targets, _ = scaling_targets(gen_status=['Closed', 'Open'])
@@ -829,7 +850,7 @@ def test_step_02_area_mode_end_to_end():
         assert (step.out_dir / 'h1.pwb').exists()
         sheets = pd.read_excel(step.out_dir / 'h1_Log.xlsx', sheet_name=None)
         assert set(sheets) == {'areas', 'exceptions', 'runs'}
-        assert sheets['runs']['Run'].iloc[0] == 'main'
+        assert sheets['runs']['Run'].tolist()[:2] == ['prebalance', 'main']        # Targets 100 MW short of load: balanced first.
         assert sorted(fp.name for fp in step.out_dir.glob('*.xlsx')) == ['h1_Log.xlsx']
     out = sa.saved['h1.pwb']
     assert ('Gen', '99') not in sa.applied                                      # The swing was never written.
@@ -1222,6 +1243,54 @@ def test_step_02_keeps_the_saved_case_when_its_log_cannot_be_built():
         finally:
             step.area.areas = real
     assert 'h1.pwb' in sa.saved
+
+def test_prebalance_targets_splits_half_gen_half_load_and_spills_capped_gen_onto_load():
+    # Load 200 -> 600 MW, gens fixed: +400 MW would land on the swing. Gen half (200) hits g1's MWMax (+50), so load
+    # takes the other 350.
+    t = load_ramp_targets()
+    t['Load']['SMW_Target'] = 600.0
+    t['Gen']['MWMax'] = 150.0
+    moved = area.prebalance_targets(t)
+    assert t['Gen'].loc['g1', 'MWSetPoint_Target'] == 150.0
+    assert abs(t['Load'].loc['l1', 'SMW_Target'] - 250.0) < 1e-9 and abs(t['Load'].loc['l1', 'SMvar_Target'] - 320.0 * 250 / 600) < 1e-9
+    changes = area.mw_changes(moved)
+    assert abs(changes['Gen MW Change'] - 50.0) < 1e-9 and abs(changes['Load MW Change'] + 350.0) < 1e-9
+    assert area.prebalance_targets(t) is None                                     # Balanced now: nothing to move.
+
+def test_prebalanced_targets_need_no_midrun_balance():
+    gen, load = swing_case()
+    sa = SwingSimAuto(gen, load)
+    targets = load_ramp_targets()                                                # Without it: +3000 MW onto the swing.
+    targets['Gen']['MWMax'] = 1e4                                                # g1 100 -> 1600, l1 200 -> 1700.
+    area.prebalance_targets(targets)
+    assert targets['Gen'].loc['g1', 'MWSetPoint_Target'] == 1600.0
+    after_step, runs = area.midrun_balancer(sa)
+    scale.iterate_to_gen_load_targets(sa, targets, after_step=after_step)
+    assert runs == [] and abs(area.swing_mw(sa.table('Gen'), [])[0]) < 1e-6
+
+def test_prebalance_targets_counts_only_what_will_move():
+    # l1's dist gen (40 MW, Closed) goes to 0: +40 MW onto the swing. l2's dist gen is Open: its 30 MW never injected.
+    # Gens: gx is excluded and g_open goes Open, so neither moves; gcap (target 300) is already above its MWMax (200),
+    # so it isn't raised and g1 takes the gen half (+20). Load half: -20 over l1 and l2 (factor 0.9).
+    gen = targets_df(ObjectID=['g1', 'gx', 'g_open', 'gcap'], BusNum=[1, 2, 3, 4], ID='1', Status='Closed',
+                     Status_Target=['Closed', 'Closed', 'Open', 'Closed'], MWSetPoint=[100.0, 100.0, 50.0, 300.0],
+                     MWSetPoint_Target=[100.0, 100.0, 50.0, 300.0], MWMax=[1000.0, 1000.0, 1000.0, 200.0])
+    gen.loc['gx', 'ExclusionReason'] = 'PVQV'
+    load = targets_df(ObjectID=['l1', 'l2'], BusNum=[5, 6], ID='1', Status='Closed', Status_Target='Closed',
+                      DistStatus=['Closed', 'Open'], DistStatus_Target='Open',
+                      **{c: [0.0, 0.0] for c in scale.SCALED['Load']}, **{f'{c}_Target': [0.0, 0.0] for c in scale.SCALED['Load']})
+    for c in ('SMW', 'SMW_Target'):
+        load[c] = 100.0
+    load['DistMWInput'] = [40.0, 30.0]
+    area.prebalance_targets({'Gen': gen, 'Load': load})
+    assert gen['MWSetPoint_Target'].round(9).to_dict() == {'g1': 120.0, 'gx': 100.0, 'g_open': 50.0, 'gcap': 300.0}
+    assert load['SMW_Target'].round(9).tolist() == [90.0, 90.0]
+
+def test_prebalance_targets_does_not_raise_gens_without_mwmax():
+    t = load_ramp_targets()                                                       # Topology tables: no MWMax column.
+    area.prebalance_targets(t)
+    assert t['Gen'].loc['g1', 'MWSetPoint_Target'] == 100.0                       # Load took all of it.
+    assert abs(t['Load'].loc['l1', 'SMW_Target'] - 200.0) < 1e-9
 
 if __name__ == '__main__':
     tests = [f for name, f in dict(globals()).items() if name.startswith('test_')]

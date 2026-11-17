@@ -618,6 +618,45 @@ def balance_targets(final: dict[str, pd.DataFrame], swing: float, swing_buses, s
         df['ExclusionReason'] = ''
     return {t: df.set_index('ObjectID') for t, df in targets.items()}
 
+def prebalance_targets(targets: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame] | None:
+    """
+    Before scaling: moves the targets so that, losses aside, scaling leaves the swing where it is. The change in
+    gen + dist gen - load from now to the targets would otherwise land on the swing as it scales (and set off a midrun
+    balance every few steps). Same rule as a balance: half onto gen (in proportion to target MW, capped at MWMax, the
+    rest onto load), half onto load (one factor on its MW and Mvar targets). Only included rows Closed in the target
+    with a positive target move. Returns the moved tables for the `runs` sheet (mw_changes()), or None if nothing moved.
+    """
+    g, l = targets['Gen'], targets['Load']
+    g_in, l_in = g[scale.included(g)], l[scale.included(l)]
+    p, p_target = l_in[LOAD_P].sum(axis=1), l_in[[f'{c}_Target' for c in LOAD_P]].sum(axis=1)
+    def dist(suffix):       # Dist gen injects only while the load and its dist gen are both Closed.
+        on = (l_in['Status' + suffix] == 'Closed') & (l_in['DistStatus' + suffix] == 'Closed')
+        return l_in['DistMWInput' + suffix].where(on, 0.0).sum()
+    swing = (p_target - p).sum() - (g_in['MWSetPoint_Target'] - g_in['MWSetPoint']).sum() - (dist('_Target') - dist(''))
+    if abs(swing) < 1.0:
+        return None
+
+    gen = g_in[(g_in['Status_Target'] == 'Closed') & (g_in['MWSetPoint_Target'] > 0)]
+    seed = gen['MWSetPoint_Target']
+    cap = gen['MWMax'] if 'MWMax' in gen else seed         # No MWMax known (topology): gens aren't raised.
+    cap = cap.where(cap > seed, seed)                       # A target already above MWMax isn't raised.
+    new = proportional_fill(max(seed.sum() + swing / 2, 0.0), seed, cap) if len(gen) else seed
+    g.loc[gen.index, 'MWSetPoint_Target'] = new
+
+    load = l_in[(l_in['Status_Target'] == 'Closed') & (p_target > 0)]
+    load_p = p_target[load.index]
+    load_down = swing - (new.sum() - seed.sum())            # What the gens couldn't take goes onto load too.
+    k = max(1 - load_down / load_p.sum(), 0.0) if len(load) else 1.0
+    for c in LOAD_P + LOAD_Q:
+        l.loc[load.index, f'{c}_Target'] = l.loc[load.index, f'{c}_Target'] * k
+
+    left = swing - (new.sum() - seed.sum()) + load_p.sum() * (k - 1)
+    print(f'Targets balanced before scaling: {swing:+.0f} MW would have landed on the swing; '
+          f'gen {new.sum() - seed.sum():+.0f} MW, load {load_p.sum() * (k - 1):+.0f} MW'
+          + (f'; {left:+.0f} MW could not be placed and stays on the swing.' if abs(left) >= 1.0 else '.'))
+    return {'Gen': pd.DataFrame({'MWSetPoint': new, 'MWSetPoint_Seed': seed}),
+            'Load': load_p.mul(k).to_frame('SMW').assign(IMW=0.0, ZMW=0.0, P_Seed=load_p)}
+
 def mw_changes(moved: dict[str, pd.DataFrame]) -> dict[str, float]:
     """MW moved onto gens and loads by a balance (balance_targets() tables, after scaling)."""
     return {'Gen MW Change': (moved['Gen']['MWSetPoint'] - moved['Gen']['MWSetPoint_Seed']).sum(),
