@@ -140,7 +140,8 @@ def conforming(load: pd.DataFrame) -> pd.Series:
 def nonconforming_targets(epc_load: pd.DataFrame, case_load: pd.DataFrame) -> pd.DataFrame:
     """
     Target rows (load_targets()' shape, Method 'EPC 1:1') for non-conforming PWB loads whose key is in the EPC: its
-    status, its S + I + Z MW and Mvar as constant power (0 if Open there), no current, impedance or dist gen. Any seed
+    status, its SMW and SMvar as constant power (0 if Open there; its I, Z and dist gen are ignored, as GridView
+    does), no current, impedance or dist gen. Any seed
     status: one Closed in the EPC is closed in by the engine (at 0 MW, then ramped), one Open there is ramped down and opened.
     """
     epc = epc_load.set_index('ObjectID')
@@ -148,8 +149,8 @@ def nonconforming_targets(epc_load: pd.DataFrame, case_load: pd.DataFrame) -> pd
     on = (e['Status'] == 'Closed').to_numpy()
     df = case_load.copy()
     df['Method'] = 'EPC 1:1'
-    df['Basis MW'] = np.where(on, e[LOAD_P].sum(axis=1), 0.0)
-    df['Basis Mvar'] = np.where(on, e[LOAD_Q].sum(axis=1), 0.0)
+    df['Basis MW'] = np.where(on, e['SMW'], 0.0)
+    df['Basis Mvar'] = np.where(on, e['SMvar'], 0.0)
     for c in ['IMW', 'IMvar', 'ZMW', 'ZMvar', 'DistMWInput', 'DistMvarInput']:
         df[f'{c}_Target'] = 0.0
     df['SMW_Target'], df['SMvar_Target'] = df['Basis MW'], df['Basis Mvar']
@@ -165,9 +166,9 @@ def nonconforming_targets(epc_load: pd.DataFrame, case_load: pd.DataFrame) -> pd
 def load_targets(epc_load: pd.DataFrame, case_load: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Returns (targets, area report). targets holds the case's Closed loads. Open loads aren't scaled.
+    An EPC load counts by its SMW and SMvar only: GridView ignores its I, Z and dist gen. The seed side sums S + I + Z.
     """
-    epc = epc_load.assign(P=epc_load[LOAD_P].sum(axis=1).where(closed(epc_load), 0.0),
-                          Q=epc_load[LOAD_Q].sum(axis=1).where(closed(epc_load), 0.0))
+    epc = epc_load.assign(P=epc_load['SMW'].where(closed(epc_load), 0.0), Q=epc_load['SMvar'].where(closed(epc_load), 0.0))
     df = case_load[closed(case_load)].copy()
     df['P'] = df[LOAD_P].sum(axis=1)
     df['Q'] = df[LOAD_Q].sum(axis=1)
@@ -202,7 +203,6 @@ def load_targets(epc_load: pd.DataFrame, case_load: pd.DataFrame) -> tuple[pd.Da
     report = pd.DataFrame({
         'Target MW': tgt['MW +'] + tgt['MW -'], 'Target Mvar': tgt['Mvar +'] + tgt['Mvar -'],
         'Seed MW': seed['MW +'] + seed['MW -'], 'Seed Mvar': seed['Mvar +'] + seed['Mvar -'],
-        'Seed Dist MW': df.groupby('AreaNumber')['DistMWInput'].sum(),
         'Planned MW': planned['MW +'] + planned['MW -'], 'Planned Mvar': planned['Mvar +'] + planned['Mvar -'],
         **{f'Target {c}': tgt[c] for c in tgt}, **{f'Seed {c}': seed[c] for c in seed},
         **{f'Planned {c}': planned[c] for c in planned},

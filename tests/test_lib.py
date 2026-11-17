@@ -291,6 +291,32 @@ def test_load_targets():
     assert r.loc[2, 'Key Loads'] == 2 and r.loc[3, 'Target MW'] == 0
     assert (r['Unmet MW'].abs() < 1e-9).all()
 
+def test_epc_loads_count_smw_and_smvar_only():
+    # EPC l1 is S 100 + I 20 + Z 30 (Mvar 10/2/3): only the 100 MW / 10 Mvar count, in the area target and in the load's target.
+    case = loads([('l1', 1, 'Closed', 80.0, 0.0, 0.0, 8.0)])
+    epc = loads([('l1', 1, 'Closed', 100.0, 20.0, 30.0, 10.0)]).assign(IMvar=2.0, ZMvar=3.0)
+    df, report = area.load_targets(epc, case)
+    r = report.set_index('AreaNumber')
+    assert r.loc[1, 'Target MW'] == 100 and r.loc[1, 'Target Mvar'] == 10
+    assert df.loc['l1', 'SMW_Target'] == 100 and df.loc['l1', 'SMvar_Target'] == 10
+    assert 'Seed Dist MW' not in report.columns
+
+def test_nonconforming_basis_is_the_epc_smw_only():
+    case = loads([('s1', 1, 'Closed', 7.0, 0.0, 0.0, 1.0)])
+    epc = loads([('s1', 1, 'Closed', 100.0, 20.0, 30.0, 10.0)]).assign(IMvar=2.0, ZMvar=3.0)
+    df = area.nonconforming_targets(epc, case)
+    assert df.loc['s1', 'Basis MW'] == 100 and df.loc['s1', 'Basis Mvar'] == 10 and df.loc['s1', 'SMW_Target'] == 100
+    assert (df.loc['s1', ['IMW_Target', 'ZMW_Target', 'IMvar_Target', 'ZMvar_Target']] == 0).all()
+
+def test_topology_targets_take_the_epc_smw_and_zero_its_i_and_z():
+    common = dict(BusName='A', NomkV=230.0)
+    load = lambda **kw: pd.DataFrame({'ObjectID': ['l1'], 'BusNum': 1, 'ID': '1', 'Status': 'Closed', 'SMW': 50.0, 'SMvar': 5.0, 'IMW': 0.0, 'IMvar': 0.0,
+                                      'ZMW': 0.0, 'ZMvar': 0.0, 'DistStatus': 'Closed', 'DistMWInput': 3.0, 'DistMvarInput': 1.0, **common, **kw})
+    gen = pd.DataFrame(columns=['ObjectID', 'BusNum', 'ID', 'Status', 'MWSetPoint', 'BusName', 'NomkV'])
+    ld = topo.build_targets({'Gen': gen, 'Load': load(SMW=100.0, SMvar=10.0, IMW=20.0, IMvar=2.0, ZMW=30.0, ZMvar=3.0)}, {'Gen': gen, 'Load': load()})['Load']
+    assert ld.loc['l1', 'SMW_Target'] == 100 and ld.loc['l1', 'SMvar_Target'] == 10
+    assert (ld.loc['l1', ['IMW_Target', 'IMvar_Target', 'ZMW_Target', 'ZMvar_Target', 'DistMWInput_Target']] == 0).all()
+
 def test_load_targets_area_with_no_seed_load_is_unmet():
     case = loads([('l1', 1, 'Open', 10.0, 0.0, 0.0, 0.0)])
     epc = loads([('l1', 1, 'Closed', 40.0, 0.0, 0.0, 0.0)])
@@ -2200,7 +2226,7 @@ def test_non_conforming_loads_open_in_both_cases_are_not_target_rows():
     assert 'non-conforming set to EPC: 25.0 MW (1 load)' in row['Note']
 
 def test_nonconforming_loads_take_the_epc_status_and_those_without_a_key_are_left_alone():
-    # s1: Open in the seed, Closed in the EPC (40 MW): closed in. s2: Closed in the seed, Open in the EPC: opened.
+    # s1: Open in the seed, Closed in the EPC (SMW 30; its I 5 and Z 5 don't count): closed in. s2: Closed in the seed, Open in the EPC: opened.
     # s3: no EPC key: untouched. Dist gen of the 1:1 loads goes Open & 0.
     sa, targets, reports, sheet, _ = nonc_hour(
         [('s1', 1, 'Open', 7.0, 0.0, 0.0, 0.0), ('s2', 1, 'Closed', 60.0, 0.0, 0.0, 0.0), ('s3', 1, 'Closed', 30.0, 0.0, 0.0, 0.0)],
@@ -2208,15 +2234,15 @@ def test_nonconforming_loads_take_the_epc_status_and_those_without_a_key_are_lef
         flags=('NO', 'NO', 'NO'), epc_flags=('NO', 'NO'))
     t = targets['Load']
     assert t.loc[['s1', 's2'], 'Status_Target'].tolist() == ['Closed', 'Open'] and 's3' not in t.index
-    assert t.loc[['s1', 's2'], 'SMW_Target'].tolist() == [40.0, 0.0] and t.loc['s1', 'SMvar_Target'] == 4.0
+    assert t.loc[['s1', 's2'], 'SMW_Target'].tolist() == [30.0, 0.0] and t.loc['s1', 'SMvar_Target'] == 4.0
     assert (t.loc[['s1', 's2'], ['IMW_Target', 'ZMW_Target', 'DistMWInput_Target']] == 0).all().all()
     assert t.loc[['s1', 's2'], 'DistStatus_Target'].tolist() == ['Open', 'Open']
     out = sa.table('Load').set_index('BusNum')
-    assert (out.loc[4, 'Status'], out.loc[4, 'SMW'], out.loc[4, 'SMvar'], out.loc[4, 'DistStatus']) == ('Closed', 40.0, 4.0, 'Open')
+    assert (out.loc[4, 'Status'], out.loc[4, 'SMW'], out.loc[4, 'SMvar'], out.loc[4, 'DistStatus']) == ('Closed', 30.0, 4.0, 'Open')
     assert (out.loc[5, 'Status'], out.loc[5, 'SMW']) == ('Open', 0.0)
     assert (out.loc[6, 'Status'], out.loc[6, 'SMW']) == ('Closed', 30.0)
     row = sheet[sheet['Group'] == 'Load'].iloc[0]
-    assert 'non-conforming set to EPC: 40.0 MW (2 loads)' in row['Note'] and 'non-conforming left as is: 30.0 MW' in row['Note']
+    assert 'non-conforming set to EPC: 30.0 MW (2 loads)' in row['Note'] and 'non-conforming left as is: 30.0 MW' in row['Note']
     assert row['Final MW'] == row['Target MW'] == 120.0 and not sheet['Note'].str.contains('unexplained').any()
 
 def test_loss_estimate_counts_one_to_one_loads_at_their_epc_value_and_others_at_seed():

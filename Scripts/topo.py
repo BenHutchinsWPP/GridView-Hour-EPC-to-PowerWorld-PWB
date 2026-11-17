@@ -451,8 +451,9 @@ def build_targets(gv: dict[str,pd.DataFrame], case: dict[str,pd.DataFrame], swin
     for table, statuses in scale.STATUS.items():
         gv_df = gv[table]
         if table == 'Load':
-            # GridView leaves distributed generation in the load table at seed-case values, unused. Target Open & 0 MW.
-            gv_df = gv_df.assign(DistStatus='Open', DistMWInput=0.0, DistMvarInput=0.0)
+            # GridView uses constant power (SMW/SMvar) only. Its I, Z and distributed generation are ignored (left in the
+            # load table at seed-case values): target them 0 / Open.
+            gv_df = gv_df.assign(IMW=0.0, IMvar=0.0, ZMW=0.0, ZMvar=0.0, DistStatus='Open', DistMWInput=0.0, DistMvarInput=0.0)
 
         fields = [*statuses, *scale.SCALED[table]]
         df = case[table].merge(gv_df[['ObjectID', *fields]], on='ObjectID', how='left', suffixes=('', '_Target'))
