@@ -105,7 +105,10 @@ def create_case(SimAuto, gv_fp, out_fp):
 
     pw.open_case(SimAuto, pw_fp)
     scale.turn_off_islanded(SimAuto, targets)     # Everything outside the main island goes Open, before scaling.
-    area.warn_unconverted_loads(pw.get_df(SimAuto, 'Load', area.LOAD_FIELDS))     # An old Prepared.pwb: rerun step 01.
+    try:        # An old Prepared.pwb: rerun step 01. Only a warning, so it never costs the hour.
+        area.warn_unconverted_loads(pw.get_df(SimAuto, 'Load', area.LOAD_FIELDS))
+    except Exception as e:
+        print(f'WARNING: could not check the loads for current/impedance/dist gen: {e!r}.')
     pvqv = pd.read_csv(pvqv_fp) if run['use_pvqv'] else None
     balance_tables, makeup_tables = [], []
     slack = prep.slack_buses(SimAuto)

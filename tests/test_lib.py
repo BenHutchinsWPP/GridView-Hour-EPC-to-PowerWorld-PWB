@@ -301,6 +301,12 @@ def test_epc_loads_count_smw_and_smvar_only():
     assert df.loc['l1', 'SMW_Target'] == 100 and df.loc['l1', 'SMvar_Target'] == 10
     assert 'Seed Dist MW' not in report.columns
 
+def test_a_blank_epc_smw_counts_as_0():
+    case = loads([('l1', 1, 'Closed', 100.0, 0.0, 0.0, 10.0), ('l2', 1, 'Closed', 100.0, 0.0, 0.0, 10.0)])
+    epc = loads([('l1', 1, 'Closed', np.nan, 0.0, 0.0, np.nan), ('l2', 1, 'Closed', 80.0, 0.0, 0.0, 8.0)])
+    targets, _ = area.build_targets({'Load': epc, 'Gen': gens([])}, {'Load': case, 'Gen': gens([])})
+    assert targets['Load']['SMW_Target'].notna().all() and targets['Load']['SMW_Target'].sum() == 80.0
+
 def test_nonconforming_basis_is_the_epc_smw_only():
     case = loads([('s1', 1, 'Closed', 7.0, 0.0, 0.0, 1.0)])
     epc = loads([('s1', 1, 'Closed', 100.0, 20.0, 30.0, 10.0)]).assign(IMvar=2.0, ZMvar=3.0)
@@ -2383,6 +2389,30 @@ def test_convert_loads_stops_bisecting_at_the_failure_cap():
     after = sa.table('Load').set_index('ObjectID')
     assert 'stopped bisecting after 1 failures' in out.getvalue()
     assert 'd' in sheets['load_conversion_failed'].index and after.loc['d', 'IMW'] == 5.0      # d is fine, but was never tried.
+    # Exactly one single-load conversion was tried: the cap stops at the first failure, not after it.
+    sa, calls, real = conversion_case(bad={'11', '12'}), [], pw.set_df
+    def counting(S, t, df, f, *a, **k):
+        if t == 'Load' and 'SMW' in f:
+            calls.append(len(df))
+        return real(S, t, df, f, *a, **k)
+    prep.CONVERT_MAX_FAILED, pw.set_df = 1, counting
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            prep.convert_loads_to_constant_power(sa)
+    finally:
+        prep.CONVERT_MAX_FAILED, pw.set_df = saved, real
+    assert calls.count(1) == 1, calls
+
+def test_conversion_warnings_flag_area_swing_and_load_moves():
+    sheet = pd.DataFrame({'AreaNumber': [1, 2, 'Swing'], 'Diff MW': [0.5, 0.0, 0.2], 'Diff Mvar': [0.0, 3.0, np.nan]})
+    done = pd.DataFrame({'MW': [10.0, 20.0], 'SMW': [10.0, 20.0], 'DistMW': [0.0, 0.0]})
+    w = prep.conversion_warnings(sheet, done)
+    assert len(w) == 1 and 'area(s) 2.' in w[0]
+    sheet.loc[2, 'Diff MW'] = -5.0
+    done.loc[1, 'MW'] = 17.0
+    w = prep.conversion_warnings(sheet.assign(**{'Diff Mvar': [0.0, 0.0, np.nan]}), done)
+    assert len(w) == 2 and 'swing moved -5.0 MW' in w[0] and '1 converted loads' in w[1]
+    assert prep.conversion_warnings(sheet.assign(**{'Diff MW': 0.0, 'Diff Mvar': 0.0}), done.assign(MW=done['SMW'])) == []
 
 def test_convert_loads_with_blank_net_fields_stops_before_writing():
     sa = conversion_case()

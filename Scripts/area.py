@@ -149,8 +149,8 @@ def nonconforming_targets(epc_load: pd.DataFrame, case_load: pd.DataFrame) -> pd
     on = (e['Status'] == 'Closed').to_numpy()
     df = case_load.copy()
     df['Method'] = 'EPC 1:1'
-    df['Basis MW'] = np.where(on, e['SMW'], 0.0)
-    df['Basis Mvar'] = np.where(on, e['SMvar'], 0.0)
+    df['Basis MW'] = np.where(on, e['SMW'].fillna(0.0), 0.0)
+    df['Basis Mvar'] = np.where(on, e['SMvar'].fillna(0.0), 0.0)
     for c in ['IMW', 'IMvar', 'ZMW', 'ZMvar', 'DistMWInput', 'DistMvarInput']:
         df[f'{c}_Target'] = 0.0
     df['SMW_Target'], df['SMvar_Target'] = df['Basis MW'], df['Basis Mvar']
@@ -168,7 +168,8 @@ def load_targets(epc_load: pd.DataFrame, case_load: pd.DataFrame) -> tuple[pd.Da
     Returns (targets, area report). targets holds the case's Closed loads. Open loads aren't scaled.
     An EPC load counts by its SMW and SMvar only: GridView ignores its I, Z and dist gen. The seed side sums S + I + Z.
     """
-    epc = epc_load.assign(P=epc_load['SMW'].where(closed(epc_load), 0.0), Q=epc_load['SMvar'].where(closed(epc_load), 0.0))
+    epc = epc_load.assign(P=epc_load['SMW'].fillna(0.0).where(closed(epc_load), 0.0),
+                          Q=epc_load['SMvar'].fillna(0.0).where(closed(epc_load), 0.0))
     df = case_load[closed(case_load)].copy()
     df['P'] = df[LOAD_P].sum(axis=1)
     df['Q'] = df[LOAD_Q].sum(axis=1)

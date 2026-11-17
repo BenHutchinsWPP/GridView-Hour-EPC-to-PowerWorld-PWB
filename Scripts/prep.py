@@ -186,7 +186,7 @@ def constant_power_rows(load: pd.DataFrame) -> pd.DataFrame:
     """
     Closed loads as constant power: S = what the load draws now (NetMW/NetMvar, after voltage and dist gen), no I, Z or dist gen.
     Input columns: BusNum, ID, ObjectID, AreaNumber, Status, NetMW, NetMvar. The result is indexed by ObjectID.
-    A load on a dead bus has NetMW 0 and so becomes 0 MW. That is fine: step 02 turns islanded loads Open anyway.
+    A load on a dead bus has NetMW 0 and so becomes 0 MW. Step 02 turns islanded loads Open anyway (when islands are checked).
     """
     out = load[load['Status'] == 'Closed'].set_index('ObjectID')[['BusNum', 'ID', 'AreaNumber', 'NetMW', 'NetMvar']]
     out = out.assign(SMW=out['NetMW'], SMvar=out['NetMvar'])
@@ -212,6 +212,25 @@ def _area_net(load: pd.DataFrame) -> pd.DataFrame:
                          'Dist MW': closed.groupby('AreaNumber')['DistMW'].sum(),
                          'Net MW': closed.groupby('AreaNumber')['NetMW'].sum(),
                          'Net Mvar': closed.groupby('AreaNumber')['NetMvar'].sum()})
+
+def conversion_warnings(sheet: pd.DataFrame, done: pd.DataFrame) -> list[str]:
+    """
+    The checks on a conversion: an area's net MW/Mvar (sheet's area rows) or the swing (its 'Swing' row) moved more than
+    CONVERT_TOL_MW, or converted loads (`done`, read back after the solve) draw MW other than their SMW or carry dist gen.
+    """
+    out = []
+    areas, swing = sheet[sheet['AreaNumber'] != 'Swing'], sheet[sheet['AreaNumber'] == 'Swing']
+    moved = areas[(areas['Diff MW'].abs() > CONVERT_TOL_MW) | (areas['Diff Mvar'].abs() > CONVERT_TOL_MW)]
+    if len(moved):
+        out.append(f'WARNING: Net load changed by more than {CONVERT_TOL_MW} MW/Mvar in area(s) {", ".join(map(str, moved["AreaNumber"]))}. See load_conversion.')
+    d = float(swing['Diff MW'].sum())
+    if abs(d) > CONVERT_TOL_MW:
+        out.append(f'WARNING: The swing moved {d:.1f} MW in the conversion (more than {CONVERT_TOL_MW} MW). See load_conversion.')
+    off = ((done['MW'] - done['SMW']).abs() > CONVERT_TOL_MW) | (done['DistMW'].abs() > 1e-6)
+    if off.any():
+        out.append(f'WARNING: {int(off.sum())} converted loads still draw MW different from their SMW or carry dist gen '
+                   '(PowerWorld may reduce load at low voltage). Check them in the case.')
+    return out
 
 def convert_loads_to_constant_power(SimAuto) -> dict[str, pd.DataFrame]:
     """
@@ -243,7 +262,8 @@ def convert_loads_to_constant_power(SimAuto) -> dict[str, pd.DataFrame]:
 
     rows = constant_power_rows(before)
     failed = pw.set_df_bisect(SimAuto, 'Load', rows, LOAD_CONVERT_FIELDS, limit=CONVERT_MAX_FAILED)
-    pw.solve(SimAuto)       # The last bisect trial may have ended on a rolled-back state.
+    if not pw.solve(SimAuto):       # The last bisect trial may have ended on a rolled-back state.
+        print('WARNING: The case does not solve after the conversion: the load_conversion figures are unsolved values.')
     after = _read_loads(SimAuto)
     swing_after = _swing_mw(SimAuto)
 
@@ -261,16 +281,9 @@ def convert_loads_to_constant_power(SimAuto) -> dict[str, pd.DataFrame]:
     n_closed = int(closed.sum())
     print(f'Loads to constant power: {n_closed} loads, net {before.loc[closed, "NetMW"].sum():.1f} MW '
           f'(dist gen {before.loc[closed, "DistMW"].sum():.1f} MW folded in)')
-    moved = sheet[(sheet['AreaNumber'] != 'Swing') & ((sheet['Diff MW'].abs() > CONVERT_TOL_MW) | (sheet['Diff Mvar'].abs() > CONVERT_TOL_MW))]
-    if len(moved):
-        print(f'WARNING: Net load changed by more than {CONVERT_TOL_MW} MW/Mvar in area(s) {", ".join(map(str, moved["AreaNumber"]))}. See load_conversion.')
-    if abs(swing_after - swing_before) > CONVERT_TOL_MW:
-        print(f'WARNING: The swing moved {swing_after - swing_before:.1f} MW in the conversion (more than {CONVERT_TOL_MW} MW). See load_conversion.')
     done = after[after['ObjectID'].isin(rows.index.difference(failed)) & (after['Status'] == 'Closed')]
-    off = ((done['MW'] - done['SMW']).abs() > CONVERT_TOL_MW) | (done['DistMW'].abs() > 1e-6)
-    if off.any():
-        print(f'WARNING: {int(off.sum())} converted loads still draw MW different from their SMW or carry dist gen '
-              '(PowerWorld may reduce load at low voltage). Check them in the case.')
+    for w in conversion_warnings(sheet, done):
+        print(w)
     if failed:
         capped = f' (stopped bisecting after {CONVERT_MAX_FAILED} failures; the rest were not tried)' if len(failed) >= CONVERT_MAX_FAILED else ''
         print(f'WARNING: {len(failed)} loads could not be converted without diverging{capped}. They keep current/impedance/dist gen; step 02 ramps those to 0.')
