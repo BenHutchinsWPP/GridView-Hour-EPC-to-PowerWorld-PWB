@@ -2,7 +2,9 @@
 Tests for the parts of Scripts/ which don't need PowerWorld. Runs on any OS.
     python tests/test_lib.py      (or: pytest tests)
 """
+import contextlib
 import importlib.util
+import io
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -1725,6 +1727,123 @@ def test_step_02_runs_a_makeup_only_in_area_mode_when_something_is_short():
     with saved_settings(), tempfile.TemporaryDirectory() as d:
         step = load_step_02(Path(d), 'topology')
         assert step.area.MAKEUP                                                  # On, but area mode only.
+
+# ------------------ T2: area.py / scale.py bugs (2026-11-17) ------------------
+def test_plan_makeup_commitment_leaves_offline_solar_and_wind_off():
+    # Night: EPC Thermal 300 MW on a key the PWB lacks, EPC Solar and Wind at 0. Thermal is short (t1 MWMax 200, t2 offline
+    # with 30 MW); s1 / w1 are online in a daytime seed. The leftover must not bring any Solar / Wind unit online.
+    case = gens([('t1', 1, '1', 'Closed', 'GT', 150.0, 200.0, 0.0), ('t2', 1, '4', 'Open', 'GT', 0.0, 30.0, 0.0),
+                 ('s1', 1, '2', 'Closed', 'PV', 100.0, 400.0, 0.0), ('w1', 1, '3', 'Closed', 'WT', 50.0, 400.0, 0.0)])
+    epc = gens([('eT', 1, '9', 'Closed', 'GT', 300.0, 400.0, 0.0),
+                ('s1', 1, '2', 'Closed', 'PV', 0.0, 400.0, 0.0), ('w1', 1, '3', 'Closed', 'WT', 0.0, 400.0, 0.0)])
+    targets, reports = area.build_targets({'Load': loads([]), 'Gen': epc}, {'Load': loads([]), 'Gen': case})
+    g = targets['Gen']
+    assert g.loc[['s1', 'w1'], 'Status_Target'].tolist() == ['Open', 'Open'] and g.loc[['s1', 'w1'], 'MWSetPoint_Target'].tolist() == [0.0, 0.0]
+    assert g.loc[['t1', 't2'], 'MWSetPoint_Target'].tolist() == [200.0, 30.0]
+    g['MWSetPoint'] = g['MWSetPoint_Target']                                      # As if scaling reached every target.
+    final = case.set_index('ObjectID').loc[g.index].assign(Status=g['Status_Target'], MWSetPoint=g['MWSetPoint_Target']).reset_index()
+    out = area.areas({'Gen': final, 'Load': loads([]).assign(NomkV=1.0)}, reports, targets).set_index('Group')
+    assert out.loc['Thermal', 'Unmet MW'] == 70.0 and out.loc['Solar', 'Unmet MW'] == 0.0 and out.loc['Wind', 'Unmet MW'] == 0.0
+    assert not out['Note'].str.contains('unexplained').any(), out['Note']
+
+def test_areas_online_final_leaves_out_statcoms():
+    case = gens([('g1', 1, '1', 'Closed', 'GT', 100.0, 200.0, 0.0), ('sc', 1, scale.STATCOM_ID, 'Closed', '', 0.0, 0.0, 0.0)])
+    epc = gens([('g1', 1, '1', 'Closed', 'GT', 100.0, 200.0, 0.0)])
+    targets, reports = area.build_targets({'Load': loads([]), 'Gen': epc}, {'Load': loads([]), 'Gen': case.iloc[:1]})
+    out = area.areas({'Gen': case, 'Load': loads([]).assign(NomkV=1.0)}, reports, targets)
+    assert out[['Group', 'Online Final']].values.tolist() == [['Thermal', 1.0]]
+
+def test_midrun_balance_skips_gens_the_scaling_takes_to_zero():
+    # g1 is decommitted (Open, 100 -> 0 MW), g3 stays Closed at a 0 MW target; g2 stays at 100. The balances go onto g2 only,
+    # so rescale_targets() has nothing to undo and the end targets keep every MW a balance moved.
+    gen = gens([('xx', 9, 'xx', 'Closed', '', 0.0, 2e4, -2e4), ('g1', 1, '1', 'Closed', 'GT', 100.0, 5000.0, 0.0),
+                ('g2', 1, '2', 'Closed', 'GT', 100.0, 5000.0, 0.0), ('g3', 1, '3', 'Closed', 'GT', 100.0, 5000.0, 0.0)]
+               ).assign(BusNum=[99, 1, 2, 4], MW=0.0, NomkV=230.0, BusName='b')
+    load = loads([('l1', 1, 'Closed', 300.0, 0.0, 0.0, 30.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
+    t = load_ramp_targets()
+    t['Gen'] = targets_df(ObjectID=['g1', 'g2', 'g3'], BusNum=[1, 2, 4], ID='1', Status='Closed', Status_Target=['Open', 'Closed', 'Closed'],
+                          MWSetPoint=[100.0] * 3, MWSetPoint_Target=[0.0, 100.0, 0.0])
+    sa = SwingSimAuto(gen, load)
+    after_step, log = area.midrun_balancer(sa)
+    scale.iterate_to_gen_load_targets(sa, t, after_step=after_step)
+    assert log and all(r.moved['Gen'].index.tolist() == ['g2'] for r in log)
+    g = t['Gen']
+    assert g.loc['g1', 'MWSetPoint_Target'] == 0 and g.loc['g3', 'MWSetPoint_Target'] == 0
+    kept = g['MWSetPoint_Target'].sum() - 100.0
+    assert kept > 100.0 and abs(kept - sum(r.moved['Gen']['MWSetPoint'].sum() - r.moved['Gen']['MWSetPoint_Seed'].sum() for r in log)) < 1e-6
+
+def own_slack_ramp(lo, hi, trigger, down=False):
+    """A 3 GW load ramp with the case's own slack (bus 9, MWMin lo, MWMax hi) and no giant swing: (midrun runs, main steps, end swing, goal)."""
+    gen = gens([('s1', 1, '1', 'Closed', 'GT', 100.0, hi, lo), ('g1', 1, '2', 'Closed', 'GT', 100.0, 5000.0, 0.0),
+                ('g2', 1, '3', 'Closed', 'HY', 100.0, 5000.0, 0.0)]).assign(BusNum=[9, 1, 2], MW=0.0, NomkV=230.0, BusName='b')
+    load = loads([('l1', 1, 'Closed', 200.0, 0.0, 0.0, 20.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
+    sa = SwingSimAuto(gen, load, slack=[9])
+    if down:        # Load 3200 -> 200 instead: the slack drifts down.
+        sa.base['Load'].loc[3, 'SMW'] = 3200.0
+    with saved_settings(), contextlib.redirect_stdout(io.StringIO()):
+        area.BALANCE_TRIGGER_MW = trigger
+        after_step, log = area.midrun_balancer(sa)
+        t = load_ramp_targets()
+        if down:
+            for c in scale.SCALED['Load']:
+                t['Load'][c], t['Load'][f'{c}_Target'] = t['Load'][f'{c}_Target'].copy(), t['Load'][c].copy()
+        out = scale.iterate_to_gen_load_targets(sa, t, after_step=after_step)
+        area.balance_swing(sa)
+    return log, out['step_df'], area.swing_mw(sa.table('Gen'), [9])[0], area.swing_goal(sa.table('Gen'), [9])
+
+def test_midrun_balance_of_an_own_slack_with_no_range_stays_cheap():
+    log, steps, swing, (lo, hi) = own_slack_ramp(100.0, 100.0, 1000.0)       # MWMin == MWMax: the band used to have no width.
+    assert len(log) <= 10 and len(steps) <= 25 and lo - area.BALANCE_TOL_MW <= swing <= hi + area.BALANCE_TOL_MW, (len(log), len(steps), swing)
+    log, steps, swing, (lo, hi) = own_slack_ramp(100.0, 100.0, 1000.0, down=True)    # The lower half of the band, on a falling load.
+    assert len(log) <= 10 and len(steps) <= 25 and lo - area.BALANCE_TOL_MW <= swing <= hi + area.BALANCE_TOL_MW, (len(log), len(steps), swing)
+
+def test_midrun_balance_of_an_own_slack_is_off_with_no_trigger_and_a_narrow_range():
+    # Trigger 0: the band is the slack's MWMin to MWMax; a range under 100 MW is not balanced midrun (the final balance still runs).
+    # (The plan's example 50..150 is exactly 100 MW wide: 90 MW here, see the T2 report.)
+    log, steps, swing, (lo, hi) = own_slack_ramp(50.0, 140.0, 0.0)
+    assert log == [] and lo - area.BALANCE_TOL_MW <= swing <= hi + area.BALANCE_TOL_MW
+    log, steps, swing, _ = own_slack_ramp(0.0, 1000.0, 0.0)                  # A wide range: balanced at its limits, not every step.
+    assert 1 <= len(log) <= 5, len(log)
+    log, steps, swing, _ = own_slack_ramp(50.0, 150.0, 0.0)                  # Exactly MIN_OWN_RANGE_MW wide: still balanced (strict <).
+    assert len(log) >= 1
+
+def test_a_unit_on_a_bus_out_of_band_from_the_start_is_held_before_scaling_begins():
+    gen = targets_df(ObjectID=['g1', 'g2'], BusNum=[1, 2], ID='1', Status='Closed', Status_Target='Closed',
+                     MWSetPoint=[10.0, 10.0], MWSetPoint_Target=[20.0, 20.0])
+    gen['HeldReason'] = ''
+    scale.hold_voltage({'Gen': gen}, pd.Series({1: 1.0, 2: 0.85}))          # No Progress column yet (before mark_start()).
+    assert gen['HeldReason'].tolist() == ['', 'Voltage']
+
+def test_areas_keeps_a_seed_gen_whose_id_is_the_statcom_id():
+    case = gens([('g1', 1, '1', 'Closed', 'GT', 100.0, 200.0, 0.0), ('g2', 1, scale.STATCOM_ID, 'Closed', 'GT', 50.0, 100.0, 0.0),
+                 ('new', 1, scale.STATCOM_ID, 'Closed', '', 0.0, 0.0, 0.0)])
+    epc = case.iloc[:2]
+    targets, reports = area.build_targets({'Load': loads([]), 'Gen': epc}, {'Load': loads([]), 'Gen': case.iloc[:2]})
+    out = area.areas({'Gen': case, 'Load': loads([]).assign(NomkV=1.0)}, reports, targets).set_index('Group')
+    assert out.loc['Thermal', 'Final MW'] == 150.0 and out.loc['Thermal', 'Online Final'] == 2.0   # 'new' is a STATCOM added later.
+    assert not out['Note'].str.contains('unexplained').any(), out['Note']
+
+class LowAtEndSimAuto(FakeSimAuto):
+    """Bus 2 sags to 0.85 pu once gen g2 has been written at 0 MW (its target): it reached the target, then the voltage dropped."""
+    def GetParametersMultipleElementRect(self, table, fields, filter_group):
+        if table != 'Bus':
+            return ('', [])
+        low = any(t == 'Gen' and k == '2' and float(r.get('MWSetPoint', 1)) == 0.0 for (t, k), r in self.applied.items())
+        v = lambda n: '0.85' if (n == 2 and low) else '1.0'
+        vals = {'IslandNumber': '1', 'BusIsStarBus:1': 'NO', 'BusNomVolt': '230'}
+        return ('', [[str(n) if f in ('Busnum', 'Number') else v(n) if f == 'Vpu' else vals.get(f, '0') for f in fields] for n in (1, 2)])
+
+def test_a_unit_at_its_target_is_not_held_for_voltage_and_gets_its_status():
+    gen = targets_df(ObjectID=['g1', 'g2'], BusNum=[1, 2], ID='1', Status='Closed', Status_Target=['Closed', 'Open'],
+                     MWSetPoint=[10.0, 50.0], MWSetPoint_Target=[20.0, 0.0])
+    load = targets_df(ObjectID=['l1'], BusNum=[1], ID='1', Status='Closed', Status_Target='Closed', DistStatus='Open', DistStatus_Target='Open',
+                      **{c: [5.0] for c in scale.SCALED['Load']}, **{f'{c}_Target': [5.0] for c in scale.SCALED['Load']})
+    t = {'Gen': gen, 'Load': load}
+    with contextlib.redirect_stdout(io.StringIO()):
+        scale.iterate_to_gen_load_targets(LowAtEndSimAuto(), t)
+    g = t['Gen']
+    assert g.loc['g2', 'Status'] == 'Open' and g.loc['g2', 'ExclusionReason'] == '' and g.loc['g2', 'Progress'] == scale.RESOLUTION
+    assert 'g2' not in set(scale.exceptions([], t)['ObjectID'])
 
 if __name__ == '__main__':
     tests = [f for name, f in dict(globals()).items() if name.startswith('test_')]

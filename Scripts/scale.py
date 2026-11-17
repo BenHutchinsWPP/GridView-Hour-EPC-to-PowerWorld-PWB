@@ -255,7 +255,8 @@ def hold_voltage(targets, vpu_by_bus: pd.Series):
     # Once a bus exceeds the vmin/vmax limits, hold its gens/loads back from scaling until it recovers.
     # This avoids voltage collapse related issues during scaling.
     for df in targets.values():
-        hold(df, ~voltage_ok(df, vpu_by_bus), 'Voltage')
+        # A row already at its target isn't held (it would end excluded, and its status never set). Before mark_start() no row has a Progress.
+        hold(df, ~voltage_ok(df, vpu_by_bus) & (df['Progress'] < RESOLUTION if 'Progress' in df else True), 'Voltage')
 
 # ------------------ Applying changes ------------------
 def apply_rows(SimAuto, table: str, df: pd.DataFrame, new_df: pd.DataFrame, solves: int = 1) -> list:
