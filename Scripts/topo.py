@@ -416,7 +416,9 @@ def set_branch_statuses(SimAuto, left_case_dict, right_case_dict):
 # ------------------ Targets (step 02) ------------------
 TARGET_FIELDS = {
     table: {'ObjectID': str, 'BusNum': int, 'BusName': str, 'NomkV': float, 'ID': str,
-            **{s: str for s in scale.STATUS[table]}, **{c: float for c in scale.SCALED[table]}}
+            **{s: str for s in scale.STATUS[table]}, **{c: float for c in scale.SCALED[table]},
+            # Gens: the swing balances raise them up to MWMax, spread by area & GenType like area mode.
+            **({'MWMax': float, 'AreaNumber': int, 'UnitTypeCode': str, 'FuelTypeCode': str} if table == 'Gen' else {})}
     for table in scale.STATUS
 }
 

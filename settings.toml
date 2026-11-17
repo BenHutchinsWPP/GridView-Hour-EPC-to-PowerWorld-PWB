@@ -15,7 +15,8 @@ create_giant_swing = true
 # Where the giant swing goes: "slack" (the case's slack bus), "max_fault_duty" (computes fault duty on every bus: slow),
 # or a bus number.
 swing_bus = "slack"
-# Move MW off the swing onto the whole case's gen and load (half each): during scaling whenever the swing is further than
+# Move MW off the swing onto the whole case's gen (load is never moved; one factor on every gen, so each area & GenType
+# moves by the same share): during scaling whenever the swing is further than
 # [area] balance_trigger_mw from 0, and after scaling until it is ~0 MW. The swing unit itself is never moved.
 balance_swing = true
 
@@ -38,15 +39,17 @@ commit_max_cf = 0.9                     # Thermal & Unknown: commit until the ta
 all_on_types = ["Hydro", "Wind", "Solar", "Battery Storage"]    # Every unit online, all at the same % output.
 off_at_zero_types = ["Wind", "Solar"]   # At a target of 0, these go offline (the other all-on types keep their status).
 manual_unit_types = ["DC"]              # Unit types never scaled (adjusted by hand).
-# Non-conforming loads (load AGC = NO in PowerWorld): false = never scaled or balanced, and left out of both cases'
+# Non-conforming loads (load AGC = NO in PowerWorld): false = never scaled, and left out of both cases'
 # area load totals.
 scale_nonconforming = false
 # Before scaling, the targets are balanced for the change in losses too: each area's losses (LossMW) are expected to go
 # as (its target load / its seed load) ** loss_exponent. 2 = I^2 R; 0 = losses stay at their seed values. The areas
 # sheet shows Seed, Est. and Final Loss MW, to check it by.
 loss_exponent = 2.0
-# After the main scaling, move what excluded/held units didn't reach onto the other units of their area & GenType (or
-# their area's load), before the final balance. The areas sheet shows it as Make-up MW.
+# Keep each area's gen total on target. In the plan: what an area & GenType's own units can't take (no units, or
+# capped at MWMax) goes onto the area's other GenTypes. After the main scaling: what excluded/held units didn't reach
+# goes onto the other units of their area & GenType, then the area's other gens (or their area's load), before the
+# final balance. The areas sheet shows both as Make-up MW.
 makeup = true
 balance_tol_mw = 1.0
 balance_max_rounds = 10

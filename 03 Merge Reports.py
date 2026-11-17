@@ -17,6 +17,7 @@ def _hour_row(hour: str, sheets: dict[str, pd.DataFrame]) -> dict:
     areas = sheets.get('areas')
     if areas is not None and len(areas):
         for col in ('Unmet MW', 'Not Reached MW', 'Make-up MW'):
+            # Unmet: what groups' own units couldn't take; Make-up covers some of it (and Not Reached) within each area.
             row[col] = areas[col].sum() if col in areas else np.nan      # Make-up MW: not in older logs.
         # Gen and load balancing apart: summed together, MW put onto gen and taken off load would cancel.
         is_load = areas['Group'] == 'Load'

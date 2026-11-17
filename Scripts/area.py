@@ -12,14 +12,14 @@ The targets are:
   for that area, and its negative loads (DC converters, generation modelled as load) to the EPC's negative total.
 - Generation, per (AreaNumber, GenType): the EPC's total MWSetPoint of Closed gens of that type in that area.
   The PWB's Closed gens of that type in that area share it in proportion to MWMax (the same capacity factor on each),
-  capped at MWMax. What can't be placed is reported as Unmet MW, and ends up on the giant swing.
+  capped at MWMax. What can't be placed is reported as Unmet MW; with MAKEUP it goes onto the area's other GenTypes.
   DC ties (unit type DC) are left alone in both cases: they are set by hand.
 - Unit commitment (COMMIT): within each (area, GenType) bucket, gens are brought online or taken offline to suit the
   target (see commit()). Load statuses never change.
 - Exception: an area whose list of loads (or gens) has exactly the same keys in both cases has each one targeted to its
   own EPC value (0 if Open in the EPC), instead of being scaled as a group. With COMMIT, such gens also take their EPC status.
 
-After that, whatever is left on the swing is balanced out over the whole case, half on generation and half on load
+After that, whatever is left on the swing is balanced out over the whole case, all on generation (load stays on its targets)
 (see balance_targets()), so the swing ends near 0 MW. This moves the area totals off their targets by that much.
 
 Working tables are in the shape Scripts/scale.py expects (see its docstring), plus AreaNumber, GenType and Method.
@@ -235,6 +235,73 @@ def proportional_fill(target: float, weight: pd.Series, cap: pd.Series) -> pd.Se
         free[hit] = False
     return x
 
+def gen_keys(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """(AreaNumber, GenType) of each gen; one area / one group for a table without the columns (some test tables)."""
+    area = df['AreaNumber'] if 'AreaNumber' in df else pd.Series(0, index=df.index)
+    group = classify_gen_type(df) if 'UnitTypeCode' in df and len(df) else pd.Series('All', index=df.index, dtype=object)
+    return area, group
+
+def _fill(target: float, weight: np.ndarray, cap: np.ndarray) -> np.ndarray:
+    """proportional_fill() on numpy arrays (target >= 0, weight >= 0, cap >= 0)."""
+    x = np.zeros(len(weight))
+    free = weight > 0
+    remaining = target
+    while free.any() and remaining > 1e-9:
+        share = np.where(free, remaining * weight / weight[free].sum(), 0.0)
+        over = free & (share > cap)
+        if not over.any():
+            x[free] = share[free]
+            break
+        x[over] = cap[over]
+        remaining -= cap[over].sum()
+        free &= ~over
+    return x
+
+def spread_by_group(ask: pd.Series, mw: pd.Series, cap: pd.Series, area: pd.Series, group: pd.Series,
+                    spill_all: bool = True) -> tuple[pd.Series, float]:
+    """
+    Places ask (MW, + or -, a Series by (AreaNumber, Group)) on gens with output mw (> 0), area and group, in proportion
+    to mw, never above cap or below 0. What a group's own units can't take is spread over the rest of its area's
+    gens, and (spill_all) what the area can't take over every gen. At the area stage, what is left going up and what
+    is left going down are placed separately, each away from the groups asked to go the other way, so one group's
+    move never undoes another's. Returns (MW change per gen, MW not placed: net of up and down).
+    """
+    m, c = mw.to_numpy(dtype=float), np.nan_to_num(cap.to_numpy(dtype=float), nan=0.0)
+    x = np.zeros(len(m))
+    by_group = pd.Series(m).groupby([area.to_numpy(), group.to_numpy()]).indices if len(m) else {}
+    by_area = pd.Series(m).groupby(area.to_numpy()).indices if len(m) else {}
+    def place(a, rows):
+        if abs(a) < 1e-9 or not len(rows):
+            return a
+        if a > 0:
+            add = _fill(a, m[rows], np.clip(c[rows] - m[rows] - x[rows], 0.0, None))
+        else:
+            add = -_fill(-a, m[rows], np.clip(m[rows] + x[rows], 0.0, None))
+        x[rows] += add
+        return a - add.sum()
+    left: dict = {}         # area -> {sign: (MW left, groups asked that way)}
+    for (a, g), v in ask.items():
+        rest = place(v, by_group.get((a, g), []))
+        sign = 1 if v > 0 else -1
+        mw_left, groups = left.setdefault(a, {}).get(sign, (0.0, set()))
+        left[a][sign] = (mw_left + rest, groups | {g})
+    total = 0.0
+    for a, signs in left.items():
+        rows = np.asarray(by_area.get(a, []), dtype=int)
+        for sign, (v, _) in signs.items():
+            other = signs.get(-sign, (0.0, set()))[1]
+            total += place(v, rows[~np.isin(group.to_numpy()[rows], list(other))] if len(rows) else rows)
+    if spill_all:
+        total = place(total, np.arange(len(m)))
+    return pd.Series(x, index=mw.index), float(total)
+
+def spread_evenly(total: float, mw: pd.Series, cap: pd.Series, area: pd.Series, group: pd.Series) -> tuple[pd.Series, float]:
+    """total MW onto gens by one factor on mw (each area & group asked its share of total by its mw), spread_by_group()."""
+    if not mw.sum() > 0:
+        return pd.Series(0.0, index=mw.index), float(total)
+    ask = (mw * (total / mw.sum())).groupby([area, group]).sum()
+    return spread_by_group(ask, mw, cap, area, group)
+
 def scalable_gens(df: pd.DataFrame) -> pd.DataFrame:
     """All gens but the giant swing and MANUAL_UNIT_TYPES."""
     return df[(df['ID'] != prep.SWING_ID) & ~_code(df['UnitTypeCode']).isin(MANUAL_UNIT_TYPES)]
@@ -368,6 +435,33 @@ def gen_targets(epc_gen: pd.DataFrame, case_gen: pd.DataFrame) -> tuple[pd.DataF
         status, mw, bucket_method[bucket] = dispatch_bucket(rows, t, bucket[1], epc_online)
         df.loc[rows.index, 'Status_Target'] = status
         df.loc[rows.index, 'MWSetPoint_Target'] = mw.where(status == 'Closed', 0.0)
+    own = df.groupby(keys)['MWSetPoint_Target'].sum()       # What each bucket's own units took.
+    own_mw = df['MWSetPoint_Target'].copy()
+    if MAKEUP:
+        # What a bucket's own units can't take (no PWB units, or capped at MWMax) goes onto the area's other GenTypes:
+        # first their online units, in proportion to MW; then, for what is still left going up, the other buckets with
+        # offline units are re-dispatched with a bigger target, so commit() brings units online by the usual rules.
+        unmet = tgt.sub(own, fill_value=0.0)
+        unmet = unmet[unmet.abs() >= 1e-6]
+        on = df[(df['Status_Target'] == 'Closed') & (df['MWSetPoint_Target'] > 0)]
+        if len(unmet) and len(on):
+            mw = on['MWSetPoint_Target']
+            df.loc[on.index, 'MWSetPoint_Target'] += spread_by_group(
+                unmet, mw, on['MWMax'].where(on['MWMax'] > mw, mw), on['AreaNumber'], on['GenType'], spill_all=False)[0]
+        left = unmet.groupby(level='AreaNumber').sum().sub(
+            (df['MWSetPoint_Target'] - own_mw).groupby(df['AreaNumber']).sum(), fill_value=0.0)
+        for a, mw_left in left[left > 1e-6].items():
+            short = set(unmet[unmet > 0].xs(a, level='AreaNumber').index) if a in unmet.index.get_level_values(0) else set()
+            rows_a = df[(df['AreaNumber'] == a) & ~df['GenType'].isin(short)]
+            off_cap = rows_a['MWMax'].where(rows_a['Status_Target'] != 'Closed', 0.0).clip(lower=0).groupby(rows_a['GenType']).sum()
+            off_cap = off_cap[off_cap > 0]
+            for g, c in off_cap.items():
+                rows = rows_a[rows_a['GenType'] == g]
+                more = float(df.loc[rows.index, 'MWSetPoint_Target'].sum()) + mw_left * c / off_cap.sum()
+                status, mw, _ = dispatch_bucket(rows, more, g, epc_online)
+                df.loc[rows.index, 'Status_Target'] = status
+                df.loc[rows.index, 'MWSetPoint_Target'] = mw.where(status == 'Closed', 0.0)
+    df['Plan Make-up MW'] = df['MWSetPoint_Target'] - own_mw
     df['Planned MW'] = df['MWSetPoint_Target']      # What the plan placed. Never rescaled: areas() measures the balances against it.
 
     df['MWSetPoint'] = df['MWSetPoint'].where(closed(df), 0.0)   # Open units are at 0 MW, as the engine expects.
@@ -381,6 +475,7 @@ def gen_targets(epc_gen: pd.DataFrame, case_gen: pd.DataFrame) -> tuple[pd.DataF
         'Target MW': tgt,
         'Seed MW': g['MWSetPoint'].sum(),
         'Planned MW': g['MWSetPoint_Target'].sum(),
+        'Make-up MW': g['Plan Make-up MW'].sum(),
         'Seed Online': on_seed.groupby([df[k] for k in keys]).sum(),
         'Planned Online': on_plan.groupby([df[k] for k in keys]).sum(),
         'Committed': (on_plan & ~on_seed).groupby([df[k] for k in keys]).sum(),
@@ -395,7 +490,9 @@ def gen_targets(epc_gen: pd.DataFrame, case_gen: pd.DataFrame) -> tuple[pd.DataF
     }).fillna(0.0)
     report = report[(report.drop(columns='All Units MWMax') != 0).any(axis=1)]   # Drop buckets with nothing online anywhere.
     report['Method'] = report.index.map(lambda k: bucket_method.get(k, ''))
-    report['Unmet MW'] = report['Target MW'] - report['Planned MW']
+    # Unmet: what the bucket's own units couldn't take. Planned includes what it took for the area's other buckets.
+    report['Unmet MW'] = report['Target MW'] - (report['Planned MW'] - report['Make-up MW'])
+    df = df.drop(columns='Plan Make-up MW')
     # Units offline before and after aren't touched.
     df = df[on_seed | on_plan]
     return df.set_index('ObjectID'), report.reset_index()
@@ -488,8 +585,9 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
     """
     The `areas` sheet: a row per (AreaNumber, Group), Group a GenType or 'Load' (AREAS_COLUMNS). The ledger per row:
         Final = Target - Unmet - Not Reached + Make-up + Balance
-    Make-up: what the make-up run moved onto the group's other units (makeup_tables: makeup_targets() tables, after
-    scaling), to cover what its excluded units didn't reach.
+    Make-up: what the plan moved onto the group to cover another GenType of its area which its own units couldn't
+    (reports['area_gen'] 'Make-up MW'), plus what the make-up run moved onto it (makeup_tables: makeup_targets() tables,
+    after scaling), to cover what excluded units didn't reach.
     Not Reached: over the main scaling's rows, end-of-run target less end-of-run value (excluded, diverged, held units).
     Balance: what swing balancing moved onto the group = the midrun part (end-of-run `_Target` less Planned MW, main rows:
     midrun balances rescale the main targets) + the final part (value less seed in each final balance's table).
@@ -550,6 +648,8 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
     out.loc[out.index.get_level_values('Group') != 'Load', 'Target Mvar'] = np.nan
     for c in ('Not Reached MW', 'Make-up MW', 'Balance MW'):
         out[c] = parts[c].reindex(index, fill_value=0.0) if c in parts else 0.0
+    if 'Make-up MW' in plan:        # The plan's own area make-up (gen_targets()).
+        out['Make-up MW'] += plan['Make-up MW'].reindex(index).fillna(0.0)
     out = out.rename(columns={'Seed Online': 'Online Seed'})
     out['Online Seed'] = out['Online Seed'].fillna(0.0)
     for c in ('Final MW', 'Final Mvar', 'Online Final'):
@@ -704,29 +804,24 @@ def balance_skips(SimAuto, final: dict[str, pd.DataFrame], targets: dict[str, pd
 
 def balance_targets(final: dict[str, pd.DataFrame], swing: float, swing_buses, skip=frozenset()) -> dict[str, pd.DataFrame]:
     """
-    Targets which move `swing` MW off the swing: half onto generation, half onto load, over the whole case.
-    (Swing at +X MW: gens up X/2, load down X/2.) One factor on every Closed gen with MW > 0 (not on a swing bus, not a
-    DC tie), capped at MWMax, and one on the MW and Mvar of every Closed load with MW > 0. Statuses are unchanged.
+    Targets which move `swing` MW off the swing onto generation only; load is never moved (it stays on its EPC target).
+    (Swing at +X MW: gens up X.) One factor on every Closed gen with MW > 0 (not on a swing bus, not a DC tie), so each
+    area & GenType moves by the same share; what a group can't take (MWMax, or 0 going down) goes onto the rest of its
+    area, then onto every gen (spread_evenly()). Statuses are unchanged. The Load table is empty.
     skip: ObjectIDs left out (balance_skips()); the rest take their share.
     """
     gen = scalable_gens(final['Gen'])
     gen = gen[closed(gen) & (gen['MWSetPoint'] > 0) & ~gen['BusNum'].isin(swing_buses) & ~gen['ObjectID'].isin(skip)].copy()
     cap = gen['MWMax'].where(gen['MWMax'] > gen['MWSetPoint'], gen['MWSetPoint'])  # A unit already above MWMax isn't raised.
-    # In proportion to MW; what units at MWMax can't take is spread over the rest, so one round moves it all.
-    gen['MWSetPoint_Target'] = proportional_fill(max(gen['MWSetPoint'].sum() + swing / 2, 0.0), gen['MWSetPoint'], cap)
+    change, _ = spread_evenly(swing, gen['MWSetPoint'], cap, *gen_keys(gen))
+    gen['MWSetPoint_Target'] = gen['MWSetPoint'] + change
     gen['MWSetPoint_Seed'] = gen['MWSetPoint']
     gen['Status_Target'] = gen['Status']
 
-    load = final['Load']
-    load = load[closed(load) & (conforming(load) | SCALE_NONCONFORMING) & ~load['ObjectID'].isin(skip)].copy()
-    p = load[LOAD_P].sum(axis=1)
-    load = load[p > 0]
-    k_load = 1 - (swing / 2) / p[p > 0].sum() if len(load) else 1.0
-    for c in scale.SCALED['Load']:
-        load[f'{c}_Target'] = load[c] * max(k_load, 0.0) if c in LOAD_P + LOAD_Q else load[c]
-    for c in scale.STATUS['Load']:
+    load = final['Load'].iloc[0:0].copy()
+    for c in scale.SCALED['Load'] + list(scale.STATUS['Load']):
         load[f'{c}_Target'] = load[c]
-    load['P_Seed'] = p[p > 0]
+    load['P_Seed'] = pd.Series(dtype=float)
 
     targets = {'Gen': gen, 'Load': load}
     for df in targets.values():
@@ -738,10 +833,10 @@ def prebalance_targets(targets: dict[str, pd.DataFrame], loss_change: float = 0.
     Before scaling: moves the targets so that scaling leaves the swing where it is. The change in
     load - gen - dist gen + losses from now to the targets would otherwise land on the swing as it scales (and set off a
     midrun balance every few steps). Gens and loads count only while Closed (an Open one injects nothing, whatever its MW).
-    loss_change: estimated target losses less seed losses (loss_estimate()). Same rule as a balance: half onto gen (in
-    proportion to target MW, capped at MWMax, the rest onto load), half onto load (one factor on its MW and Mvar
-    targets). Only included rows Closed in the target with a positive target move. Returns the moved tables for the `runs` sheet (mw_changes()), or None if
-    nothing moved.
+    loss_change: estimated target losses less seed losses (loss_estimate()). Same rule as a balance: all onto gen, one
+    factor on the target MW of every included gen Closed in the target with a positive target, spread_evenly() (capped
+    at MWMax); load targets are never moved. What the gens can't take stays on the swing. Returns the moved tables for
+    the `runs` sheet (mw_changes()), or None if nothing moved.
     """
     g, l = targets['Gen'], targets['Load']
     g_in, l_in = g[scale.included(g)], l[scale.included(l)]
@@ -760,23 +855,15 @@ def prebalance_targets(targets: dict[str, pd.DataFrame], loss_change: float = 0.
     seed = gen['MWSetPoint_Target']
     cap = gen['MWMax'] if 'MWMax' in gen else seed         # No MWMax known (topology): gens aren't raised.
     cap = cap.where(cap > seed, seed)                       # A target already above MWMax isn't raised.
-    new = proportional_fill(max(seed.sum() + swing / 2, 0.0), seed, cap) if len(gen) else seed
+    new = seed + spread_evenly(swing, seed, cap, *gen_keys(gen))[0] if len(gen) else seed
     g.loc[gen.index, 'MWSetPoint_Target'] = new
 
-    load = l_in[(l_in['Status_Target'] == 'Closed') & (p_target > 0)]
-    load_p = p_target[load.index]
-    load_down = swing - (new.sum() - seed.sum())            # What the gens couldn't take goes onto load too.
-    k = max(1 - load_down / load_p.sum(), 0.0) if len(load) else 1.0
-    for c in LOAD_P + LOAD_Q:
-        l.loc[load.index, f'{c}_Target'] = l.loc[load.index, f'{c}_Target'] * k
-
-    left = swing - (new.sum() - seed.sum()) + load_p.sum() * (k - 1)
+    left = swing - (new.sum() - seed.sum())
     print(f'Targets balanced before scaling: {swing:+.0f} MW would have landed on the swing'
-          + (f' (losses {loss_change:+.0f} MW)' if abs(loss_change) >= 1.0 else '') + '; '
-          f'gen {new.sum() - seed.sum():+.0f} MW, load {load_p.sum() * (k - 1):+.0f} MW'
+          + (f' (losses {loss_change:+.0f} MW)' if abs(loss_change) >= 1.0 else '') + f'; gen {new.sum() - seed.sum():+.0f} MW'
           + (f'; {left:+.0f} MW could not be placed and stays on the swing.' if abs(left) >= 1.0 else '.'))
     return {'Gen': pd.DataFrame({'MWSetPoint': new, 'MWSetPoint_Seed': seed}),
-            'Load': load_p.mul(k).to_frame('SMW').assign(IMW=0.0, ZMW=0.0, P_Seed=load_p)}
+            'Load': pd.DataFrame(columns=LOAD_P + ['P_Seed'], dtype=float)}
 
 def mw_changes(moved: dict[str, pd.DataFrame]) -> dict[str, float]:
     """MW moved onto gens and loads by a balance (balance_targets() tables, after scaling)."""
@@ -785,7 +872,7 @@ def mw_changes(moved: dict[str, pd.DataFrame]) -> dict[str, float]:
 
 def balance_swing(SimAuto, scaled: dict[str, pd.DataFrame] | None = None, tables: list | None = None) -> list[scale.Run]:
     """
-    With the case open: moves what is left on the swing onto the whole case's gen and load, half each (see
+    With the case open: moves what is left on the swing onto the whole case's gen (see
     balance_targets()), round after round until it is within BALANCE_TOL_MW. Returns a scale.Run per round that ran
     (`balance<N>`; the swing after a round is the next round's, or the end swing).
     scaled: the main scaling's tables, so units it held back or excluded are left alone here too (balance_skips()).
@@ -834,17 +921,19 @@ def rescale_targets(targets: dict[str, pd.DataFrame], moved: dict[str, pd.DataFr
     scale.rescale(targets['Load'], load[LOAD_P].sum(axis=1) / load['P_Seed'], LOAD_P + LOAD_Q)
 
 # ------------------ Make-up ------------------
-MAKEUP = True   # After the main scaling: move what excluded units didn't reach onto their group's other units.
+MAKEUP = True   # Keep area gen totals: plan Unmet and excluded units' shortfall go onto the group's, then the area's, other units.
 
 def makeup_targets(final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFrame], swing_buses,
                    skip=frozenset()) -> tuple[dict[str, pd.DataFrame], float] | None:
     """
     After the main scaling (area mode): per (AreaNumber, GenType) and per AreaNumber's load, the shortfall S = target -
     value of the main rows which were excluded (held units are excluded at the end of the main run; islanded rows are
-    left out). S goes onto the same group's other units, read from the live case (`final`, read_case()), so the main
-    tables are never touched: Closed gens with MW > 0 not on a swing bus, in proportion to MW (S > 0: capped at MWMax,
-    what can't be placed stays short; S < 0: down by one factor, floor 0), and Closed loads with MW > 0 (conforming
-    unless SCALE_NONCONFORMING), one factor on MW and Mvar. skip: ObjectIDs left out (balance_skips()).
+    left out). S goes onto other units, read from the live case (`final`, read_case()), so the main tables are never
+    touched. Gens: the same group's Closed gens with MW > 0 not on a swing bus, in proportion to MW (capped at MWMax
+    going up, floor 0 going down); what they can't take goes onto the rest of the area's gens of every GenType, the same
+    way (spread_by_group(), spill_all=False), and what the area can't take stays short. Loads: the area's Closed loads
+    with MW > 0 (conforming unless SCALE_NONCONFORMING), one factor on MW and Mvar. skip: ObjectIDs left out
+    (balance_skips()).
     Returns (tables in balance_targets()' shape, {'Gen': MW asked, 'Load': MW asked}), or None if no group is short
     by 1 MW or more.
     """
@@ -859,17 +948,12 @@ def makeup_targets(final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFra
         return None
 
     gen = scalable_gens(final['Gen'])
-    gen = gen[closed(gen) & (gen['MWSetPoint'] > 0) & ~gen['BusNum'].isin(swing_buses) & ~gen['ObjectID'].isin(skip)].copy()
-    gen['key'] = list(zip(gen['AreaNumber'], _gen_group(gen)))
-    gen = gen[gen['key'].isin(s_gen.index)]
-    gen['MWSetPoint_Target'] = gen['MWSetPoint']
-    for key, rows in gen.groupby('key').groups.items():
-        mw, short = gen.loc[rows, 'MWSetPoint'], s_gen[key]
-        if short > 0:
-            cap = gen.loc[rows, 'MWMax'].where(gen.loc[rows, 'MWMax'] > mw, mw)
-            gen.loc[rows, 'MWSetPoint_Target'] = proportional_fill(mw.sum() + short, mw, cap)
-        else:
-            gen.loc[rows, 'MWSetPoint_Target'] = mw * max(1 + short / mw.sum(), 0.0)
+    gen = gen[closed(gen) & (gen['MWSetPoint'] > 0) & ~gen['BusNum'].isin(swing_buses) & ~gen['ObjectID'].isin(skip)
+              & gen['AreaNumber'].isin(s_gen.index.get_level_values('AreaNumber'))].copy()
+    cap = gen['MWMax'].where(gen['MWMax'] > gen['MWSetPoint'], gen['MWSetPoint'])
+    change, _ = spread_by_group(s_gen, gen['MWSetPoint'], cap, *gen_keys(gen), spill_all=False)
+    gen = gen[change.abs() > 1e-9]
+    gen['MWSetPoint_Target'] = gen['MWSetPoint'] + change[gen.index]
     gen['MWSetPoint_Seed'] = gen['MWSetPoint']
     gen['Status_Target'] = gen['Status']
 
@@ -885,7 +969,7 @@ def makeup_targets(final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFra
         load[f'{c}_Target'] = load[c]
     load['P_Seed'] = p
 
-    tables = {'Gen': gen.drop(columns='key'), 'Load': load}
+    tables = {'Gen': gen, 'Load': load}
     for df in tables.values():
         df['ExclusionReason'] = ''
     return {t: df.set_index('ObjectID') for t, df in tables.items()}, {'Gen': float(s_gen.sum()), 'Load': float(s_load.sum())}
@@ -921,7 +1005,7 @@ def makeup(SimAuto, targets: dict[str, pd.DataFrame], tables: list | None = None
 def midrun_balancer(SimAuto):
     """
     Returns (after_step, runs) for scale.iterate_to_gen_load_targets(). After each step, if the swing is outside
-    its band (swing_band()), moves it onto the whole case's gen and load, half each (balance_targets()), and keeps that in
+    its band (swing_band()), moves it onto the whole case's gen (balance_targets()), and keeps that in
     the scaling still to come (rescale_targets()). If a balance leaves the swing outside the band (e.g. gens at MWMax),
     the band is widened to where it got to, plus a margin (BALANCE_TRIGGER_MW, or 10% of the band if that's 0), so the
     next balance waits until the swing has moved that much further. The swing itself is never moved.
@@ -946,7 +1030,7 @@ def midrun_balancer(SimAuto):
         swing, swing_buses = swing_mw(gen, slack)
         if state['lo'] <= swing <= state['hi']:
             return
-        print(f'----- Swing at {swing:.1f} MW, outside {state["lo"]:.0f} to {state["hi"]:.0f} MW: balancing half on gen, half on load -----')
+        print(f'----- Swing at {swing:.1f} MW, outside {state["lo"]:.0f} to {state["hi"]:.0f} MW: balancing onto gen -----')
         final = {'Load': pw.get_df(SimAuto, 'Load', LOAD_FIELDS), 'Gen': gen}
         moved = balance_targets(final, swing - aim, swing_buses, balance_skips(SimAuto, final, targets))
         label = f'Balance {len(runs) + 1} (main scaling at {progress} of {scale.RESOLUTION})'

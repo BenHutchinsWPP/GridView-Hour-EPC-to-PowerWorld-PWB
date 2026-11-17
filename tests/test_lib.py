@@ -322,7 +322,9 @@ def test_gen_targets():
                 ('e3', 1, '3', 'Closed', 'ES', -40.0, 80.0, -80.0), ('e4', 1, '4', 'Closed', 'PV', 25.0, 30.0, 0.0),
                 ('e5', 1, '5', 'Open', 'GT', 90.0, 100.0, 0.0),
                 ('a', 2, '1', 'Closed', 'GT', 70.0, 100.0, 0.0), ('b', 2, '2', 'Open', 'GT', 50.0, 100.0, 0.0)])
-    df, report = area.gen_targets(epc, case)
+    with saved_settings():
+        area.MAKEUP = False
+        df, report = area.gen_targets(epc, case)
     assert 'xx' not in df.index and 'to' not in df.index                    # Swing, and gens offline before and after.
     # Hydro, wind, storage: all on at the same %. Thermal 0 MW: off. Matched area 2: EPC statuses and values.
     assert df['MWSetPoint_Target'].to_dict() == {'h1': 50.0, 'h2': 150.0, 'w1': 50.0, 'w2': 50.0, 'b1': -10.0, 'b2': -30.0,
@@ -330,6 +332,34 @@ def test_gen_targets():
     assert df.loc[df['Status_Target'] == 'Open'].index.tolist() == ['t1', 'b']
     r = report.set_index(['AreaNumber', 'GenType'])['Unmet MW']
     assert r[(1, 'Wind')] == 50 and r[(1, 'Solar')] == 25 and r[(1, 'Hydro')] == 0 and r[(1, 'Thermal')] == 0
+    # With make-up: Wind's 50 MW (capped) and Solar's 25 MW (no PWB units) go onto area 1's Hydro, by MW (1:3).
+    # Storage (charging) takes none; area 2 is untouched. Unmet still says what each bucket's own units couldn't take.
+    df, report = area.gen_targets(epc, case)
+    assert df['MWSetPoint_Target'].to_dict() == {'h1': 68.75, 'h2': 206.25, 'w1': 50.0, 'w2': 50.0, 'b1': -10.0, 'b2': -30.0,
+                                                 't1': 0.0, 'a': 70.0, 'b': 0.0}
+    r = report.set_index(['AreaNumber', 'GenType'])
+    assert r.loc[(1, 'Wind'), 'Unmet MW'] == 50 and r.loc[(1, 'Hydro'), 'Unmet MW'] == 0 and r.loc[(1, 'Hydro'), 'Make-up MW'] == 75
+    assert r.loc[(1, 'Hydro'), 'Planned MW'] == 275 and (df['Planned MW'] == df['MWSetPoint_Target']).all()
+
+def test_plan_makeup_commits_offline_units_and_follows_storage_down():
+    # Area 1: Thermal target 100 (t1 online, MWMax 120; t2 offline, MWMax 500), 300 MW of EPC Solar with no PWB solar.
+    # t1 takes 20 MW online; the other 280 MW re-dispatch Thermal at 400 MW, which brings t2 online.
+    case = gens([('t1', 1, '1', 'Closed', 'GT', 100.0, 120.0, 0.0), ('t2', 1, '2', 'Open', 'GT', 0.0, 500.0, 0.0)])
+    epc = gens([('t1', 1, '1', 'Closed', 'GT', 100.0, 120.0, 0.0), ('t2', 1, '2', 'Open', 'GT', 0.0, 500.0, 0.0),
+                ('s1', 1, '3', 'Closed', 'PV', 300.0, 300.0, 0.0)])
+    df, report = area.gen_targets(epc, case)
+    assert abs(df['MWSetPoint_Target'].sum() - 400.0) < 1e-6 and df.loc['t2', 'Status_Target'] == 'Closed'
+    r = report.set_index(['AreaNumber', 'GenType'])
+    assert r.loc[(1, 'Solar'), 'Unmet MW'] == 300 and abs(r.loc[(1, 'Thermal'), 'Make-up MW'] - 300.0) < 1e-6
+    # Storage charges -300 MW in the EPC (another key) but the PWB unit can take -100: the area's net gen keeps its total, so
+    # Thermal (500) and Hydro (100) come down 200 MW between them, by MW.
+    case = gens([('b1', 1, '1', 'Closed', 'BA', 0.0, 100.0, -100.0), ('t1', 1, '2', 'Closed', 'GT', 500.0, 1000.0, 0.0),
+                 ('h1', 1, '3', 'Closed', 'HY', 100.0, 1000.0, 0.0)])
+    epc = gens([('e1', 1, '9', 'Closed', 'BA', -300.0, 300.0, -300.0), ('t1', 1, '2', 'Closed', 'GT', 500.0, 1000.0, 0.0),
+                ('h1', 1, '3', 'Closed', 'HY', 100.0, 1000.0, 0.0)])
+    df, report = area.gen_targets(epc, case)
+    assert df['MWSetPoint_Target'].round(6).to_dict() == {'b1': -100.0, 't1': round(500 - 200 * 5 / 6, 6), 'h1': round(100 - 200 / 6, 6)}
+    assert abs(df['MWSetPoint_Target'].sum() - 300.0) < 1e-6                     # The EPC's net: -300 + 500 + 100.
 
 def test_load_targets_scale_positive_and_negative_separately():
     # Mvar +100 / -98 (net +2) against +300 / -50: one net factor would blow up; split by sign it doesn't.
@@ -411,19 +441,52 @@ def test_swing_mw():
     assert area.swing_mw(gen, slack_buses=[8]) == (120.0, [7])                  # The giant swing wins.
     assert area.swing_mw(gen[gen['ID'] != 'xx'], slack_buses=[8]) == (50.0, [8])  # Else gens on slack buses.
 
-def test_balance_targets_half_gen_half_load():
-    # Swing at +100 MW: gens up 50 MW, load down 50 MW, each by one factor over the whole case.
+def test_balance_targets_moves_gen_only():
+    # Swing at +100 MW: gens up 100 MW by one factor (50 each); load untouched. g2 (area 2) caps at MWMax 120 and area 2
+    # has no other gen, so its last 30 MW go onto g1.
     gen = gens([('g1', 1, '1', 'Closed', 'GT', 100.0, 300.0, 0.0), ('g2', 2, '2', 'Closed', 'HY', 100.0, 120.0, 0.0),
                 ('neg', 2, '3', 'Closed', 'BA', -10.0, 50.0, -50.0), ('sw', 3, '1', 'Closed', 'GT', 500.0, 1e4, 0.0),
                 ('dc', 3, '2', 'Closed', 'DC', 90.0, 500.0, -500.0)]).assign(BusNum=[1, 2, 2, 9, 3])
     load = loads([('l1', 1, 'Closed', 150.0, 0.0, 0.0, 30.0), ('l2', 2, 'Closed', 350.0, 0.0, 0.0, 70.0),
                   ('lneg', 2, 'Closed', -40.0, 0.0, 0.0, 0.0), ('lo', 2, 'Open', 99.0, 0.0, 0.0, 0.0)])
     t = area.balance_targets({'Gen': gen, 'Load': load}, swing=100.0, swing_buses=[9])
-    assert t['Gen']['MWSetPoint_Target'].to_dict() == {'g1': 130.0, 'g2': 120.0}  # g2 capped at MWMax; g1 takes the rest.
-    assert t['Load']['SMW_Target'].to_dict() == {'l1': 135.0, 'l2': 315.0}
-    assert t['Load']['SMvar_Target'].to_dict() == {'l1': 27.0, 'l2': 63.0}
-    assert t['Load']['P_Seed'].to_dict() == {'l1': 150.0, 'l2': 350.0}     # What rescale_targets() divides by.
-    assert (t['Load']['Status_Target'] == 'Closed').all()
+    assert t['Gen']['MWSetPoint_Target'].to_dict() == {'g1': 180.0, 'g2': 120.0}
+    assert t['Load'].empty and (t['Gen']['MWSetPoint_Target'] - t['Gen']['MWSetPoint_Seed']).sum() == 100.0
+    area.rescale_targets({'Gen': targets_df(ObjectID=['g1'], MWSetPoint=[150.0], MWSetPoint_Target=[150.0]),
+                          'Load': targets_df(ObjectID=['l1'], **{c: [1.0] for c in area.LOAD_P + area.LOAD_Q})}, t)   # Empty load table is fine.
+
+def test_spread_by_group_fills_the_group_then_its_area_then_everyone():
+    # Area 1: Thermal t1 (100, cap 110), Hydro h1 (100, cap 1000). Area 2: Thermal t2 (100, cap 1000).
+    mw = pd.Series([100.0, 100.0, 100.0], index=['t1', 'h1', 't2'])
+    cap = pd.Series([110.0, 1000.0, 1000.0], index=mw.index)
+    area_, group = pd.Series([1, 1, 2], index=mw.index), pd.Series(['Thermal', 'Hydro', 'Thermal'], index=mw.index)
+    ask = pd.Series({(1, 'Thermal'): 50.0})
+    x, left = area.spread_by_group(ask, mw, cap, area_, group, spill_all=False)
+    assert x.to_dict() == {'t1': 10.0, 'h1': 40.0, 't2': 0.0} and left == 0.0       # Group first, then its area.
+    cap['h1'] = 120.0
+    x, left = area.spread_by_group(ask, mw, cap, area_, group, spill_all=False)
+    assert x.to_dict() == {'t1': 10.0, 'h1': 20.0, 't2': 0.0} and left == 20.0      # The area is full: stays short.
+    x, left = area.spread_by_group(ask, mw, cap, area_, group)
+    assert x.to_dict() == {'t1': 10.0, 'h1': 20.0, 't2': 20.0} and left == 0.0      # spill_all: everyone else.
+    x, left = area.spread_by_group(pd.Series({(1, 'Thermal'): -150.0}), mw, cap, area_, group, spill_all=False)
+    assert x.to_dict() == {'t1': -100.0, 'h1': -50.0, 't2': 0.0} and left == 0.0   # Down: floor 0, then the area.
+    x, _ = area.spread_evenly(-30.0, mw, cap, area_, group)
+    assert x.round(9).to_dict() == {'t1': -10.0, 'h1': -10.0, 't2': -10.0}        # One factor on every group.
+    x, left = area.spread_evenly(50.0, mw.iloc[:0], cap.iloc[:0], area_.iloc[:0], group.iloc[:0])
+    assert left == 50.0                                                             # Nothing to place it on.
+
+def test_spread_by_group_goes_by_mw_and_keeps_opposite_moves_apart():
+    # By MW, not per group: t (100) and h (300) share +40 as 10 / 30.
+    mw = pd.Series([100.0, 300.0], index=['t', 'h'])
+    x, _ = area.spread_evenly(40.0, mw, pd.Series(1e4, index=mw.index), pd.Series(1, index=mw.index), pd.Series(['Thermal', 'Hydro'], index=mw.index))
+    assert x.round(9).to_dict() == {'t': 10.0, 'h': 30.0}
+    # Thermal (at MWMax) asks +50, Hydro asks -30, Wind has room. Thermal's 50 go onto Wind only, never back onto Hydro.
+    mw = pd.Series([100.0, 100.0, 100.0], index=['t1', 'h1', 'w1'])
+    cap = pd.Series([100.0, 1000.0, 1000.0], index=mw.index)
+    group = pd.Series(['Thermal', 'Hydro', 'Wind'], index=mw.index)
+    x, left = area.spread_by_group(pd.Series({(1, 'Thermal'): 50.0, (1, 'Hydro'): -30.0}), mw, cap,
+                                   pd.Series(1, index=mw.index), group, spill_all=False)
+    assert x.round(9).to_dict() == {'t1': 0.0, 'h1': -30.0, 'w1': 50.0} and left == 0.0
 
 def test_balance_skips_held_and_out_of_band_units():
     # FakeSimAuto has buses 1 and 2 at 1.0 PU; bus 3 has no voltage, so it counts as outside the band.
@@ -435,8 +498,8 @@ def test_balance_skips_held_and_out_of_band_units():
     skip = area.balance_skips(FakeSimAuto(), {'Gen': gen, 'Load': load}, main)
     assert skip == {'g2', 'g3', 'l2'}
     t = area.balance_targets({'Gen': gen, 'Load': load}, swing=100.0, swing_buses=[], skip=skip)
-    assert t['Gen']['MWSetPoint_Target'].to_dict() == {'g1': 150.0}     # The whole gen half lands on what is left.
-    assert t['Load']['SMW_Target'].to_dict() == {'l1': 50.0}
+    assert t['Gen']['MWSetPoint_Target'].to_dict() == {'g1': 200.0}     # The whole swing lands on what is left.
+    assert t['Load'].empty
 
 def thermal_case():
     return gens([('g1', 1, '1', 'Closed', 'GT', 50.0, 100.0, 0.0), ('g2', 1, '2', 'Open', 'GT', 0.0, 400.0, 0.0),
@@ -538,7 +601,7 @@ def test_nonconforming_loads_are_left_alone():
     r = reports['area_load'].iloc[0]
     assert (r['Target MW'], r['Seed Non-conforming MW'], r['EPC Non-conforming MW']) == (150, 500, 900)
     bal = area.balance_targets({'Gen': gens([('g1', 1, '1', 'Closed', 'GT', 100.0, 300.0, 0.0)]), 'Load': case}, 50.0, [])
-    assert bal['Load'].index.tolist() == ['l1']
+    assert bal['Load'].empty                                                     # Balancing never moves load.
     area.SCALE_NONCONFORMING = True
     try:
         targets, _ = area.build_targets({'Load': epc, 'Gen': gens([])}, {'Load': case, 'Gen': gens([])})
@@ -597,8 +660,8 @@ class SwingSimAuto(FakeSimAuto):
         return ('', [])
 
 def swing_case():
-    gen = gens([('xx', 9, 'xx', 'Closed', '', 0.0, 2e4, -2e4), ('g1', 1, '1', 'Closed', 'GT', 100.0, 1000.0, 0.0),
-                ('g2', 1, '1', 'Closed', 'HY', 100.0, 1000.0, 0.0)]).assign(BusNum=[99, 1, 2], MW=0.0, NomkV=230.0, BusName='b')
+    gen = gens([('xx', 9, 'xx', 'Closed', '', 0.0, 2e4, -2e4), ('g1', 1, '1', 'Closed', 'GT', 100.0, 5000.0, 0.0),
+                ('g2', 1, '1', 'Closed', 'HY', 100.0, 5000.0, 0.0)]).assign(BusNum=[99, 1, 2], MW=0.0, NomkV=230.0, BusName='b')
     load = loads([('l1', 1, 'Closed', 200.0, 0.0, 0.0, 20.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
     return gen, load
 
@@ -615,8 +678,8 @@ def test_midrun_balancer_keeps_the_swing_near_zero_and_never_moves_it():
     assert len(log) >= 1 and all(abs(r.after) < abs(r.before) for r in log)
     assert abs(swing()) <= area.BALANCE_TRIGGER_MW                      # Balanced as it went.
     assert ('Gen', '99') not in sa.applied                              # The swing unit was never written.
-    # The load's target was scaled down by the balances, so the scaling ended where the balance left it.
-    assert targets['Load'].loc['l1', 'SMW_Target'] < 3200 and abs(targets['Load'].loc['l1', 'SMW'] - targets['Load'].loc['l1', 'SMW_Target']) < 1e-6
+    # Balancing moves gen only: the load reached its own target.
+    assert targets['Load'].loc['l1', 'SMW_Target'] == 3200 and abs(targets['Load'].loc['l1', 'SMW'] - 3200) < 1e-6
     area.balance_swing(sa)
     assert abs(swing()) < area.BALANCE_TOL_MW and ('Gen', '99') not in sa.applied
 
@@ -715,6 +778,7 @@ def test_midrun_balance_keeps_gens_within_mwmax():
     sa = SwingSimAuto(gen, load)
     with saved_settings():
         area.BALANCE_TRIGGER_MW = 20.0
+        area.MAKEUP = False             # Else the plan puts s1's 50 MW on t1 and the swing never moves.
         targets, _ = area.build_targets({'Gen': epc_gen, 'Load': epc_load}, area.read_case(sa), swing_buses=[99])
         after_step, log = area.midrun_balancer(sa)
         scale.iterate_to_gen_load_targets(sa, targets, after_step=after_step)
@@ -763,7 +827,7 @@ def test_balance_df_counts_the_whole_load_change():
     sa = SwingSimAuto(gen, load.assign(IMW=100.0))      # 300 MW of load against 200 MW of gen: the swing is at +100.
     first = scale.runs_sheet(area.balance_swing(sa)).iloc[0]
     assert first['Run'] == 'balance1' and abs(first['Swing MW Before'] - 100) < 1e-9
-    assert abs(first['Load MW Moved'] + 50) < 1e-6 and abs(first['Gen MW Moved'] - 50) < 1e-6   # Half each, I part included.
+    assert first['Load MW Moved'] == 0 and abs(first['Gen MW Moved'] - 100) < 1e-6    # All onto gen, I part included.
 
 def test_iterate_raises_when_the_case_does_not_solve():
     class Diverges(FakeSimAuto):
@@ -893,8 +957,8 @@ def test_step_02_topology_mode_end_to_end():
 
 def test_slack_bus_gens_are_the_swing_when_there_is_no_giant_swing():
     # Bus 9 is the slack bus: its unit carries the imbalance, and neither balance writes to it.
-    gen = gens([('s1', 1, '1', 'Closed', 'GT', 100.0, 1000.0, 0.0), ('g1', 1, '2', 'Closed', 'GT', 100.0, 1000.0, 0.0),
-                ('g2', 1, '3', 'Closed', 'HY', 100.0, 1000.0, 0.0)]).assign(BusNum=[9, 1, 2], MW=0.0, NomkV=230.0, BusName='b')
+    gen = gens([('s1', 1, '1', 'Closed', 'GT', 100.0, 1000.0, 0.0), ('g1', 1, '2', 'Closed', 'GT', 100.0, 5000.0, 0.0),
+                ('g2', 1, '3', 'Closed', 'HY', 100.0, 5000.0, 0.0)]).assign(BusNum=[9, 1, 2], MW=0.0, NomkV=230.0, BusName='b')
     load = loads([('l1', 1, 'Closed', 200.0, 0.0, 0.0, 20.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
     sa = SwingSimAuto(gen, load, slack=[9])
     assert prep.slack_buses(sa) == [9]
@@ -906,8 +970,8 @@ def test_slack_bus_gens_are_the_swing_when_there_is_no_giant_swing():
 
 def ledger_run(mutate=None, slack=(99,), makeup=False):
     """Midrun + final balances, a diverging gen (g3, bus 4) and the areas sheet of the result. slack: slack buses (99 has xx)."""
-    gen = gens([('xx', 1, 'xx', 'Closed', '', 0.0, 2e4, -2e4), ('g1', 1, '1', 'Closed', 'GT', 100.0, 1000.0, 0.0),
-                ('g2', 1, '2', 'Closed', 'HY', 100.0, 1000.0, 0.0), ('g3', 1, '3', 'Closed', 'GT', 100.0, 1000.0, 0.0)]
+    gen = gens([('xx', 1, 'xx', 'Closed', '', 0.0, 2e4, -2e4), ('g1', 1, '1', 'Closed', 'GT', 100.0, 5000.0, 0.0),
+                ('g2', 1, '2', 'Closed', 'HY', 100.0, 5000.0, 0.0), ('g3', 1, '3', 'Closed', 'GT', 100.0, 5000.0, 0.0)]
                ).assign(BusNum=[99, 1, 2, 4], MW=0.0, NomkV=230.0, BusName='b')
     load = loads([('l1', 1, 'Closed', 200.0, 0.0, 0.0, 20.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
     epc_gen = gens([('g1', 1, '1', 'Closed', 'GT', 200.0, 1000.0, 0.0), ('g2', 1, '2', 'Closed', 'HY', 150.0, 1000.0, 0.0),
@@ -928,11 +992,11 @@ def ledger_run(mutate=None, slack=(99,), makeup=False):
 def test_areas_ledger_holds_with_midrun_and_final_balances_and_a_diverging_gen():
     out, targets = ledger_run()
     assert out.columns.tolist() == area.AREAS_COLUMNS and out.groupby(['AreaNumber', 'Group']).size().max() == 1
-    ledger = out['Target MW'] - out['Unmet MW'] - out['Not Reached MW'] + out['Balance MW']
+    ledger = out['Target MW'] - out['Unmet MW'] - out['Not Reached MW'] + out['Make-up MW'] + out['Balance MW']
     assert (abs(out['Final MW'] - ledger) < 1e-6).all(), out
     row = lambda g: out[out['Group'] == g].iloc[0]
     assert row('Thermal')['Not Reached MW'] > 0 and row('Thermal')['Balance MW'] != 0     # g3 held at 100 of 200 MW; g1 balanced.
-    assert row('Load')['Balance MW'] != 0 and pd.isna(row('Thermal')['Target Mvar']) and row('Load')['Target Mvar'] == 320
+    assert row('Load')['Balance MW'] == 0 and pd.isna(row('Thermal')['Target Mvar']) and row('Load')['Target Mvar'] == 320
     assert (out['Note'] == '').all() and (out['Online Final'] > 0).all()
 
 def test_areas_before_scaling_has_blank_final_columns():
@@ -1215,7 +1279,7 @@ def test_step_02_console_is_one_summary_line_per_hour():
 def test_areas_ledger_holds_with_a_second_slack_bus():
     # Bus 2 (hydro g2) is a slack bus beside the giant swing: left out of the areas, its balance moves must be too.
     out, _ = ledger_run(slack=(99, 2))
-    ledger = out['Target MW'] - out['Unmet MW'] - out['Not Reached MW'] + out['Balance MW']
+    ledger = out['Target MW'] - out['Unmet MW'] - out['Not Reached MW'] + out['Make-up MW'] + out['Balance MW']
     assert (abs(out['Final MW'] - ledger) < 1e-6).all(), out
 
 def test_step_02_log_without_balancing_has_the_end_swing():
@@ -1270,26 +1334,28 @@ def test_step_02_keeps_the_saved_case_when_its_log_cannot_be_built():
             step.area.areas = real
     assert 'h1.pwb' in sa.saved
 
-def test_prebalance_targets_splits_half_gen_half_load_and_spills_capped_gen_onto_load():
-    # Load 200 -> 600 MW, gens fixed: +400 MW would land on the swing. Gen half (200) hits g1's MWMax (+50), so load
-    # takes the other 350.
+def test_prebalance_targets_moves_gen_only_and_leaves_what_gens_cannot_take_on_the_swing():
+    # Load 200 -> 600 MW, gens fixed: +400 MW would land on the swing. g1 can take +50 (MWMax 150); load keeps its target,
+    # and the other 350 MW stay on the swing.
     t = load_ramp_targets()
     t['Load']['SMW_Target'] = 600.0
     t['Gen']['MWMax'] = 150.0
     moved = area.prebalance_targets(t)
     assert t['Gen'].loc['g1', 'MWSetPoint_Target'] == 150.0
-    assert abs(t['Load'].loc['l1', 'SMW_Target'] - 250.0) < 1e-9 and abs(t['Load'].loc['l1', 'SMvar_Target'] - 320.0 * 250 / 600) < 1e-9
-    changes = area.mw_changes(moved)
-    assert abs(changes['Gen MW Change'] - 50.0) < 1e-9 and abs(changes['Load MW Change'] + 350.0) < 1e-9
+    assert t['Load'].loc['l1', 'SMW_Target'] == 600.0 and t['Load'].loc['l1', 'SMvar_Target'] == 320.0
+    assert area.mw_changes(moved) == {'Gen MW Change': 50.0, 'Load MW Change': 0.0}
+    t['Gen']['MWMax'] = 1000.0
+    area.prebalance_targets(t)
+    assert t['Gen'].loc['g1', 'MWSetPoint_Target'] == 500.0
     assert area.prebalance_targets(t) is None                                     # Balanced now: nothing to move.
 
 def test_prebalanced_targets_need_no_midrun_balance():
     gen, load = swing_case()
     sa = SwingSimAuto(gen, load)
     targets = load_ramp_targets()                                                # Without it: +3000 MW onto the swing.
-    targets['Gen']['MWMax'] = 1e4                                                # g1 100 -> 1600, l1 200 -> 1700.
+    targets['Gen']['MWMax'] = 1e4                                                # g1 100 -> 3100, l1 stays 3200.
     area.prebalance_targets(targets)
-    assert targets['Gen'].loc['g1', 'MWSetPoint_Target'] == 1600.0
+    assert targets['Gen'].loc['g1', 'MWSetPoint_Target'] == 3100.0
     after_step, runs = area.midrun_balancer(sa)
     scale.iterate_to_gen_load_targets(sa, targets, after_step=after_step)
     assert runs == [] and abs(area.swing_mw(sa.table('Gen'), [])[0]) < 1e-6
@@ -1298,7 +1364,7 @@ def test_prebalance_targets_counts_only_what_will_move():
     # l1's dist gen (40 MW, Closed) goes to 0: +40 MW onto the swing. l2's dist gen is Open: its 30 MW never injected.
     # l3 is Open in both: its 100 MW never counts. g_open goes Closed -> Open (MW unchanged): its 50 MW leave: +50.
     # gx is excluded: not counted, not moved. gcap (target 300) is already above its MWMax (200), so it isn't raised.
-    # +90 in all: g1 takes the gen half (+45); load half -45 over l1 and l2 (factor 0.775).
+    # +90 in all: g1 takes it all; loads keep their targets.
     gen = targets_df(ObjectID=['g1', 'gx', 'g_open', 'gcap'], BusNum=[1, 2, 3, 4], ID='1', Status='Closed',
                      Status_Target=['Closed', 'Closed', 'Open', 'Closed'], MWSetPoint=[100.0, 100.0, 50.0, 300.0],
                      MWSetPoint_Target=[100.0, 150.0, 50.0, 300.0], MWMax=[1000.0, 1000.0, 1000.0, 200.0])
@@ -1309,18 +1375,18 @@ def test_prebalance_targets_counts_only_what_will_move():
     load['SMW'], load['SMW_Target'] = 100.0, 100.0
     load['DistMWInput'] = [40.0, 30.0, 20.0]
     area.prebalance_targets({'Gen': gen, 'Load': load})
-    assert gen['MWSetPoint_Target'].round(9).to_dict() == {'g1': 145.0, 'gx': 150.0, 'g_open': 50.0, 'gcap': 300.0}
-    assert load['SMW_Target'].round(9).tolist() == [77.5, 77.5, 100.0]
+    assert gen['MWSetPoint_Target'].round(9).to_dict() == {'g1': 190.0, 'gx': 150.0, 'g_open': 50.0, 'gcap': 300.0}
+    assert load['SMW_Target'].round(9).tolist() == [100.0, 100.0, 100.0]
 
 def test_prebalance_targets_counts_losses():
-    # Targets balanced by themselves; losses fall 40 MW: gens -20, load +20.
+    # Targets balanced by themselves; losses fall 40 MW: gens -40, load unchanged.
     t = load_ramp_targets()
     t['Load']['SMW_Target'] = 1100.0
     t['Gen']['MWSetPoint_Target'], t['Gen']['MWMax'] = 1000.0, 2000.0
     assert area.prebalance_targets(t, 0.0) is None
     area.prebalance_targets(t, loss_change=-40.0)
-    assert abs(t['Gen'].loc['g1', 'MWSetPoint_Target'] - 980.0) < 1e-9
-    assert abs(t['Load'].loc['l1', 'SMW_Target'] - 1120.0) < 1e-9
+    assert abs(t['Gen'].loc['g1', 'MWSetPoint_Target'] - 960.0) < 1e-9
+    assert t['Load'].loc['l1', 'SMW_Target'] == 1100.0
 
 def test_loss_estimate_scales_each_area_with_its_load():
     # Area 1: 200 -> 100 MW of scaled load plus 100 MW non-conforming: 300 -> 200, losses 9 * (2/3)^2 = 4.
@@ -1379,8 +1445,8 @@ def test_report_gen_load_balance_counts_only_closed_units():
 def test_prebalance_targets_does_not_raise_gens_without_mwmax():
     t = load_ramp_targets()                                                       # Topology tables: no MWMax column.
     area.prebalance_targets(t)
-    assert t['Gen'].loc['g1', 'MWSetPoint_Target'] == 100.0                       # Load took all of it.
-    assert abs(t['Load'].loc['l1', 'SMW_Target'] - 200.0) < 1e-9
+    assert t['Gen'].loc['g1', 'MWSetPoint_Target'] == 100.0                       # Nothing placed: it stays on the swing.
+    assert t['Load'].loc['l1', 'SMW_Target'] == 3200.0
 
 def test_step_02_estimates_losses_and_clears_untouched_dist_gen():
     # Seed losses 10 MW; area 1's load goes 200 -> 300 MW (non-conforming ln's 50 MW stays): (350/250)^2 * 10 = 19.6.
@@ -1565,6 +1631,10 @@ def test_makeup_targets_stay_in_the_group_and_respect_caps_islands_and_signs():
     assert moved['Gen']['MWSetPoint_Target'].round(9).to_dict() == {'g1': 120.0, 'g2': 140.0}
     assert moved['Load'].index.tolist() == ['l1'] and moved['Load'].loc['l1', 'SMW_Target'] == 130.0
     assert area.makeup_targets(final, {'Gen': tg.assign(ExclusionReason=''), 'Load': tl.assign(ExclusionReason='')}, []) is None
+    # g1 and g2 capped at MWMax: Thermal's 60 MW go onto the area's Hydro h1, not area 2's Thermal g9.
+    final['Gen']['MWMax'] = [100.0, 100.0, 1000.0, 1000.0, 1000.0, 1000.0]
+    moved, _ = area.makeup_targets(final, {'Gen': tg, 'Load': tl}, swing_buses=[], skip={'gx', 'gi', 'lx'})
+    assert moved['Gen']['MWSetPoint_Target'].round(9).to_dict() == {'h1': 160.0}
 
 def test_step_02_runs_a_makeup_only_in_area_mode_when_something_is_short():
     gen, load = two_cases()
@@ -1583,7 +1653,7 @@ def test_step_02_runs_a_makeup_only_in_area_mode_when_something_is_short():
         sa.bad = {'1'}
         step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')
         runs = pd.read_excel(step.out_dir / 'h1_Log.xlsx', sheet_name='runs').set_index('Run')
-    assert 'gen asked +89 MW, placed +0 MW' in runs.loc['makeup', 'Note']        # No other Thermal unit to take it.
+    assert 'gen asked +129 MW, placed +129 MW' in runs.loc['makeup', 'Note']     # No other Thermal unit: h1 (Hydro, same area) takes it.
     with saved_settings(), tempfile.TemporaryDirectory() as d:                  # A make-up error keeps the hour.
         step = load_step_02(Path(d), 'area')
         sa = CaseSimAuto({'h1.epc': (epc_gen, epc_load), 'Prepared.pwb': (gen, load)}, slack=[99])
