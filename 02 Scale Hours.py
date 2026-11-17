@@ -123,7 +123,7 @@ def create_case(SimAuto, gv_fp, out_fp):
     if area_mode and area.MAKEUP:
         # What excluded units didn't reach goes onto their group's other units, before the final balance.
         try:
-            runs += area.makeup(SimAuto, targets, tables=makeup_tables)
+            runs += area.makeup(SimAuto, targets, tables=makeup_tables, nonconforming=reports['nonconforming'])
         except Exception as e:     # Never lose the hour over its make-up: the final balance still runs.
             print(f'WARNING: make-up failed: {e!r}. Carrying on without it.')
             makeup_tables.clear()

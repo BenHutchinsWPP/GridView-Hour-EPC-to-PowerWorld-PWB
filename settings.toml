@@ -40,8 +40,9 @@ commit_max_cf = 0.9                     # Thermal & Unknown: commit until the ta
 all_on_types = ["Hydro", "Wind", "Solar", "Battery Storage"]    # Every unit online, all at the same % output.
 off_at_zero_types = ["Wind", "Solar"]   # At a target of 0, these go offline (the other all-on types keep their status).
 manual_unit_types = ["DC"]              # Unit types never scaled (adjusted by hand).
-# Non-conforming loads (load AGC = NO in PowerWorld): false = never scaled, and left out of both cases'
-# area load totals.
+# Non-conforming loads (load AGC = NO in PowerWorld, or flagged in the EPC): false = never scaled, and left out of both
+# cases' area load totals; those whose key is in the EPC take its status and MW/Mvar 1:1, the rest keep their seed values.
+# true = scaled like any other load.
 scale_nonconforming = false
 # Before scaling, the targets are balanced for the change in losses too: each area's losses (LossMW) are expected to go
 # as (its target load / its seed load) ** loss_exponent. 2 = I^2 R; 0 = losses stay at their seed values. The areas

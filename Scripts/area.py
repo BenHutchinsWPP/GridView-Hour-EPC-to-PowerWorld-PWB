@@ -2,8 +2,9 @@
 Step 02 targets: scale the PWB to the GridView hour by area, not element by element.
 
 Topology is not matched: nothing is created or deleted, and no branch or load is opened or closed to match the
-GridView hour. The rules (load and gen targets per area, unit commitment, make-up, balancing the swing) are in
-ReadMe.md, "Area Mode".
+GridView hour, except non-conforming loads whose key is in the EPC (they take its status). Loads outside the main
+island are also turned off (scale.turn_off_islanded()). The rules (load and gen targets per area, unit commitment,
+make-up, balancing the swing) are in ReadMe.md, "Area Mode".
 
 Working tables are in the shape Scripts/scale.py expects (see its docstring), plus AreaNumber, GenType and Method.
 """
@@ -129,10 +130,37 @@ def sign_share(value: pd.Series, area: pd.Series, target_pos: pd.Series, target_
     return new
 
 # Non-conforming loads: PowerWorld's load AGC field is NO (the RAW SCALE flag 0; an EPC's nonc flag 1, presumably).
-SCALE_NONCONFORMING = False     # False: they keep their seed values, and are left out of both cases' area totals.
+# False: they are left out of both cases' area totals. Those whose key is in the EPC take its status and MW/Mvar 1:1
+# (nonconforming_targets()); the others keep their seed values.
+SCALE_NONCONFORMING = False
 
 def conforming(load: pd.DataFrame) -> pd.Series:
     return load['AGC'].fillna('').astype(str).str.strip().str.upper() != 'NO'
+
+def nonconforming_targets(epc_load: pd.DataFrame, case_load: pd.DataFrame) -> pd.DataFrame:
+    """
+    Target rows (load_targets()' shape, Method 'EPC 1:1') for non-conforming PWB loads whose key is in the EPC: its
+    status, its S + I + Z MW and Mvar as constant power (0 if Open there), no current, impedance or dist gen. Any seed
+    status: one Closed in the EPC is closed in by the engine (at 0 MW, then ramped), one Open there is ramped down and opened.
+    """
+    epc = epc_load.set_index('ObjectID')
+    e = epc.loc[case_load['ObjectID']]
+    on = (e['Status'] == 'Closed').to_numpy()
+    df = case_load.copy()
+    df['Method'] = 'EPC 1:1'
+    df['Basis MW'] = np.where(on, e[LOAD_P].sum(axis=1), 0.0)
+    df['Basis Mvar'] = np.where(on, e[LOAD_Q].sum(axis=1), 0.0)
+    for c in ['IMW', 'IMvar', 'ZMW', 'ZMvar', 'DistMWInput', 'DistMvarInput']:
+        df[f'{c}_Target'] = 0.0
+    df['SMW_Target'], df['SMvar_Target'] = df['Basis MW'], df['Basis Mvar']
+    df['Planned MW'] = df['SMW_Target']
+    df['Status_Target'] = e['Status'].to_numpy()
+    df['DistStatus_Target'] = 'Open'
+    for c in [*scale.STATUS['Load'], *scale.SCALED['Load']]:
+        df[f'{c}_Seed'] = df[c]
+    df['ExclusionReason'] = ''
+    df['Nonconforming'] = True
+    return df.set_index('ObjectID')
 
 def load_targets(epc_load: pd.DataFrame, case_load: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
@@ -167,6 +195,7 @@ def load_targets(epc_load: pd.DataFrame, case_load: pd.DataFrame) -> tuple[pd.Da
     for c in [*scale.STATUS['Load'], *scale.SCALED['Load']]:
         df[f'{c}_Seed'] = df[c]
     df['ExclusionReason'] = ''
+    df['Nonconforming'] = False
 
     planned = pd.concat([sign_totals(df['SMW_Target'], df['AreaNumber'], 'MW'),
                          sign_totals(df['SMvar_Target'], df['AreaNumber'], 'Mvar')], axis=1)
@@ -467,7 +496,10 @@ def gen_targets(epc_gen: pd.DataFrame, case_gen: pd.DataFrame) -> tuple[pd.DataF
 def build_targets(epc: dict[str, pd.DataFrame], case: dict[str, pd.DataFrame], swing_buses=(),
                   island_by_bus: pd.Series | None = None) -> tuple[dict, dict]:
     """
-    Returns (targets {'Gen', 'Load'} for scale.iterate_to_gen_load_targets(), reports {'area_load', 'area_gen'}).
+    Returns (targets {'Gen', 'Load'} for scale.iterate_to_gen_load_targets(), reports {'area_load', 'area_gen', ...}).
+    reports['nonconforming']: ObjectIDs of the main island's non-conforming loads (flagged in either case; empty with
+    SCALE_NONCONFORMING). They are out of the area totals, the balances and the make-up; those with a key in the EPC are
+    target rows (Nonconforming True, Method 'EPC 1:1': the EPC's status and MW/Mvar), the rest are left as is.
     Gens on swing_buses (the slack bus) are left out of both cases: the solution sets their MW, and swing balancing
     deals with what they carry.
     island_by_bus (scale.seed_islands()): the PWB's gens/loads outside the main island take no share of the targets
@@ -480,20 +512,45 @@ def build_targets(epc: dict[str, pd.DataFrame], case: dict[str, pd.DataFrame], s
     islanded = {t: case[t][case_reason[t] != ''].assign(ExclusionReason=case_reason[t]) for t in ('Gen', 'Load')}
     case = {t: case[t][case_reason[t] == ''] for t in ('Gen', 'Load')}
     epc_load, case_load = epc['Load'], case['Load']
-    # Non-conforming is decided by key: a load which is non-conforming in the PWB, or flagged in the EPC, is out of both.
-    nonc_ids = set(case_load.loc[~conforming(case_load), 'ObjectID'])
-    epc_nonc = ~conforming(epc_load) | epc_load['ObjectID'].isin(nonc_ids)
-    if not SCALE_NONCONFORMING:
-        epc_load, case_load = epc_load[~epc_nonc], case_load[conforming(case_load)]
-    load, load_report = load_targets(epc_load, case_load)
-    nonc = lambda df, mask: df[mask & closed(df)].assign(P=lambda d: d[LOAD_P].sum(axis=1)).groupby('AreaNumber')['P'].sum()
-    load_report['Seed Non-conforming MW'] = load_report['AreaNumber'].map(nonc(case['Load'], ~conforming(case['Load']))).fillna(0.0)
-    load_report['EPC Non-conforming MW'] = load_report['AreaNumber'].map(nonc(epc['Load'], epc_nonc)).fillna(0.0)
+    # Non-conforming is decided by key: a PWB load flagged in either case is out of both cases' totals (and so is an
+    # EPC load flagged, or with a flagged PWB key).
+    if SCALE_NONCONFORMING:
+        nonc_ids, epc_nonc = set(), pd.Series(False, index=epc_load.index)
+    else:
+        epc_flagged = ~conforming(epc_load)
+        flagged_in_either = ~conforming(case_load) | case_load['ObjectID'].isin(epc_load.loc[epc_flagged, 'ObjectID'])
+        nonc_ids = set(case_load.loc[flagged_in_either, 'ObjectID'])
+        epc_nonc = epc_flagged | epc_load['ObjectID'].isin(nonc_ids)
+    is_nonc = case_load['ObjectID'].isin(nonc_ids)
+    case_nonc = case_load[is_nonc]
+    load, load_report = load_targets(epc_load[~epc_nonc], case_load[~is_nonc])
+    # Those with a key in the EPC take its status and MW 1:1 (target rows), unless Open in both cases (nothing to
+    # change); the rest keep their seed values.
+    epc_status = case_nonc['ObjectID'].map(epc_load.set_index('ObjectID')['Status'])
+    keyed = epc_status.notna() & ~((epc_status == 'Open') & (case_nonc['Status'] == 'Open'))
+    nonc_rows = nonconforming_targets(epc_load, case_nonc[keyed])
+    load = pd.concat([load, nonc_rows])
+    load_report = _nonconforming_report(load_report, case_nonc, keyed, nonc_rows)
     off_swing = lambda df: df[~df['BusNum'].isin(swing_buses)]
     gen, gen_report = gen_targets(off_swing(epc['Gen']), off_swing(case['Gen']))
     gen, load, islanded_mw = _add_islanded(gen, load, islanded['Gen'], islanded['Load'])
     return {'Gen': gen, 'Load': load}, {'area_load': load_report, 'area_gen': gen_report, 'islanded': islanded_mw,
-                                        'swing': swing_epc(epc['Gen'], case['Gen'], swing_buses)}
+                                        'nonconforming': nonc_ids, 'swing': swing_epc(epc['Gen'], case['Gen'], swing_buses)}
+
+def _nonconforming_report(load_report: pd.DataFrame, case_nonc: pd.DataFrame, keyed: pd.Series,
+                          nonc_rows: pd.DataFrame) -> pd.DataFrame:
+    """
+    load_report with the non-conforming columns (MW, per area): 'Left As Is MW' (seed MW of those which are not target
+    rows), 'Set To EPC MW' and 'Set To EPC Loads' (their 1:1 target rows). An area with only non-conforming loads gets a row too.
+    """
+    mw = lambda df: df[closed(df)].assign(P=lambda d: d[LOAD_P].sum(axis=1)).groupby('AreaNumber')['P'].sum()
+    cols = pd.DataFrame({'Left As Is MW': mw(case_nonc[~keyed]),
+                         'Set To EPC MW': nonc_rows.groupby('AreaNumber')['SMW_Target'].sum(),
+                         'Set To EPC Loads': nonc_rows.groupby('AreaNumber').size()})
+    report = load_report.set_index('AreaNumber')
+    index = report.index.union(pd.Index(case_nonc['AreaNumber'].unique(), name='AreaNumber'))
+    report = report.reindex(index).fillna(0.0).join(cols.reindex(index)).fillna(0.0)
+    return report.reset_index()
 
 def swing_epc(epc_gen: pd.DataFrame, case_gen: pd.DataFrame, swing_buses) -> pd.DataFrame:
     """
@@ -530,6 +587,7 @@ def _add_islanded(gen: pd.DataFrame, load: pd.DataFrame, i_gen: pd.DataFrame, i_
         scale.turn_off_targets(df, table, df.index == df.index)
     i_gen['GenType'] = classify_gen_type(i_gen)
     i_gen['Planned MW'], i_load['Planned MW'] = 0.0, 0.0
+    i_load['Nonconforming'] = False
     mw = pd.concat([_by_group(i_gen, i_gen['MWSetPoint'], i_gen['GenType']), _by_group(i_load, i_load[LOAD_P].sum(axis=1))])
     scale.print_islanded({'Gen': len(i_gen), 'Load': len(i_load)}, set(i_gen['ExclusionReason']) | set(i_load['ExclusionReason']))
     join = lambda a, b: pd.concat([a, b.set_index('ObjectID')]) if len(b) else a
@@ -539,7 +597,8 @@ def dist_gen_cleanup(case_load: pd.DataFrame) -> pd.DataFrame:
     """
     Every load with distributed generation still on: set it Open & 0. GridView ignores distributed generation, so no
     hour keeps any. Step 02 writes it after the main scaling, before the final balance (which takes up what it removes):
-    by then it is left only on loads the scaling never touched (Open, non-conforming) or didn't finish (held, excluded).
+    by then it is left only on loads the scaling never touched (Open, non-conforming without an EPC key) or didn't
+    finish (held, excluded).
     dist_gen_removed() is what that takes off the case.
     """
     on = (case_load['DistStatus'] == 'Closed') | (case_load['DistMWInput'] != 0) | (case_load['DistMvarInput'] != 0)
@@ -578,11 +637,13 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
     midrun balances rescale the main targets) + the final part (value less seed in each final balance's table).
     final: read_case() of the scaled case, or None before scaling (Final columns blank). targets: the main tables after
     scaling (None: nothing reached or balanced). balance_tables: balance_targets() tables of the final balance rounds,
-    after scaling (balance_swing(..., tables=)). Gens on swing_buses are left out, as in build_targets().
+    after scaling (balance_swing(..., tables=)). Gens on swing_buses are left out, as in build_targets(). The non-conforming
+    loads (reports['nonconforming']) are left out of every column but the Load row's Note.
     Losses go on each area's Load row: Seed and Est. from reports['area_loss'] (loss_estimate()), Final from final_loss
     (area_losses() of the scaled case). An area with losses but no load gets a Load row for them.
     """
     key = ['AreaNumber', 'Group']
+    nonc = reports['nonconforming']
     plan = pd.concat([reports['area_gen'].rename(columns={'GenType': 'Group'}),
                       reports['area_load'].rename(columns={'Seed Loads': 'Seed Online'}).assign(Group='Load')]).set_index(key)
     parts: dict[str, pd.Series] = {}
@@ -591,7 +652,7 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
     if targets is not None:
         g, l = targets['Gen'], targets['Load']
         # Islanded rows are out of the ledger, as they are out of Seed, Target and Final (even one that stayed on).
-        g, l = g[~scale.is_island_reason(g['ExclusionReason'])], l[~scale.is_island_reason(l['ExclusionReason'])]
+        g, l = g[~scale.is_island_reason(g['ExclusionReason'])], l[~scale.is_island_reason(l['ExclusionReason']) & ~l.index.isin(nonc)]
         gg = classify_gen_type(g)
         not_reached = (_by_group(g, g['MWSetPoint_Target'] - g['MWSetPoint'], gg)
                        .add(_by_group(l, p_of(l, [f'{c}_Target' for c in LOAD_P]) - p_of(l, LOAD_P)), fill_value=0.0))
@@ -609,7 +670,7 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
     if final is not None:
         # Islanded units (excluded rows of the targets) are left out of Final MW, as they are out of Seed and Target.
         out_ids = set().union(*[df.index[scale.is_island_reason(df['ExclusionReason'])] for df in (targets or {}).values()])
-        load = final['Load'][closed(final['Load']) & (conforming(final['Load']) | SCALE_NONCONFORMING) & ~final['Load']['ObjectID'].isin(out_ids)]
+        load = final['Load'][closed(final['Load']) & ~final['Load']['ObjectID'].isin(out_ids | nonc)]
         gen = scalable_gens(final['Gen'])
         # STATCOMs the scaling added (ID 'SC', not in the targets) are not generation; a seed gen with that ID is.
         added = (gen['ID'] == scale.STATCOM_ID) & ~gen['ObjectID'].isin(targets['Gen'].index if targets is not None else [])
@@ -670,9 +731,11 @@ def _area_notes(out: pd.DataFrame, plan: pd.DataFrame, ledger: pd.Series) -> lis
         if k[1] == 'Load':
             if target != 0 and p.get('Seed Online', 0) == 0:
                 n.append('no PWB units')
-            nonc = p.get('Seed Non-conforming MW', 0)
-            if pd.notna(nonc) and nonc != 0:
-                n.append(f'non-conforming left as is: {nonc:.1f} MW')
+            n_set, left = p.get('Set To EPC Loads', 0), p.get('Left As Is MW', 0)
+            if pd.notna(n_set) and n_set:
+                n.append(f"non-conforming set to EPC: {p['Set To EPC MW']:.1f} MW ({int(n_set)} load{'s' if n_set != 1 else ''})")
+            if pd.notna(left) and left != 0:
+                n.append(f'non-conforming left as is: {left:.1f} MW')
         else:
             units = p.get('All Units MWMax', 0) or p.get('Seed Online', 0)
             if target != 0 and not units:
@@ -719,8 +782,9 @@ def area_losses(SimAuto) -> pd.Series:
 def loss_estimate(targets: dict[str, pd.DataFrame], area_load: pd.DataFrame, seed_loss: pd.Series) -> pd.DataFrame:
     """
     Seed and estimated target LossMW per area (columns 'Seed Loss MW', 'Est. Loss MW', index AreaNumber). An area's load
-    is its positive Closed load MW in the targets (negative loads, e.g. DC converters, left out), plus its
-    non-conforming load when that isn't scaled (area_load's 'Seed Non-conforming MW', which keeps its seed value).
+    is its positive Closed load MW in the targets (negative loads, e.g. DC converters, left out; non-conforming loads
+    with an EPC key are target rows, at their EPC values), plus the seed MW of the non-conforming loads left as is
+    (area_load's 'Left As Is MW').
     The ratio is capped at LOSS_RATIO_MAX (printed). An area with no seed load keeps its seed losses.
     """
     l = targets['Load']
@@ -728,9 +792,7 @@ def loss_estimate(targets: dict[str, pd.DataFrame], area_load: pd.DataFrame, see
     def total(suffix):
         p = l[[c + suffix for c in LOAD_P]].sum(axis=1).where(l['Status' + suffix] == 'Closed', 0.0).clip(lower=0.0)
         return p.groupby(l['AreaNumber']).sum()
-    fixed = pd.Series(dtype=float)
-    if not SCALE_NONCONFORMING and 'Seed Non-conforming MW' in area_load:
-        fixed = area_load.set_index('AreaNumber')['Seed Non-conforming MW'].clip(lower=0.0)
+    fixed = area_load.set_index('AreaNumber')['Left As Is MW'].clip(lower=0.0)
     seed, target = total('').add(fixed, fill_value=0.0), total('_Target').add(fixed, fill_value=0.0)
     ratio = (target / seed).where(seed > 0, 1.0).reindex(seed_loss.index, fill_value=1.0)
     capped = ratio[ratio > LOSS_RATIO_MAX]
@@ -958,7 +1020,7 @@ def rescale_targets(targets: dict[str, pd.DataFrame], moved: dict[str, pd.DataFr
 MAKEUP = True   # Keep area gen totals: plan Unmet and excluded units' shortfall go onto the group's, then the area's, other units.
 
 def makeup_targets(final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFrame], swing_buses,
-                   skip=frozenset()) -> tuple[dict[str, pd.DataFrame], float] | None:
+                   skip=frozenset(), nonconforming=frozenset()) -> tuple[dict[str, pd.DataFrame], float] | None:
     """
     After the main scaling (area mode): per (AreaNumber, GenType) and per AreaNumber's load, the shortfall S = target -
     value of the main rows which were excluded (held units are excluded at the end of the main run; islanded rows are
@@ -966,8 +1028,8 @@ def makeup_targets(final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFra
     touched. Gens: the same group's Closed gens with MW > 0 not on a swing bus, in proportion to MW (capped at MWMax
     going up, floor 0 going down); what they can't take goes onto the rest of the area's gens of every GenType, the same
     way (spread_by_group(), spill_all=False), and what the area can't take stays short. Loads: the area's Closed loads
-    with MW > 0 (conforming unless SCALE_NONCONFORMING), one factor on MW and Mvar. skip: ObjectIDs left out
-    (balance_skips()).
+    with MW > 0, one factor on MW and Mvar; the non-conforming loads (`nonconforming`: reports['nonconforming']) neither
+    count as short nor take a share. skip: ObjectIDs left out (balance_skips()).
     Returns (tables in balance_targets()' shape, {'Gen': MW asked, 'Load': MW asked}), or None if no group is short
     by 1 MW or more.
     """
@@ -975,8 +1037,9 @@ def makeup_targets(final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFra
         out = df[~scale.included(df) & ~scale.is_island_reason(df['ExclusionReason'])]
         return _by_group(out, tgt(out) - cur(out), group(out) if group else None)
     tp = lambda df: df[[f'{c}_Target' for c in LOAD_P]].sum(axis=1)
+    nonc = set(nonconforming)
     s_gen = shortfall(targets['Gen'], lambda d: d['MWSetPoint'], lambda d: d['MWSetPoint_Target'], classify_gen_type)
-    s_load = shortfall(targets['Load'], lambda d: d[LOAD_P].sum(axis=1), tp, None)
+    s_load = shortfall(targets['Load'][~targets['Load'].index.isin(nonc)], lambda d: d[LOAD_P].sum(axis=1), tp, None)
     s_gen, s_load = s_gen[s_gen.abs() >= 1.0], s_load[s_load.abs() >= 1.0]
     if not (len(s_gen) or len(s_load)):
         return None
@@ -992,7 +1055,7 @@ def makeup_targets(final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFra
     gen['Status_Target'] = gen['Status']
 
     load = final['Load']
-    load = load[closed(load) & (conforming(load) | SCALE_NONCONFORMING) & ~load['ObjectID'].isin(skip)].copy()
+    load = load[closed(load) & ~load['ObjectID'].isin(nonc | set(skip))].copy()
     p = load[LOAD_P].sum(axis=1)
     load = load[(p > 0) & load['AreaNumber'].isin(s_load.index.get_level_values('AreaNumber'))]
     p = p[load.index]
@@ -1008,7 +1071,7 @@ def makeup_targets(final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFra
         df['ExclusionReason'] = ''
     return {t: df.set_index('ObjectID') for t, df in tables.items()}, {'Gen': float(s_gen.sum()), 'Load': float(s_load.sum())}
 
-def makeup(SimAuto, targets: dict[str, pd.DataFrame], tables: list | None = None) -> list[scale.Run]:
+def makeup(SimAuto, targets: dict[str, pd.DataFrame], tables: list | None = None, nonconforming=frozenset()) -> list[scale.Run]:
     """
     With the case open, after the main scaling: runs makeup_targets() (a `makeup` run; none if nothing is short).
     tables: if a list, the make-up tables (after scaling) are appended to it, for areas(). A make-up which fails
@@ -1017,7 +1080,7 @@ def makeup(SimAuto, targets: dict[str, pd.DataFrame], tables: list | None = None
     slack = prep.slack_buses(SimAuto)
     final = read_case(SimAuto)
     before, swing_buses = swing_mw(final['Gen'], slack)
-    made = makeup_targets(final, targets, swing_buses, balance_skips(SimAuto, final, targets))
+    made = makeup_targets(final, targets, swing_buses, balance_skips(SimAuto, final, targets), nonconforming)
     if made is None:
         return []
     moved, asked = made

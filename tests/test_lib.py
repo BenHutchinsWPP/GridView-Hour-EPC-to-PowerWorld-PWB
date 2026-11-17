@@ -588,13 +588,13 @@ def test_nonconforming_loads_are_left_alone():
     targets, reports = area.build_targets({'Load': epc, 'Gen': gens([])}, {'Load': case, 'Gen': gens([])})
     assert targets['Load'].index.tolist() == ['l1'] and targets['Load'].loc['l1', 'SMW_Target'] == 150
     r = reports['area_load'].iloc[0]
-    assert (r['Target MW'], r['Seed Non-conforming MW'], r['EPC Non-conforming MW']) == (150, 500, 900)
+    assert (r['Target MW'], r['Left As Is MW']) == (150, 500)
     bal = area.balance_targets({'Gen': gens([('g1', 1, '1', 'Closed', 'GT', 100.0, 300.0, 0.0)]), 'Load': case}, 50.0, [])
     assert bal['Load'].empty                                                     # Balancing never moves load.
     with saved_settings():
         area.SCALE_NONCONFORMING = True
-        targets, _ = area.build_targets({'Load': epc, 'Gen': gens([])}, {'Load': case, 'Gen': gens([])})
-        assert targets['Load']['SMW_Target'].sum() == 1050
+        targets, reports = area.build_targets({'Load': epc, 'Gen': gens([])}, {'Load': case, 'Gen': gens([])})
+        assert targets['Load']['SMW_Target'].sum() == 1050 and reports['nonconforming'] == set() and not targets['Load']['Nonconforming'].any()
 
 def test_build_targets_leaves_slack_bus_gens_out_of_both_cases():
     # Identical cases: the slack-bus unit's 300 MW is not loaded onto g1, and the area still matches by key.
@@ -748,13 +748,18 @@ def restore_settings(saved):
         setattr(m, k, v)
 
 def test_nonconforming_is_decided_by_key():
-    # l2 is non-conforming in the PWB only. The EPC's l2 (500 MW) must not be loaded onto l1.
+    # l2 is non-conforming in the PWB only. The EPC's l2 (900 MW) must not be loaded onto l1: it is out of the area's
+    # target (100), and l2 itself is set to its EPC value 1:1.
     case = loads([('l1', 1, 'Closed', 100.0, 0.0, 0.0, 0.0), ('l2', 1, 'Closed', 500.0, 0.0, 0.0, 0.0)]).assign(AGC=['YES', 'NO'])
-    epc = loads([('l1', 1, 'Closed', 100.0, 0.0, 0.0, 0.0), ('l2', 1, 'Closed', 500.0, 0.0, 0.0, 0.0)])
+    epc = loads([('l1', 1, 'Closed', 100.0, 0.0, 0.0, 0.0), ('l2', 1, 'Closed', 900.0, 0.0, 0.0, 0.0)])
     targets, reports = area.build_targets({'Load': epc, 'Gen': gens([])}, {'Load': case, 'Gen': gens([])})
-    assert targets['Load'].index.tolist() == ['l1'] and targets['Load'].loc['l1', 'SMW_Target'] == 100
+    t = targets['Load']
+    assert t.index.tolist() == ['l1', 'l2'] and t.loc['l1', 'SMW_Target'] == 100 and t.loc['l2', 'SMW_Target'] == 900
+    assert t['Method'].tolist() == ['Key', 'EPC 1:1'] and t['Nonconforming'].tolist() == [False, True]
+    assert reports['nonconforming'] == {'l2'}
     r = reports['area_load'].iloc[0]
-    assert (r['Target MW'], r['Planned MW'], r['Seed Non-conforming MW'], r['EPC Non-conforming MW']) == (100, 100, 500, 500)
+    assert (r['Target MW'], r['Planned MW']) == (100, 100)
+    assert (r['Set To EPC MW'], r['Set To EPC Loads'], r['Left As Is MW']) == (900, 1, 0)
 
 def test_rescale_caps_gen_targets_at_mwmax():
     df = targets_df(ObjectID=['a', 'b', 'c'], MWSetPoint=[50.0, 50.0, 50.0], MWSetPoint_Start=[0.0, 0.0, 0.0], MWSetPoint_Target=[100.0, 100.0, 130.0])
@@ -1485,16 +1490,12 @@ def test_loss_estimate_scales_each_area_with_its_load():
                       Status_Target=['Closed', 'Closed', 'Open'], **{c: [0.0] * 3 for c in LOAD_P_ALL},
                       **{f'{c}_Target': [0.0] * 3 for c in LOAD_P_ALL})
     load['SMW'], load['SMW_Target'] = [200.0, 0.0, 500.0], [100.0, 50.0, 0.0]
-    area_load = pd.DataFrame({'AreaNumber': [1, 2], 'Seed Non-conforming MW': [100.0, 0.0]})
+    area_load = pd.DataFrame({'AreaNumber': [1, 2], 'Left As Is MW': [100.0, 0.0]})
     est = area.loss_estimate({'Load': load}, area_load, pd.Series({1: 9.0, 2: 3.0, 3: 5.0}))
     assert est['Est. Loss MW'].round(9).to_dict() == {1: 4.0, 2: 3.0, 3: 5.0} and est['Seed Loss MW'].to_dict() == {1: 9.0, 2: 3.0, 3: 5.0}
     with saved_settings():
         area.LOSS_EXPONENT = 0.0
         assert (area.loss_estimate({'Load': load}, area_load, pd.Series({1: 9.0}))['Est. Loss MW'] == 9.0).all()
-    # Scaled non-conforming load is in the targets already: not added again. Area 1: 200 -> 100, losses 9 / 4.
-    with saved_settings():
-        area.SCALE_NONCONFORMING = True
-        assert area.loss_estimate({'Load': load}, area_load, pd.Series({1: 9.0}))['Est. Loss MW'].round(9).tolist() == [2.25]
 
 def test_loss_estimate_uses_positive_load_and_caps_the_ratio():
     # Area 1: 100 MW load beside a -95 MW DC load; the load goes to 150. Net 5 -> 55 would give losses x121.
@@ -1502,7 +1503,7 @@ def test_loss_estimate_uses_positive_load_and_caps_the_ratio():
     load = targets_df(ObjectID=['l1', 'dc', 'l2'], BusNum=[1, 2, 3], ID='1', AreaNumber=[1, 1, 2], Status='Closed', Status_Target='Closed',
                       **{c: [0.0] * 3 for c in LOAD_P_ALL}, **{f'{c}_Target': [0.0] * 3 for c in LOAD_P_ALL})
     load['SMW'], load['SMW_Target'] = [100.0, -95.0, 10.0], [150.0, -95.0, 100.0]
-    est = area.loss_estimate({'Load': load}, pd.DataFrame({'AreaNumber': [1, 2]}), pd.Series({1: 10.0, 2: 1.0}))
+    est = area.loss_estimate({'Load': load}, pd.DataFrame({'AreaNumber': [1, 2], 'Left As Is MW': 0.0}), pd.Series({1: 10.0, 2: 1.0}))
     assert est['Est. Loss MW'].round(9).to_dict() == {1: 22.5, 2: 4.0}
 
 def test_areas_shows_final_losses_without_a_plan_estimate():
@@ -2029,6 +2030,141 @@ def test_step_02_keeps_the_hour_when_the_dist_gen_cleanup_raises():
     row = runs[runs['Run'] == 'distgen'].iloc[0]
     assert row['Note'].startswith("failed: RuntimeError('no dist gen')"), runs
     assert not areas['Note'].astype(str).str.contains('unexplained').any(), areas
+
+# ------------------ T4: non-conforming loads take the EPC's status and MW 1:1 ------------------
+class LowBusSimAuto(SwingSimAuto):
+    """SwingSimAuto with the buses in `low` at 0.85 pu (below the scaling band)."""
+    low = frozenset()
+
+    def GetParametersMultipleElementRect(self, table, fields, filter_group):
+        err, rows = super().GetParametersMultipleElementRect(table, fields, filter_group)
+        if table == 'Bus' and 'Vpu' in fields:
+            n, v = fields.index('Number'), fields.index('Vpu')
+            rows = [[('0.85' if i == v and int(r[n]) in self.low else x) for i, x in enumerate(r)] for r in rows]
+        return err, rows
+
+def nonc_hour(case_rows, epc_rows, flags=('YES', 'YES'), epc_flags=('YES', 'YES'), low=(), buses=(3, 4, 5, 6), seed_flags=None):
+    """
+    Area 1: conforming l1 (seed 200, EPC 120) and the loads of case_rows / epc_rows after it (loads() rows, area 1), on buses 3, 4, ...
+    Scales a SwingSimAuto hour through the engine. Returns (sa, targets, reports, areas sheet).
+    """
+    base = [('l1', 1, 'Closed', 200.0, 0.0, 0.0, 20.0)]
+    dec = lambda df, agc: df.assign(BusNum=list(buses)[:len(df)], NomkV=230.0, BusName='b', AGC=agc)
+    case = dec(loads(base + case_rows), ['YES'] + list(seed_flags or flags))
+    epc = dec(loads([('l1', 1, 'Closed', 120.0, 0.0, 0.0, 12.0)] + epc_rows), ['YES'] + list(epc_flags))
+    gen = gens([('g1', 1, '1', 'Closed', 'GT', 100.0, 1000.0, 0.0)]).assign(BusNum=1, MW=0.0, NomkV=230.0, BusName='b')
+    sa = LowBusSimAuto(gen, case)
+    sa.low = frozenset(low)
+    targets, reports = area.build_targets({'Load': epc, 'Gen': gen}, {'Load': case, 'Gen': gen})
+    with contextlib.redirect_stdout(io.StringIO()):
+        scale.iterate_to_gen_load_targets(sa, targets)
+        mk = []
+        area.makeup(sa, targets, tables=mk, nonconforming=reports['nonconforming'])
+        sheet = area.areas(area.read_case(sa), reports, targets, [], makeup_tables=mk)
+    return sa, targets, reports, sheet, mk
+
+def test_load_flagged_only_in_the_epc_is_non_conforming_and_out_of_the_ledger():
+    # ss is conforming in the PWB, flagged in the EPC (80 MW): out of the area's target and of Final MW, and set to 80 MW 1:1.
+    sa, targets, reports, sheet, _ = nonc_hour([('ss', 1, 'Closed', 50.0, 0.0, 0.0, 0.0)], [('ss', 1, 'Closed', 80.0, 0.0, 0.0, 0.0)],
+                                               flags=('YES',), epc_flags=('NO',))
+    assert reports['nonconforming'] == {'ss'} and targets['Load'].loc['ss', 'Method'] == 'EPC 1:1'
+    assert sa.table('Load').set_index('BusNum').loc[4, 'SMW'] == 80.0 and sa.table('Load').set_index('BusNum').loc[3, 'SMW'] == 120.0
+    row = sheet[sheet['Group'] == 'Load'].iloc[0]
+    assert (row['Target MW'], row['Final MW'], row['Error MW'], row['Online Final']) == (120.0, 120.0, 0.0, 1.0)
+    assert 'unexplained' not in row['Note'] and 'non-conforming set to EPC: 80.0 MW (1 load)' in row['Note']
+    assert not sheet['Note'].str.contains('unexplained').any()
+
+def test_an_area_with_only_nonconforming_loads_gets_a_load_row_for_the_note():
+    case = loads([('k', 2, 'Closed', 40.0, 0.0, 0.0, 0.0)]).assign(AGC='NO')
+    targets, reports = area.build_targets({'Load': loads([]), 'Gen': gens([])}, {'Load': case, 'Gen': gens([])})
+    out = area.areas(None, reports, targets)
+    assert out['Group'].tolist() == ['Load'] and out['AreaNumber'].tolist() == [2]
+    assert out['Note'].iloc[0] == 'non-conforming left as is: 40.0 MW'
+    assert len(targets['Load']) == 0
+
+def test_nonconforming_load_held_for_voltage_keeps_the_ledger_and_the_makeup_off_conforming_loads():
+    # ss (bus 4) sags below the voltage band: held, then excluded 30 MW short of its EPC value. The make-up must not put
+    # those 30 MW on l1, and the ledger (which leaves ss out) still holds.
+    sa, targets, reports, sheet, mk = nonc_hour([('ss', 1, 'Closed', 50.0, 0.0, 0.0, 0.0)], [('ss', 1, 'Closed', 80.0, 0.0, 0.0, 0.0)],
+                                                flags=('NO',), epc_flags=('NO',), low=(4,))
+    t = targets['Load'].loc['ss']
+    assert t['ExclusionReason'] != '' and t['SMW'] == 50.0 and t['SMW_Target'] == 80.0
+    assert all(len(m['Load']) == 0 for m in mk) and sa.table('Load').set_index('BusNum').loc[3, 'SMW'] == 120.0
+    row = sheet[sheet['Group'] == 'Load'].iloc[0]
+    assert (row['Target MW'], row['Not Reached MW'], row['Make-up MW'], row['Final MW']) == (120.0, 0.0, 0.0, 120.0)
+    assert not sheet['Note'].str.contains('unexplained').any()
+    # The make-up's own shortfall list leaves it out directly, too.
+    final = area.read_case(sa)
+    assert area.makeup_targets(final, targets, swing_buses=[], nonconforming=reports['nonconforming']) is None
+
+def test_makeup_leaves_non_conforming_loads_alone_unless_scale_nonconforming():
+    # l1 (bus 3) is held 80 MW short. l2 is conforming; ss (flagged in the EPC only) has headroom: it must not take a share.
+    rows = [('l2', 1, 'Closed', 100.0, 0.0, 0.0, 0.0), ('ss', 1, 'Closed', 50.0, 0.0, 0.0, 0.0)]
+    epc_rows = [('l2', 1, 'Closed', 100.0, 0.0, 0.0, 0.0), ('ss', 1, 'Closed', 50.0, 0.0, 0.0, 0.0)]
+    with saved_settings():
+        sa, targets, reports, sheet, mk = nonc_hour(rows, epc_rows, flags=('YES', 'YES'), epc_flags=('YES', 'NO'), low=(3,))
+    assert reports['nonconforming'] == {'ss'} and targets['Load'].loc['l1', 'ExclusionReason'] != ''
+    assert [m['Load'].index.tolist() for m in mk] == [['l2']] and abs(mk[0]['Load'].loc['l2', 'SMW_Target'] - 20.0) < 1e-9
+    out = sa.table('Load').set_index('BusNum')
+    assert abs(out.loc[4, 'SMW'] - 20.0) < 1e-9 and out.loc[5, 'SMW'] == 50.0
+    assert not sheet['Note'].str.contains('unexplained').any(), sheet['Note']
+    # With scale_nonconforming they are ordinary loads again: ss takes a share of the make-up too.
+    with saved_settings():
+        area.SCALE_NONCONFORMING = True
+        sa, targets, reports, sheet, mk = nonc_hour(rows, epc_rows, flags=('YES', 'YES'), epc_flags=('YES', 'NO'), low=(3,))
+    assert reports['nonconforming'] == set() and sorted(mk[0]['Load'].index) == ['l2', 'ss']
+    assert not sheet['Note'].str.contains('unexplained').any(), sheet['Note']
+
+def test_non_conforming_loads_open_in_both_cases_are_not_target_rows():
+    # s1 is Open in the seed and in the EPC: nothing to change, so no target row (no write, no exception, not counted).
+    # s2 is Closed in the EPC: the one row, so the Note says '1 load'.
+    sa, targets, reports, sheet, _ = nonc_hour(
+        [('s1', 1, 'Open', 7.0, 0.0, 0.0, 0.0), ('s2', 1, 'Open', 7.0, 0.0, 0.0, 0.0)],
+        [('s1', 1, 'Open', 9.0, 0.0, 0.0, 0.0), ('s2', 1, 'Closed', 25.0, 0.0, 0.0, 0.0)], flags=('NO', 'NO'), epc_flags=('NO', 'NO'), low=(4,))
+    assert reports['nonconforming'] == {'s1', 's2'} and 's1' not in targets['Load'].index
+    assert targets['Load'].loc['s2', 'Status_Target'] == 'Closed'
+    row = sheet[sheet['Group'] == 'Load'].iloc[0]
+    assert 'non-conforming set to EPC: 25.0 MW (1 load)' in row['Note']
+
+def test_nonconforming_loads_take_the_epc_status_and_those_without_a_key_are_left_alone():
+    # s1: Open in the seed, Closed in the EPC (40 MW): closed in. s2: Closed in the seed, Open in the EPC: opened.
+    # s3: no EPC key: untouched. Dist gen of the 1:1 loads goes Open & 0.
+    sa, targets, reports, sheet, _ = nonc_hour(
+        [('s1', 1, 'Open', 7.0, 0.0, 0.0, 0.0), ('s2', 1, 'Closed', 60.0, 0.0, 0.0, 0.0), ('s3', 1, 'Closed', 30.0, 0.0, 0.0, 0.0)],
+        [('s1', 1, 'Closed', 30.0, 5.0, 5.0, 4.0), ('s2', 1, 'Open', 99.0, 0.0, 0.0, 0.0)],
+        flags=('NO', 'NO', 'NO'), epc_flags=('NO', 'NO'))
+    t = targets['Load']
+    assert t.loc[['s1', 's2'], 'Status_Target'].tolist() == ['Closed', 'Open'] and 's3' not in t.index
+    assert t.loc[['s1', 's2'], 'SMW_Target'].tolist() == [40.0, 0.0] and t.loc['s1', 'SMvar_Target'] == 4.0
+    assert (t.loc[['s1', 's2'], ['IMW_Target', 'ZMW_Target', 'DistMWInput_Target']] == 0).all().all()
+    assert t.loc[['s1', 's2'], 'DistStatus_Target'].tolist() == ['Open', 'Open']
+    out = sa.table('Load').set_index('BusNum')
+    assert (out.loc[4, 'Status'], out.loc[4, 'SMW'], out.loc[4, 'SMvar'], out.loc[4, 'DistStatus']) == ('Closed', 40.0, 4.0, 'Open')
+    assert (out.loc[5, 'Status'], out.loc[5, 'SMW']) == ('Open', 0.0)
+    assert (out.loc[6, 'Status'], out.loc[6, 'SMW']) == ('Closed', 30.0)
+    row = sheet[sheet['Group'] == 'Load'].iloc[0]
+    assert 'non-conforming set to EPC: 40.0 MW (2 loads)' in row['Note'] and 'non-conforming left as is: 30.0 MW' in row['Note']
+    assert row['Final MW'] == row['Target MW'] == 120.0 and not sheet['Note'].str.contains('unexplained').any()
+
+def test_loss_estimate_counts_one_to_one_loads_at_their_epc_value_and_others_at_seed():
+    # Area 1 seed load: l1 200 + ss 50 (EPC 100) + kl 30 (no key, left as is) = 280; target: l1 120 + ss 100 + kl 30 = 250.
+    case = loads([('l1', 1, 'Closed', 200.0, 0.0, 0.0, 0.0), ('ss', 1, 'Closed', 50.0, 0.0, 0.0, 0.0),
+                  ('kl', 1, 'Closed', 30.0, 0.0, 0.0, 0.0)]).assign(AGC=['YES', 'NO', 'NO'])
+    epc = loads([('l1', 1, 'Closed', 120.0, 0.0, 0.0, 0.0), ('ss', 1, 'Closed', 100.0, 0.0, 0.0, 0.0)]).assign(AGC=['YES', 'NO'])
+    targets, reports = area.build_targets({'Load': epc, 'Gen': gens([])}, {'Load': case, 'Gen': gens([])})
+    assert reports['area_load'].iloc[0]['Left As Is MW'] == 30
+    est = area.loss_estimate(targets, reports['area_load'], pd.Series({1: 9.0}))
+    assert abs(est['Est. Loss MW'].iloc[0] - 9.0 * (250.0 / 280.0) ** area.LOSS_EXPONENT) < 1e-9
+
+def test_prebalance_moves_by_the_one_to_one_loads_change():
+    # ss goes 50 -> 150 MW (EPC): +100 MW of load, so the gens go up 100. The conforming load and the gen keep their EPC values.
+    case = loads([('l1', 1, 'Closed', 200.0, 0.0, 0.0, 0.0), ('ss', 1, 'Closed', 50.0, 0.0, 0.0, 0.0)]).assign(AGC=['YES', 'NO'], DistMWInput=0.0)
+    epc = loads([('l1', 1, 'Closed', 200.0, 0.0, 0.0, 0.0), ('ss', 1, 'Closed', 150.0, 0.0, 0.0, 0.0)]).assign(AGC=['YES', 'NO'], DistMWInput=0.0)
+    gen = gens([('g1', 1, '1', 'Closed', 'GT', 300.0, 1000.0, 0.0)])
+    targets, _ = area.build_targets({'Load': epc, 'Gen': gen}, {'Load': case, 'Gen': gen})
+    moved = area.prebalance_targets(targets)
+    assert moved is not None and targets['Gen'].loc['g1', 'MWSetPoint_Target'] == 400.0
+    assert targets['Load'].loc['ss', 'SMW_Target'] == 150.0 and targets['Load'].loc['l1', 'SMW_Target'] == 200.0
 
 if __name__ == '__main__':
     tests = [f for name, f in dict(globals()).items() if name.startswith('test_')]
