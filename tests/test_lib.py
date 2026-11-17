@@ -438,6 +438,25 @@ def test_dist_gen_cleanup_clears_every_load_still_carrying_it():
     assert area.dist_gen_removed(cleanup) == 5.0
     assert area.dist_gen_removed(area.dist_gen_cleanup(case.iloc[2:3])) == 0.0  # Nothing to clear.
 
+def test_unconverted_loads_warn_once_with_count_and_mw():
+    case = loads([('a', 1, 'Closed', 50.0, 7.0, 0.0, 0.0), ('b', 1, 'Closed', 50.0, 0.0, 0.0, 0.0), ('c', 1, 'Open', 50.0, 9.0, 0.0, 0.0)])
+    case.loc[1, ['DistStatus', 'DistMWInput', 'DistMvarInput']] = ['Open', 0.0, 0.0]
+    case.loc[2, ['DistStatus', 'DistMWInput', 'DistMvarInput']] = ['Open', 0.0, 0.0]
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        n = area.warn_unconverted_loads(case)
+    lines = out.getvalue().splitlines()
+    assert n == 1 and len(lines) == 1 and lines[0].startswith('WARNING: Prepared.pwb has 1 Closed loads')
+    assert '7 MW of I+Z' in lines[0] and 'Rerun step 01' in lines[0]
+
+def test_converted_loads_and_open_dist_gen_print_no_unconverted_warning():
+    case = loads([('a', 1, 'Closed', 50.0, 0.0, 0.0, 5.0), ('b', 1, 'Open', 50.0, 0.0, 0.0, 0.0)])
+    case.loc[0, ['DistStatus', 'DistMWInput', 'DistMvarInput']] = ['Open', 0.0, 0.0]
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        n = area.warn_unconverted_loads(case)                 # b is Open with dist gen: it injects nothing.
+    assert n == 0 and out.getvalue() == ''
+
 def test_area_targets_through_the_engine():
     case = loads([('l1', 1, 'Closed', 60.0, 20.0, 20.0, 10.0), ('l2', 1, 'Closed', 100.0, 0.0, 0.0, 10.0)])
     epc = loads([('e1', 1, 'Closed', 300.0, 0.0, 0.0, 40.0)])
@@ -1637,6 +1656,18 @@ def test_step_02_estimates_losses_and_clears_untouched_dist_gen():
     row = sheets['areas'].set_index('Group').loc['Load']
     assert (row['Seed Loss MW'], round(row['Est. Loss MW'], 9), row['Final Loss MW']) == (10.0, 19.6, 10.0)
     assert sheets['areas'].set_index('Group').loc['Thermal', ['Seed Loss MW', 'Est. Loss MW', 'Final Loss MW']].isna().all()
+
+def test_step_02_warns_once_when_prepared_pwb_is_unconverted():
+    gen, load = two_cases()                                   # loads() fixtures carry dist gen on Closed loads.
+    epc_gen = gens([('e1', 1, '1', 'Closed', 'GT', 150.0, 1000.0, 0.0)]).assign(BusNum=1, MW=0.0, NomkV=230.0, BusName='b')
+    epc_load = loads([('e1', 1, 'Closed', 300.0, 0.0, 0.0, 30.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        step = load_step_02(Path(d), 'area')
+        sa = CaseSimAuto({'h1.epc': (epc_gen, epc_load), 'Prepared.pwb': (gen, load)}, slack=[99])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')
+    assert sum('Rerun step 01' in l for l in out.getvalue().splitlines()) == 1
 
 def test_exclude_islands_names_the_island_and_targets_it_off():
     # Bus 1 main island, bus 2 island 3, bus 4 blank, bus 5 not in the case. gx (a second island's slack gen) loses

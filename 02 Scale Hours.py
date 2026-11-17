@@ -40,9 +40,10 @@ def summary_line(hour, log, area_mode):
 
 def clear_dist_gen(SimAuto, swing) -> list[scale.Run]:
     """
-    GridView ignores distributed generation: sets it Open & 0 on every load still carrying it (loads the scaling never
-    touched or didn't finish), one solve-checked edit, bisected if it diverges. The final balance (if balance_swing)
-    takes up the MW. Returns a `distgen` run for the runs sheet (none if nothing was left), whose Note names the loads
+    Safety net: GridView ignores distributed generation, so sets it Open & 0 on every load still carrying it. On a seed
+    converted by step 01 that finds only loads whose conversion (or dist gen clearing) diverged there. One solve-checked
+    edit, bisected if it diverges. The final balance (if balance_swing) takes up the MW. Returns a `distgen` run for the
+    runs sheet (none if nothing was left), whose Note names the loads
     which kept theirs.
     """
     left = area.dist_gen_cleanup(pw.get_df(SimAuto, 'Load', area.LOAD_FIELDS))
@@ -104,6 +105,7 @@ def create_case(SimAuto, gv_fp, out_fp):
 
     pw.open_case(SimAuto, pw_fp)
     scale.turn_off_islanded(SimAuto, targets)     # Everything outside the main island goes Open, before scaling.
+    area.warn_unconverted_loads(pw.get_df(SimAuto, 'Load', area.LOAD_FIELDS))     # An old Prepared.pwb: rerun step 01.
     pvqv = pd.read_csv(pvqv_fp) if run['use_pvqv'] else None
     balance_tables, makeup_tables = [], []
     slack = prep.slack_buses(SimAuto)

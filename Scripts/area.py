@@ -615,7 +615,9 @@ def _add_islanded(gen: pd.DataFrame, load: pd.DataFrame, i_gen: pd.DataFrame, i_
 def dist_gen_cleanup(case_load: pd.DataFrame) -> pd.DataFrame:
     """
     Every load with distributed generation still on: set it Open & 0. GridView ignores distributed generation, so no
-    hour keeps any. Step 02 writes it after the main scaling, before the final balance (which takes up what it removes):
+    hour keeps any. A safety net: on a Prepared.pwb converted by step 01 it finds only loads whose conversion (or dist
+    gen clearing) diverged there. Step 02 writes it after the main scaling, before the final balance (which takes up
+    what it removes):
     by then it is left only on loads the scaling never touched (Open, non-conforming without an EPC key) or didn't
     finish (held, excluded).
     dist_gen_removed() is what that takes off the case.
@@ -624,6 +626,25 @@ def dist_gen_cleanup(case_load: pd.DataFrame) -> pd.DataFrame:
     df = case_load[on]
     return df.assign(DistStatus='Open', DistMWInput=0.0, DistMvarInput=0.0, DistMW_Seed=df['DistMWInput'].where(
         closed(df) & (df['DistStatus'] == 'Closed'), 0.0))
+
+def unconverted_loads(case_load: pd.DataFrame) -> pd.DataFrame:
+    """
+    Closed loads still carrying constant current/impedance or distributed generation: what step 01 leaves none of, except
+    loads it couldn't converge. An old Prepared.pwb (from before the constant-power conversion) has them all.
+    """
+    cols = ['IMW', 'IMvar', 'ZMW', 'ZMvar', 'DistMWInput', 'DistMvarInput']
+    on = (case_load[cols] != 0).any(axis=1) | (case_load['DistStatus'] == 'Closed')
+    return case_load[closed(case_load) & on]
+
+def warn_unconverted_loads(case_load: pd.DataFrame) -> int:
+    """Prints one warning if unconverted_loads() finds any (step 02 carries on: it ramps them to 0). Returns their count."""
+    df = unconverted_loads(case_load)
+    if len(df):
+        dist = df['DistMWInput'].where(df['DistStatus'] == 'Closed', 0.0).sum()
+        print(f'WARNING: Prepared.pwb has {len(df)} Closed loads with constant current/impedance or dist gen '
+              f'({(df["IMW"] + df["ZMW"]).sum():,.0f} MW of I+Z, {dist:,.0f} MW of dist gen). '
+              'Rerun step 01: it converts every load to constant power.')
+    return len(df)
 
 def dist_gen_removed(cleanup: pd.DataFrame) -> float:
     """MW of distributed generation a dist_gen_cleanup() table takes off the case (it injected only where Closed)."""
