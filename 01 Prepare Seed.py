@@ -94,13 +94,18 @@ if(__name__=='__main__'):
         try_step('GenTerminalVoltageControl.aux', lambda: pw.run(SimAuto, f'LoadAux("{cur_dir / "Scripts" / "GenTerminalVoltageControl.aux"}",YES);'))
         save('GenTerminalVoltageControl')
 
+    prep.disable_area_agc(SimAuto)
+    if not pw.solve(SimAuto):
+        raise SystemExit('The case does not solve with Area AGC off. Fix that before step 02.')
+
+    print('convert_loads_to_constant_power')
+    log.update(prep.convert_loads_to_constant_power(SimAuto))
+    save('convert_loads')
+
     if run['compute_pvqv']:
         print('get_pvqv')
         prep.get_pvqv(SimAuto).to_csv(pvqv_fp, index=False)
 
-    prep.disable_area_agc(SimAuto)
-    if not pw.solve(SimAuto):
-        raise SystemExit('The case does not solve with Area AGC off. Fix that before step 02.')
     if run['create_giant_swing']:
         swing_bus = run['swing_bus']
         if swing_bus == 'max_fault_duty':

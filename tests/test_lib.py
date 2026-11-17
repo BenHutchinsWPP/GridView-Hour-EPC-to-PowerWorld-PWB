@@ -676,6 +676,13 @@ class SwingSimAuto(FakeSimAuto):
                 for f, v in row.items():
                     if f in df.columns:
                         df.loc[int(key), f] = type(df[f].iloc[0])(v) if f not in ('Status', 'DistStatus', 'ID') else v
+        if name == 'Load':      # Solution columns at 1.0 PU: what the load draws, and what dist gen gives back.
+            on = df['Status'] == 'Closed'
+            df['MW'] = (df['SMW'] + df['IMW'] + df['ZMW']).where(on, 0.0)
+            df['Mvar'] = (df['SMvar'] + df['IMvar'] + df['ZMvar']).where(on, 0.0)
+            dist = on & (df['DistStatus'] == 'Closed')
+            df['DistMW'], df['DistMvar'] = df['DistMWInput'].where(dist, 0.0), df['DistMvarInput'].where(dist, 0.0)
+            df['NetMW'], df['NetMvar'] = df['MW'] - df['DistMW'], df['Mvar'] - df['DistMvar']
         if name == 'Gen':
             on = df['Status'] == 'Closed'
             ld = self.table('Load')
@@ -2231,6 +2238,89 @@ def test_prebalance_moves_by_the_one_to_one_loads_change():
     moved = area.prebalance_targets(targets)
     assert moved is not None and targets['Gen'].loc['g1', 'MWSetPoint_Target'] == 400.0
     assert targets['Load'].loc['ss', 'SMW_Target'] == 150.0 and targets['Load'].loc['l1', 'SMW_Target'] == 200.0
+
+# ------------------ Constant-power conversion (step 01) ------------------
+def conversion_case(bad=()):
+    """Area 1: loads on buses 11 and 12 (ZIP + dist gen), 13 Open with dist gen (S 50, I 7). Area 2: bus 21. Swing xx on bus 99 (slack)."""
+    gen = gens([('xx', 9, 'xx', 'Closed', '', 0.0, 2e4, -2e4)]).assign(BusNum=99, MW=0.0, NomkV=230.0, BusName='b')
+    load = loads([('a', 1, 'Closed', 60.0, 20.0, 10.0, 6.0), ('b', 1, 'Closed', 40.0, 0.0, 0.0, 4.0),
+                  ('c', 1, 'Open', 50.0, 7.0, 0.0, 5.0), ('d', 2, 'Closed', 30.0, 5.0, 5.0, 3.0)]).assign(BusNum=[11, 12, 13, 21], NomkV=230.0, BusName='b')
+    load.loc[load['ObjectID'] == 'c', 'DistMWInput'] = 9.0
+    sa = SwingSimAuto(gen, load, slack=[99])
+    sa.bad, sa.count_dist = set(bad), True
+    return sa
+
+def test_constant_power_rows_use_net_load_and_skip_open_loads():
+    load = loads([('a', 1, 'Closed', 60.0, 20.0, 10.0, 6.0), ('o', 1, 'Open', 50.0, 0.0, 0.0, 5.0)]).assign(NetMW=[85.0, 0.0], NetMvar=[5.0, 0.0])
+    out = prep.constant_power_rows(load)
+    assert out.index.tolist() == ['a'] and out.loc['a', ['SMW', 'SMvar']].tolist() == [85.0, 5.0]
+    assert (out.loc['a', ['IMW', 'IMvar', 'ZMW', 'ZMvar', 'DistMWInput', 'DistMvarInput']] == 0).all() and out.loc['a', 'DistStatus'] == 'Open'
+
+def test_convert_loads_to_constant_power_keeps_the_operating_point():
+    sa = conversion_case()
+    before = sa.table('Load').set_index('ObjectID')
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        sheets = prep.convert_loads_to_constant_power(sa)
+    after = sa.table('Load').set_index('ObjectID')
+    assert set(sheets) == {'load_conversion'} and 'Loads to constant power: 3 loads, net 155.0 MW (dist gen 15.0 MW folded in)' in out.getvalue()
+    assert 'WARNING' not in out.getvalue()
+    for k in 'abd':          # Written S is the net load before; the rest is 0, and dist gen is Open (not just 0).
+        assert after.loc[k, 'SMW'] == before.loc[k, 'NetMW'] and after.loc[k, 'SMvar'] == before.loc[k, 'NetMvar']
+        assert (after.loc[k, ['IMW', 'IMvar', 'ZMW', 'ZMvar', 'DistMWInput', 'DistMvarInput']] == 0).all() and after.loc[k, 'DistStatus'] == 'Open'
+    assert after.loc['a', 'SMW'] == 85.0
+    # The Open load keeps S, I and Z, and loses only its dist gen.
+    assert after.loc['c', ['SMW', 'IMW', 'ZMW', 'SMvar']].tolist() == before.loc['c', ['SMW', 'IMW', 'ZMW', 'SMvar']].tolist()
+    assert after.loc['c', 'DistStatus'] == 'Open' and after.loc['c', 'DistMWInput'] == 0 and after.loc['c', 'DistMvarInput'] == 0
+    sheet = sheets['load_conversion'].set_index('AreaNumber')
+    assert sheet.loc[1, 'Loads'] == 2 and sheet.loc[1, 'Nominal MW'] == 130.0 and sheet.loc[1, 'Dist MW'] == 10.0
+    assert (sheet[['Diff MW', 'Diff Mvar']].dropna().abs() < 1e-6).all().all()
+    assert abs(sheet.loc['Swing', 'Net MW Before'] - sheet.loc['Swing', 'Net MW After']) < 1e-6 and sheet.loc['Swing', 'Net MW Before'] == 155.0
+
+def test_convert_loads_lists_loads_which_diverge_and_converts_the_rest():
+    sa = conversion_case(bad={'12'})      # Bus 12 (load b) diverges once changed.
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        sheets = prep.convert_loads_to_constant_power(sa)
+    after = sa.table('Load').set_index('ObjectID')
+    assert sheets['load_conversion_failed'].index.tolist() == ['b'] and 'WARNING: 1 loads could not be converted' in out.getvalue()
+    assert after.loc['b', 'DistStatus'] == 'Closed' and after.loc['b', 'DistMWInput'] == 5.0         # Untouched.
+    assert after.loc['a', 'SMW'] == 85.0 and after.loc['a', 'IMW'] == 0 and after.loc['d', 'IMW'] == 0
+
+def test_convert_loads_stops_bisecting_at_the_failure_cap():
+    sa = conversion_case(bad={'11', '12'})
+    saved = prep.CONVERT_MAX_FAILED
+    prep.CONVERT_MAX_FAILED = 1
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            sheets = prep.convert_loads_to_constant_power(sa)
+    finally:
+        prep.CONVERT_MAX_FAILED = saved
+    after = sa.table('Load').set_index('ObjectID')
+    assert 'stopped bisecting after 1 failures' in out.getvalue()
+    assert 'd' in sheets['load_conversion_failed'].index and after.loc['d', 'IMW'] == 5.0      # d is fine, but was never tried.
+
+def test_convert_loads_with_blank_net_fields_stops_before_writing():
+    sa = conversion_case()
+    real = sa.GetParametersMultipleElementRect
+    sa.GetParametersMultipleElementRect = lambda t, f, g: ('', [['' if x == 'NetMW' else v for x, v in zip(f, row)] for row in real(t, f, g)[1]]) if t == 'Load' else real(t, f, g)
+    try:
+        prep.convert_loads_to_constant_power(sa)
+        assert False, 'expected SystemExit'
+    except SystemExit as e:
+        assert '3 Closed loads have a blank NetMW or NetMvar' in str(e)
+    assert not any(t == 'Load' for t, _ in sa.applied)
+
+def test_convert_loads_skips_the_conversion_when_the_case_does_not_solve():
+    sa = conversion_case(bad={'11'})
+    sa.applied[('Load', '11')] = {}       # Already diverged before the conversion.
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        sheets = prep.convert_loads_to_constant_power(sa)
+    assert sheets == {} and 'NOT converted' in out.getvalue() and set(sa.applied) == {('Load', '11')}
+
+def test_step_01_runs_the_conversion_after_agc_off_and_before_pvqv_and_the_giant_swing():
+    lines = (Path(__file__).resolve().parents[1] / '01 Prepare Seed.py').read_text().splitlines()
+    first = lambda text: next(i for i, line in enumerate(lines) if text in line)
+    order = [first(f'prep.{name}') for name in ('disable_area_agc', 'convert_loads_to_constant_power', 'get_pvqv', 'create_giant_swing')]
+    assert order == sorted(order)
 
 if __name__ == '__main__':
     tests = [f for name, f in dict(globals()).items() if name.startswith('test_')]

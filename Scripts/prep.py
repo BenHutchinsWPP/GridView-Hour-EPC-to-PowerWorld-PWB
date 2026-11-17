@@ -2,6 +2,7 @@
 Step 01, both modes: seed preparation which doesn't change topology. Switches shunts for voltage, fault duty and
 PVQV sensitivities, the giant swing, and turning off area AGC. (Terminal voltage control is
 Scripts/GenTerminalVoltageControl.aux, loaded by step 01.) Topology matching is in topo.py.
+Also turns the seed's loads into constant power, so a scaled hour moves one number per load.
 """
 import pandas as pd
 from . import pw
@@ -14,6 +15,9 @@ SHUNT_MAX_ITERATIONS = 10       # Max one-at-a-time shunt switching passes.
 SWING_ID = 'xx'     # ID of the giant swing generator.
 SWING_MW_MAX = 20000.0      # Giant swing MW limits. With [area] balance_at_swing_limits, scaling rebalances
 SWING_MW_MIN = -20000.0     # gen & load whenever the swing goes past them.
+
+CONVERT_TOL_MW = 1.0        # Constant-power conversion: warn when an area's (or the swing's) net MW or Mvar moves more than this.
+CONVERT_MAX_FAILED = 50     # Stop bisecting after this many loads fail to convert; the rest keep their current/impedance/dist gen.
 
 # ------------------ Shunts ------------------
 def suggested_shunt_status(df: pd.DataFrame, vlow: float, vhigh: float) -> pd.Series:
@@ -174,3 +178,105 @@ def create_giant_swing(SimAuto, bus_num: int) -> pd.DataFrame:
 def disable_area_agc(SimAuto):
     """Turns off MW AGC in the solution options, so the swing takes up every imbalance while scaling."""
     pw.set_df(SimAuto, 'Sim_Solution_Options_Value', pd.DataFrame({'Option':['ChkMWAGC'], 'Value':['NO']}), ['Option', 'Value'])
+
+# ------------------ Constant-power loads ------------------
+LOAD_CONVERT_FIELDS = ['BusNum', 'ID', 'SMW', 'SMvar', 'IMW', 'IMvar', 'ZMW', 'ZMvar', 'DistMWInput', 'DistMvarInput', 'DistStatus']
+
+def constant_power_rows(load: pd.DataFrame) -> pd.DataFrame:
+    """
+    Closed loads as constant power: S = what the load draws now (NetMW/NetMvar, after voltage and dist gen), no I, Z or dist gen.
+    Input columns: BusNum, ID, ObjectID, AreaNumber, Status, NetMW, NetMvar. The result is indexed by ObjectID.
+    A load on a dead bus has NetMW 0 and so becomes 0 MW. That is fine: step 02 turns islanded loads Open anyway.
+    """
+    out = load[load['Status'] == 'Closed'].set_index('ObjectID')[['BusNum', 'ID', 'AreaNumber', 'NetMW', 'NetMvar']]
+    out = out.assign(SMW=out['NetMW'], SMvar=out['NetMvar'])
+    out[['IMW', 'IMvar', 'ZMW', 'ZMvar', 'DistMWInput', 'DistMvarInput']] = 0.0
+    out['DistStatus'] = 'Open'
+    return out.drop(columns=['NetMW', 'NetMvar'])
+
+def _swing_mw(SimAuto) -> float:
+    """MW of the Closed gens on the swing buses. (Not area.swing_mw: area imports this module.)"""
+    gen = pw.get_df(SimAuto, 'Gen', {'BusNum': int, 'Status': str, 'MW': float})
+    return float(gen.loc[(gen['Status'] == 'Closed') & gen['BusNum'].isin(slack_buses(SimAuto)), 'MW'].sum())
+
+def _read_loads(SimAuto) -> pd.DataFrame:
+    return pw.get_df(SimAuto, 'Load', {
+        'ObjectID': str, 'BusNum': int, 'ID': str, 'AreaNumber': int, 'Status': str, 'MW': float, 'SMW': float, 'SMvar': float,
+        'IMW': float, 'IMvar': float, 'ZMW': float, 'ZMvar': float, 'NetMW': float, 'NetMvar': float, 'DistMW': float,
+        'DistStatus': str, 'DistMWInput': float, 'DistMvarInput': float})
+
+def _area_net(load: pd.DataFrame) -> pd.DataFrame:
+    closed = load[load['Status'] == 'Closed']
+    return pd.DataFrame({'Loads': closed.groupby('AreaNumber').size(),
+                         'Nominal MW': closed.groupby('AreaNumber')[['SMW', 'IMW', 'ZMW']].sum().sum(axis=1),
+                         'Dist MW': closed.groupby('AreaNumber')['DistMW'].sum(),
+                         'Net MW': closed.groupby('AreaNumber')['NetMW'].sum(),
+                         'Net Mvar': closed.groupby('AreaNumber')['NetMvar'].sum()})
+
+def convert_loads_to_constant_power(SimAuto) -> dict[str, pd.DataFrame]:
+    """
+    Turns every Closed load into constant power at its solved NetMW/NetMvar, in one bisected edit (loads which make the
+    case diverge keep their current/impedance/dist gen; step 02 ramps those to 0). Open loads only lose their dist gen.
+    Run on the open, solved case with AGC off. Warns, never stops, except when NetMW/NetMvar come back blank.
+    Returns the sheets for the log: load_conversion (net MW/Mvar per area and the swing, before and after), and
+    load_conversion_failed when there are any.
+    """
+    if not pw.solve(SimAuto):
+        print('WARNING: The case does not solve, so loads were NOT converted to constant power. Step 02 ramps their current, impedance and dist gen to 0.')
+        return {}
+    before = _read_loads(SimAuto)      # NetMW is read before any write.
+    swing_before = _swing_mw(SimAuto)
+    closed = before['Status'] == 'Closed'
+    blank = before.loc[closed, ['NetMW', 'NetMvar']].isna().any(axis=1).sum()
+    if blank:
+        # A wrong field name might come back as blanks rather than an error; writing them would zero every load.
+        raise SystemExit(f'{blank} Closed loads have a blank NetMW or NetMvar. Check those Load field names in PowerWorld.')
+
+    # Open loads inject nothing: clear their dist gen so it can't come back on, and leave their S, I and Z alone.
+    dist_on = (before['Status'] == 'Open') & ((before['DistStatus'] != 'Open') | (before['DistMWInput'] != 0) | (before['DistMvarInput'] != 0))
+    open_rows = before[dist_on].set_index('ObjectID')[['BusNum', 'ID']].assign(DistStatus='Open', DistMWInput=0.0, DistMvarInput=0.0)
+    if len(open_rows):
+        with pw.trial(SimAuto) as t:
+            pw.set_df(SimAuto, 'Load', open_rows, ['BusNum', 'ID', 'DistStatus', 'DistMWInput', 'DistMvarInput'])
+        if not t.ok:
+            print(f'WARNING: Did not solve after clearing dist gen on {len(open_rows)} Open loads. Rolled back.')
+
+    rows = constant_power_rows(before)
+    failed = pw.set_df_bisect(SimAuto, 'Load', rows, LOAD_CONVERT_FIELDS, limit=CONVERT_MAX_FAILED)
+    pw.solve(SimAuto)       # The last bisect trial may have ended on a rolled-back state.
+    after = _read_loads(SimAuto)
+    swing_after = _swing_mw(SimAuto)
+
+    # Sheet: one row per area, then the swing.
+    b, a = _area_net(before), _area_net(after)
+    sheet = pd.DataFrame({'Loads': b['Loads'], 'Nominal MW': b['Nominal MW'], 'Dist MW': b['Dist MW'],
+                          'Net MW Before': b['Net MW'], 'Net MW After': a['Net MW'].reindex(b.index).fillna(0.0),
+                          'Net Mvar Before': b['Net Mvar'], 'Net Mvar After': a['Net Mvar'].reindex(b.index).fillna(0.0)})
+    sheet.insert(5, 'Diff MW', sheet['Net MW After'] - sheet['Net MW Before'])
+    sheet['Diff Mvar'] = sheet['Net Mvar After'] - sheet['Net Mvar Before']
+    sheet = sheet.rename_axis('AreaNumber').reset_index().astype({'AreaNumber': object})
+    swing = pd.DataFrame([{'AreaNumber': 'Swing', 'Net MW Before': swing_before, 'Net MW After': swing_after, 'Diff MW': swing_after - swing_before}])
+    sheet = pd.concat([sheet, swing], ignore_index=True)
+
+    n_closed = int(closed.sum())
+    print(f'Loads to constant power: {n_closed} loads, net {before.loc[closed, "NetMW"].sum():.1f} MW '
+          f'(dist gen {before.loc[closed, "DistMW"].sum():.1f} MW folded in)')
+    moved = sheet[(sheet['AreaNumber'] != 'Swing') & ((sheet['Diff MW'].abs() > CONVERT_TOL_MW) | (sheet['Diff Mvar'].abs() > CONVERT_TOL_MW))]
+    if len(moved):
+        print(f'WARNING: Net load changed by more than {CONVERT_TOL_MW} MW/Mvar in area(s) {", ".join(map(str, moved["AreaNumber"]))}. See load_conversion.')
+    if abs(swing_after - swing_before) > CONVERT_TOL_MW:
+        print(f'WARNING: The swing moved {swing_after - swing_before:.1f} MW in the conversion (more than {CONVERT_TOL_MW} MW). See load_conversion.')
+    done = after[after['ObjectID'].isin(rows.index.difference(failed)) & (after['Status'] == 'Closed')]
+    off = ((done['MW'] - done['SMW']).abs() > CONVERT_TOL_MW) | (done['DistMW'].abs() > 1e-6)
+    if off.any():
+        print(f'WARNING: {int(off.sum())} converted loads still draw MW different from their SMW or carry dist gen '
+              '(PowerWorld may reduce load at low voltage). Check them in the case.')
+    if failed:
+        capped = f' (stopped bisecting after {CONVERT_MAX_FAILED} failures; the rest were not tried)' if len(failed) >= CONVERT_MAX_FAILED else ''
+        print(f'WARNING: {len(failed)} loads could not be converted without diverging{capped}. They keep current/impedance/dist gen; step 02 ramps those to 0.')
+
+    out = {'load_conversion': sheet}
+    if failed:
+        out['load_conversion_failed'] = before[before['ObjectID'].isin(failed)].set_index('ObjectID')[
+            ['BusNum', 'ID', 'AreaNumber', 'SMW', 'IMW', 'ZMW', 'DistMW', 'NetMW', 'NetMvar']]
+    return out

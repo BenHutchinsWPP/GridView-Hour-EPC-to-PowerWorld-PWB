@@ -103,26 +103,35 @@ def creating(SimAuto):
     finally:
         SimAuto.CreateIfNotFound = False
 
-def set_df_bisect(SimAuto, table: str, df: pd.DataFrame, fields: list[str], solves: int = 1) -> list:
+def set_df_bisect(SimAuto, table: str, df: pd.DataFrame, fields: list[str], solves: int = 1, limit: int | None = None) -> list:
     """
     Attempts to apply all rows of df in one bulk edit.
     If it fails, rolls back and bisects df into two halves to test recursively until reaching 1 row.
     Each attempt must pass `solves` solves.
     Returns the index labels of rows which could not be applied without divergence.
+    limit: stop bisecting once this many single rows have failed. Rows not yet tried are returned as not applied too.
     """
-    if len(df) == 0:
-        return []
+    failed: list = []
 
-    with trial(SimAuto, solves=solves) as t:
-        set_df(SimAuto, table, df, fields)
-    if t.ok:
-        return []
+    def apply(part: pd.DataFrame):
+        if len(part) == 0:
+            return
+        if limit is not None and len(failed) >= limit:
+            failed.extend(part.index)       # Not tried.
+            return
+        with trial(SimAuto, solves=solves) as t:
+            set_df(SimAuto, table, part, fields)
+        if t.ok:
+            return
+        if len(part) == 1:
+            failed.append(part.index[0])
+            return
+        mid = len(part) // 2
+        apply(part.iloc[:mid])
+        apply(part.iloc[mid:])
 
-    if len(df) == 1:
-        return [df.index[0]]
-
-    mid = len(df) // 2
-    return set_df_bisect(SimAuto, table, df.iloc[:mid], fields, solves) + set_df_bisect(SimAuto, table, df.iloc[mid:], fields, solves)
+    apply(df)
+    return failed
 
 print_opened = True    # Step 02 turns this off: it opens the seed three times an hour.
 print_solve_errors = True   # Step 02 turns this off: its step lines say which steps diverged.
