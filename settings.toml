@@ -7,11 +7,11 @@
 # "topology": make the seed match the GridView topology (missing elements, branch statuses), then match every
 #         gen and load to its own EPC value.
 mode = "area"
-case_format = "PWB23"
+case_format = "PWB24"                   # PowerWorld Simulator 24 or later opens the saved cases.
 
 # Swing. true: add a giant swing generator (ID "xx") to take up the imbalance while scaling.
 # false: use the case's own swing (the gens on its slack bus).
-create_giant_swing = true
+create_giant_swing = false
 # Where the giant swing goes: "slack" (the case's slack bus), "max_fault_duty" (computes fault duty on every bus: slow),
 # or a bus number.
 swing_bus = "slack"
@@ -24,8 +24,8 @@ balance_swing = true
 # Seed preparation (step 01).
 adjust_seed_shunts = true
 gen_terminal_voltage_control = true     # Scripts/GenTerminalVoltageControl.aux
-compute_pvqv = true                     # PVQV self-sensitivities (Prepared/pvqv.csv). Keep on, so use_pvqv can be turned on
-                                        # in step 02 without rerunning step 01.
+compute_pvqv = false                    # PVQV self-sensitivities (Prepared/pvqv.csv). Needed only for use_pvqv (step 02
+                                        # stops with a message if use_pvqv is on without it: rerun step 01 with this on).
 
 # Scaling (step 02).
 # Two extra exclusions, off by default (bisecting the scaling step finds the gens/loads which diverge). Turn them on for a
@@ -36,7 +36,7 @@ use_pvqv = false        # Exclude gens/loads whose linear PVQV voltage change es
 [area]
 # Unit commitment per area & GenType: bring gens online / take them offline to suit the target.
 commit = true
-commit_max_cf = 0.9                     # Match types: commit until the target is at most this of online MWMax.
+commit_max_cf = 0.94                    # Match types: commit until the target is at most this of online MWMax.
 # Capacity types: each area's group is one injection: every unit online, all at the same % of MWMax, matching the
 # group's EPC total (each unit's own EPC MW is ignored). Every other type matches unit by unit (key basis), then scales.
 capacity_types = ["Wind", "Solar", "Battery Storage"]
@@ -55,7 +55,7 @@ loss_exponent = 2.0
 # goes onto the other units of their area & GenType, then the area's other gens (or their area's load), before the
 # final balance. The areas sheet shows both as Make-up MW.
 makeup = true
-balance_tol_mw = 1.0
+balance_tol_mw = 25.0
 balance_max_rounds = 10
 # While scaling, balance once the swing goes outside its band. The giant swing: further than balance_trigger_mw from 0
 # (0 = not used), or (balance_at_swing_limits) past its MWMax / MWMin; with both, whichever comes first. The case's own
