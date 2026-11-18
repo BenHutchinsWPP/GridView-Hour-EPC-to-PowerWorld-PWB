@@ -6,7 +6,10 @@ it names, by upper-cased key: [scale] exclude_vmin = 0.88 sets Scripts/scale.py'
 defaults, so a key left out of the file keeps its default, and an unknown key (one not in SETTINGS) is an error.
 """
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
+from types import ModuleType
+from typing import Any
 from . import area, prep, pw, scale, topo
 
 DEFAULT_FP = Path(__file__).resolve().parents[1] / 'settings.toml'
@@ -45,9 +48,9 @@ SETTINGS = {
 CODE_KEYS = {(area, 'UNIT_GENTYPE'), (area, 'FUEL_GENTYPE'), (area, 'MANUAL_UNIT_TYPES')}
 FUEL = 'fuel'   # In [area.unit_gentype]: decide by the fuel type.
 
-def _check_type(fp, what: str, default, value, allow_int: bool = False):
+def _check_type(fp: Path, what: str, default: Any, value: Any, allow_int: bool = False) -> None:
     """The value must be of the default's kind: bool, number, text, list (for lists and sets) or table."""
-    def kind(v):
+    def kind(v: Any) -> str | None:
         if isinstance(v, bool):
             return 'true/false'
         if isinstance(v, (int, float)):
@@ -63,14 +66,14 @@ def _check_type(fp, what: str, default, value, allow_int: bool = False):
     if want is not None and got != want and not (allow_int and got == 'number'):
         raise ValueError(f'{fp}: {what} must be {want}, not {value!r}')
 
-def _need(fp, ok: bool, what: str):
+def _need(fp: Path, ok: bool, what: str) -> None:
     if not ok:
         raise ValueError(f'{fp}: {what}')
 
-def _is_int(v) -> bool:
+def _is_int(v: Any) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
 
-def _check_ranges(fp, get):
+def _check_ranges(fp: Path, get: Callable[[ModuleType, str], Any]) -> None:
     """Rejects values which hang the engine or silently disable it. `get(module, NAME)`: the value the file would set."""
     for name in ('INITIAL_STEP', 'MAX_STEP', 'STEP_SOLVES', 'FINAL_MAX_ROUNDS'):
         _need(fp, _is_int(get(scale, name)), f'[scale] {name.lower()} must be a whole number')

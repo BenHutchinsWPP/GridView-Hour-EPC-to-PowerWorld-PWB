@@ -8,7 +8,9 @@ make-up, balancing the swing) are in ReadMe.md, "Area Mode".
 
 Working tables are in the shape Scripts/scale.py expects (see its docstring), plus AreaNumber, GenType and Method.
 """
+from collections.abc import Callable, Collection, Iterable, Sequence
 from collections.abc import Set as AbstractSet
+from pathlib import Path
 import numpy as np
 import pandas as pd
 from . import prep, pw, scale
@@ -81,7 +83,7 @@ GEN_FIELDS: dict[str, type] = {**_KEY, 'Status': str, 'MW': float, 'MWSetPoint':
 LOAD_P = ['SMW', 'IMW', 'ZMW']
 LOAD_Q = ['SMvar', 'IMvar', 'ZMvar']
 
-def read_case(SimAuto) -> dict[str, pd.DataFrame]:
+def read_case(SimAuto: pw.SimAutoApi) -> dict[str, pd.DataFrame]:
     """Loads & gens of the open case (PWB, or an EPC opened in PowerWorld)."""
     return {'Load': pw.get_df(SimAuto, 'Load', LOAD_FIELDS), 'Gen': pw.get_df(SimAuto, 'Gen', GEN_FIELDS)}
 
@@ -267,7 +269,7 @@ def spread_by_group(ask: pd.Series, mw: pd.Series, cap: pd.Series, area: pd.Seri
     x = np.zeros(len(m))
     by_group = pd.Series(m).groupby([area.to_numpy(), group.to_numpy()]).indices if len(m) else {}
     by_area = pd.Series(m).groupby(area.to_numpy()).indices if len(m) else {}
-    def place(a, rows):
+    def place(a: float, rows: pd.Index | np.ndarray | Sequence[int]) -> float:
         if abs(a) < 1e-9 or not len(rows):
             return a
         if a > 0:
@@ -544,7 +546,7 @@ def shortfall(epc_gen: pd.DataFrame, case_gen: pd.DataFrame, gen_report: pd.Data
     out = pd.concat([b[2] for b in blocks], ignore_index=True)
     return out.astype({c: 'Int64' for c in ('EPC BusNum', 'PWB BusNum', 'EPC Units', 'PWB Units')})   # Blank, not 101.0.
 
-def build_targets(epc: dict[str, pd.DataFrame], case: dict[str, pd.DataFrame], swing_buses=(),
+def build_targets(epc: dict[str, pd.DataFrame], case: dict[str, pd.DataFrame], swing_buses: Collection[int] = (),
                   island_by_bus: pd.Series | None = None) -> tuple[dict, dict]:
     """
     Returns (targets {'Gen', 'Load'} for scale.iterate_to_gen_load_targets(), reports {'area_load', 'area_gen', ...}).
@@ -620,7 +622,7 @@ def _nonconforming_report(load_report: pd.DataFrame, case_nonc: pd.DataFrame, ke
     report = report.reindex(index).fillna(0.0).join(cols.reindex(index)).fillna(0.0)
     return report.reset_index()
 
-def swing_epc(epc_gen: pd.DataFrame, case_gen: pd.DataFrame, swing_buses) -> pd.DataFrame:
+def swing_epc(epc_gen: pd.DataFrame, case_gen: pd.DataFrame, swing_buses: Collection[int]) -> pd.DataFrame:
     """
     The case's own slack gens (Closed, on swing_buses) whose key is also in the EPC: 'Seed MW' (their solved MW, or
     MWSetPoint if MW isn't read) and 'EPC MW' (0 if Open in the EPC; kept within _limits(): 0 to MWMax), by ObjectID. The balances aim each at its EPC MW
@@ -640,7 +642,7 @@ def swing_epc(epc_gen: pd.DataFrame, case_gen: pd.DataFrame, swing_buses) -> pd.
     return pd.DataFrame({'Seed MW': seed.to_numpy(dtype=float), 'EPC MW': goal.to_numpy(dtype=float)},
                         index=pd.Index(slack['ObjectID'], name='ObjectID'))
 
-def _add_islanded(gen: pd.DataFrame, load: pd.DataFrame, i_gen: pd.DataFrame, i_load: pd.DataFrame):
+def _add_islanded(gen: pd.DataFrame, load: pd.DataFrame, i_gen: pd.DataFrame, i_load: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     """
     build_targets(): the islanded gens/loads Closed in the seed (a second island's slack gens too; not the giant
     swing), as excluded target rows targeted Open at 0 MW, which step 02 writes before scaling
@@ -703,7 +705,7 @@ AREAS_COLUMNS = ['AreaNumber', 'Group', 'Seed MW', 'Target MW', 'Unmet MW', 'Not
                  'Target Mvar', 'Final Mvar', 'Online Seed', 'Online Final', 'Seed Loss MW', 'Est. Loss MW', 'Final Loss MW', 'Note']
 LEDGER_TOL_MW = 1.0     # A row's Final further than this from its ledger is noted as unexplained.
 
-def _by_group(df: pd.DataFrame, value, group=None) -> pd.Series:
+def _by_group(df: pd.DataFrame, value: pd.Series | np.ndarray | Sequence[float] | float, group: pd.Series | np.ndarray | None = None) -> pd.Series:
     """Sum of `value` (aligned to df's rows) by (AreaNumber, Group). Group: GenType of a gen table, else 'Load'."""
     if group is None:
         group = pd.Series('Load', index=df.index)
@@ -714,7 +716,7 @@ def _by_group(df: pd.DataFrame, value, group=None) -> pd.Series:
     return frame.groupby(['AreaNumber', 'Group'])['v'].sum()
 
 def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame], targets: dict[str, pd.DataFrame] | None = None,
-          runs=(), swing_buses=(), final_loss: pd.Series | None = None) -> pd.DataFrame:
+          runs: Iterable[scale.Run] = (), swing_buses: Collection[int] = (), final_loss: pd.Series | None = None) -> pd.DataFrame:
     """
     The `areas` sheet: a row per (AreaNumber, Group), Group a GenType or 'Load' (AREAS_COLUMNS). The ledger per row:
         Final = Target - Unmet - Not Reached + Make-up + Balance
@@ -848,7 +850,7 @@ def _area_notes(out: pd.DataFrame, plan: pd.DataFrame, ledger: pd.Series) -> lis
         notes.append('; '.join(n))
     return notes
 
-def compute_targets(SimAuto, gv_fp, pw_fp) -> tuple[dict, dict]:
+def compute_targets(SimAuto: pw.SimAutoApi, gv_fp: Path, pw_fp: Path) -> tuple[dict, dict]:
     """Opens the EPC and the PWB, and returns build_targets() of their loads & gens. Closes the case."""
     pw.open_case(SimAuto, gv_fp)
     epc = read_case(SimAuto)
@@ -868,7 +870,7 @@ def compute_targets(SimAuto, gv_fp, pw_fp) -> tuple[dict, dict]:
 LOSS_EXPONENT = 2.0
 LOSS_RATIO_MAX = 2.0    # An area's load ratio is capped at this (a small-load area could otherwise get huge losses).
 
-def area_losses(SimAuto) -> pd.Series:
+def area_losses(SimAuto: pw.SimAutoApi) -> pd.Series:
     """LossMW of each area of the open case, by AreaNumber."""
     df = pw.get_df(SimAuto, 'Area', {'Number': int, 'LossMW': float})
     return pd.Series(df['LossMW'].to_numpy(), index=pd.Index(df['Number'].to_numpy(), name='AreaNumber'), dtype=float)
@@ -883,7 +885,7 @@ def loss_estimate(targets: dict[str, pd.DataFrame], area_load: pd.DataFrame, see
     """
     l = targets['Load']
     l = l[scale.included(l)]
-    def total(suffix):
+    def total(suffix: str) -> pd.Series:
         p = l[[c + suffix for c in LOAD_P]].sum(axis=1).where(l['Status' + suffix] == 'Closed', 0.0).clip(lower=0.0)
         return p.groupby(l['AreaNumber']).sum()
     fixed = area_load.set_index('AreaNumber')['Left As Is MW'].clip(lower=0.0)
@@ -905,13 +907,13 @@ BALANCE_AT_SWING_LIMITS = False     # ...or past the swing unit's own MWMax / MW
 MIN_OWN_RANGE_MW = 100.0            # With no trigger, the case's own slack needs a range at least this wide to be balanced midrun.
 
 
-def swing_units(gen: pd.DataFrame, slack_buses) -> pd.DataFrame:
+def swing_units(gen: pd.DataFrame, slack_buses: Collection[int]) -> pd.DataFrame:
     """The giant swing (ID prep.SWING_ID) if the case has one Closed, else every Closed gen on a slack bus."""
     on = gen[closed(gen)]
     swing = on[on['ID'] == prep.SWING_ID]
     return swing if len(swing) else on[on['BusNum'].isin(slack_buses)]
 
-def swing_mw(gen: pd.DataFrame, slack_buses) -> tuple[float, list]:
+def swing_mw(gen: pd.DataFrame, slack_buses: Collection[int]) -> tuple[float, list]:
     """MW on the swing, and the swing's bus numbers."""
     swing = swing_units(gen, slack_buses)
     return float(swing['MW'].sum()), sorted(set(swing['BusNum']))
@@ -924,7 +926,7 @@ def _limits(units: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     a, b = units['MWMin'].astype(float).fillna(-np.inf), units['MWMax'].astype(float).fillna(np.inf)
     return a.where(a < b, b).clip(upper=0.0), a.where(a > b, b)
 
-def swing_band(gen: pd.DataFrame, slack_buses) -> tuple[float, float]:
+def swing_band(gen: pd.DataFrame, slack_buses: Collection[int]) -> tuple[float, float]:
     """
     (low, high) MW the swing may sit within while scaling, before midrun_balancer() rebalances. The case's own slack
     gens (no giant swing): their _limits(), 0 to MWMax (summed). The giant swing: the narrowest of +/- BALANCE_TRIGGER_MW
@@ -942,7 +944,7 @@ def swing_band(gen: pd.DataFrame, slack_buses) -> tuple[float, float]:
         lo, hi = max(lo, float(swing['MWMin'].sum())), min(hi, float(swing['MWMax'].sum()))
     return lo, hi
 
-def swing_goal(gen: pd.DataFrame, slack_buses, epc: pd.DataFrame | None = None) -> tuple[float, float]:
+def swing_goal(gen: pd.DataFrame, slack_buses: Collection[int], epc: pd.DataFrame | None = None) -> tuple[float, float]:
     """
     (low, high) MW the swing should end within. The giant swing: 0. The case's own slack gens: each one in `epc`
     (swing_epc()) at its EPC MW kept within _limits(), 0 to MWMax (an EPC MW past a limit, or 0 for a slack Open in the
@@ -957,7 +959,7 @@ def swing_goal(gen: pd.DataFrame, slack_buses, epc: pd.DataFrame | None = None) 
     goal = epc_mw[matched].clip(lower=lo[matched], upper=hi[matched])
     return float(goal.sum() + lo[~matched].sum()), float(goal.sum() + hi[~matched].sum())
 
-def balance_skips(SimAuto, final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFrame] | None = None) -> set:
+def balance_skips(SimAuto: pw.SimAutoApi, final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFrame] | None = None) -> set:
     """
     ObjectIDs a balance leaves alone: gens/loads on buses outside the main island (the swing can't take what they
     move) or outside the scaling voltage band (the balance's own scaling would hold them at once, so their share would
@@ -972,12 +974,12 @@ def balance_skips(SimAuto, final: dict[str, pd.DataFrame], targets: dict[str, pd
         skip |= set(df.index[~scale.included(df) | scale.held(df)])
     return skip
 
-def movable_gens(gen: pd.DataFrame, swing_buses, skip: AbstractSet = frozenset()) -> pd.DataFrame:
+def movable_gens(gen: pd.DataFrame, swing_buses: Collection[int], skip: AbstractSet = frozenset()) -> pd.DataFrame:
     """Gens a balance or make-up may move (a copy): scalable_gens(), Closed, MWSetPoint > 0, not on a swing bus, not in skip (ObjectIDs)."""
     gen = scalable_gens(gen)
     return gen[closed(gen) & (gen['MWSetPoint'] > 0) & ~gen['BusNum'].isin(swing_buses) & ~gen['ObjectID'].isin(skip)].copy()
 
-def balance_targets(final: dict[str, pd.DataFrame], swing: float, swing_buses, skip: AbstractSet = frozenset()) -> dict[str, pd.DataFrame]:
+def balance_targets(final: dict[str, pd.DataFrame], swing: float, swing_buses: Collection[int], skip: AbstractSet = frozenset()) -> dict[str, pd.DataFrame]:
     """
     Targets which move `swing` MW off the swing onto generation only; load is never moved (it stays on its EPC target).
     (Swing at +X MW: gens up X.) One factor on every Closed gen with MW > 0 (not on a swing bus, not a DC tie), so each
@@ -1020,7 +1022,7 @@ def prebalance_targets(targets: dict[str, pd.DataFrame], loss_change: float = 0.
     p = l_in[LOAD_P].sum(axis=1).where(on(l_in, ''), 0.0)
     p_target = l_in[[f'{c}_Target' for c in LOAD_P]].sum(axis=1).where(on(l_in, '_Target'), 0.0)
     gen_mw = lambda suffix: g_in['MWSetPoint' + suffix].where(on(g_in, suffix), 0.0).sum()
-    def dist(suffix):       # Dist gen injects only while the load and its dist gen are both Closed.
+    def dist(suffix: str) -> float:       # Dist gen injects only while the load and its dist gen are both Closed.
         return l_in['DistMWInput' + suffix].where(on(l_in, suffix) & (l_in['DistStatus' + suffix] == 'Closed'), 0.0).sum()
     swing = ((p_target - p).sum() - (gen_mw('_Target') - gen_mw('')) - (dist('_Target') - dist(''))
              + loss_change + swing_change)
@@ -1046,7 +1048,7 @@ def mw_changes(moved: dict[str, pd.DataFrame]) -> dict[str, float]:
     return {'Gen MW Change': (moved['Gen']['MWSetPoint'] - moved['Gen']['MWSetPoint_Seed']).sum(),
             'Load MW Change': (moved['Load'][LOAD_P].sum(axis=1) - moved['Load']['P_Seed']).sum()}
 
-def run_correction(SimAuto, run: scale.Run, label: str) -> bool:
+def run_correction(SimAuto: pw.SimAutoApi, run: scale.Run, label: str) -> bool:
     """
     Scales run.moved (balance_targets() / makeup_targets() tables) from where the case is, starting at the largest
     step. The engine edits run.moved in place, so afterwards it holds what was applied. Sets run.log. On a
@@ -1064,7 +1066,7 @@ def run_correction(SimAuto, run: scale.Run, label: str) -> bool:
         run.note = '; '.join(filter(None, [run.note, f'stopped: {e}']))
         return False
 
-def balance_swing(SimAuto, scaled: dict[str, pd.DataFrame] | None = None,
+def balance_swing(SimAuto: pw.SimAutoApi, scaled: dict[str, pd.DataFrame] | None = None,
                   epc: pd.DataFrame | None = None) -> list[scale.Run]:
     """
     With the case open: moves the swing onto the whole case's gen (see balance_targets()) until it is within
@@ -1101,7 +1103,7 @@ def balance_swing(SimAuto, scaled: dict[str, pd.DataFrame] | None = None,
             runs[-1].note = '; '.join(filter(None, [runs[-1].note, 'stopped at max rounds']))
     return runs
 
-def _balance_round(SimAuto, i, slack, epc, scaled, runs) -> bool:
+def _balance_round(SimAuto: pw.SimAutoApi, i: int, slack: Collection[int], epc: pd.DataFrame | None, scaled: dict[str, pd.DataFrame] | None, runs: list[scale.Run]) -> bool:
     """One balance_swing() round; False once the swing is at its goal or the round's scaling stopped."""
     final = read_case(SimAuto)
     swing, swing_buses = swing_mw(final['Gen'], slack)
@@ -1116,7 +1118,7 @@ def _balance_round(SimAuto, i, slack, epc, scaled, runs) -> bool:
     runs.append(run)
     return run_correction(SimAuto, run, f'Final balance {i + 1}')
 
-def rescale_targets(targets: dict[str, pd.DataFrame], moved: dict[str, pd.DataFrame]):
+def rescale_targets(targets: dict[str, pd.DataFrame], moved: dict[str, pd.DataFrame]) -> None:
     """
     After a balance (`moved`: balance_targets() tables, after scaling) in the middle of scaling to `targets`:
     works out the factor each moved row was moved by, and has scale.rescale() apply it to the rest of the scaling, so
@@ -1128,8 +1130,8 @@ def rescale_targets(targets: dict[str, pd.DataFrame], moved: dict[str, pd.DataFr
 # ------------------ Make-up ------------------
 MAKEUP = True   # Keep area gen totals: plan Unmet and excluded units' shortfall go onto the group's, then the area's, other units.
 
-def makeup_targets(final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFrame], swing_buses,
-                   skip: AbstractSet = frozenset(), nonconforming=frozenset()) -> tuple[dict[str, pd.DataFrame], dict[str, float]] | None:
+def makeup_targets(final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFrame], swing_buses: Collection[int],
+                   skip: AbstractSet = frozenset(), nonconforming: Iterable[str] = frozenset()) -> tuple[dict[str, pd.DataFrame], dict[str, float]] | None:
     """
     After the main scaling (area mode): per (AreaNumber, GenType) and per AreaNumber's load, the shortfall S = target -
     value of the main rows which were excluded (held units are excluded at the end of the main run; islanded rows are
@@ -1142,7 +1144,8 @@ def makeup_targets(final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFra
     Returns (tables in balance_targets()' shape, {'Gen': MW asked, 'Load': MW asked}), or None if no group is short
     by 1 MW or more.
     """
-    def shortfall(df, cur, tgt, group):
+    def shortfall(df: pd.DataFrame, cur: Callable[[pd.DataFrame], pd.Series], tgt: Callable[[pd.DataFrame], pd.Series],
+                  group: Callable[[pd.DataFrame], pd.Series] | None) -> pd.Series:
         out = df[~scale.included(df) & ~scale.is_island_reason(df['ExclusionReason'])]
         return _by_group(out, tgt(out) - cur(out), group(out) if group else None)
     tp = lambda df: df[[f'{c}_Target' for c in LOAD_P]].sum(axis=1)
@@ -1179,7 +1182,7 @@ def makeup_targets(final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFra
         df['ExclusionReason'] = ''
     return {t: df.set_index('ObjectID') for t, df in tables.items()}, {'Gen': float(s_gen.sum()), 'Load': float(s_load.sum())}
 
-def makeup(SimAuto, targets: dict[str, pd.DataFrame], nonconforming=frozenset()) -> list[scale.Run]:
+def makeup(SimAuto: pw.SimAutoApi, targets: dict[str, pd.DataFrame], nonconforming: Iterable[str] = frozenset()) -> list[scale.Run]:
     """
     With the case open, after the main scaling: runs makeup_targets() (a `makeup` run; none if nothing is short).
     A make-up which fails part-way keeps what it applied and the hour carries on. areas() reads the Run's moved tables.
@@ -1200,7 +1203,8 @@ def makeup(SimAuto, targets: dict[str, pd.DataFrame], nonconforming=frozenset())
     print(f'Make-up: {run.note}.')
     return [run]
 
-def midrun_balancer(SimAuto, epc: pd.DataFrame | None = None):
+def midrun_balancer(SimAuto: pw.SimAutoApi, epc: pd.DataFrame | None = None
+                    ) -> tuple[Callable[[pw.SimAutoApi, dict[str, pd.DataFrame], int], float | None], list[scale.Run]]:
     """
     Returns (after_step, runs) for scale.iterate_to_gen_load_targets(). After each step, if the swing is outside
     its band, moves it onto the whole case's gen (balance_targets()), and keeps that in the scaling still to come
@@ -1238,10 +1242,10 @@ def midrun_balancer(SimAuto, epc: pd.DataFrame | None = None):
     if not own_slack and not (np.isfinite(lo) or np.isfinite(hi)):
         print('Midrun balancing off: balance_trigger_mw is 0 and balance_at_swing_limits is false.')
 
-    def expected(progress):
+    def expected(progress: int) -> float:
         return float(np.clip(start + (end - start) * progress / scale.RESOLUTION, lo, hi))
 
-    def band(progress):
+    def band(progress: int) -> tuple[float, float]:
         if not own_slack:
             return state['lo'], state['hi']
         if own_off:
@@ -1260,7 +1264,7 @@ def midrun_balancer(SimAuto, epc: pd.DataFrame | None = None):
     inside = min(BALANCE_TRIGGER_MW / 2 if BALANCE_TRIGGER_MW else np.inf, 0.25 * (hi - lo) if np.isfinite(hi - lo) else np.inf)
     inside = inside if np.isfinite(inside) else 0.0
 
-    def aim_for(swing, progress):
+    def aim_for(swing: float, progress: int) -> float:
         if own_slack:
             return float(np.clip(expected(progress), lo + inside, hi - inside))
         # Balance to a point inside the band, not to its edge, so the next small drift doesn't set off another balance:
@@ -1268,12 +1272,12 @@ def midrun_balancer(SimAuto, epc: pd.DataFrame | None = None):
         if np.isfinite(lo) and np.isfinite(hi):
             return float(np.clip(0.0, lo + 0.25 * (hi - lo), hi - 0.25 * (hi - lo)))
         return float(np.clip(0.0, lo, hi))
-    def ref(progress):     # Where the swing should be.
+    def ref(progress: int) -> float:     # Where the swing should be.
         return expected(progress) if own_slack else aim_for(0.0, progress)
     state = {'lo': lo, 'hi': hi, 'extra': 0.0, 'p': 0, 'dev': swing_mw(gen0, slack)[0] - ref(0)}
     runs: list[scale.Run] = []
 
-    def step_cap(progress, swing_now, swing_after):
+    def step_cap(progress: int, swing_now: float, swing_after: float) -> int | None:
         # Drift per unit of progress since the last check, away from where the swing should be; the next step may
         # carry the swing at most to the edge of its band (as widened) in the direction it drifts.
         dev_now, dev_after = swing_now - ref(progress), swing_after - ref(progress)
@@ -1285,7 +1289,7 @@ def midrun_balancer(SimAuto, epc: pd.DataFrame | None = None):
             return None
         return max(1, int(room / abs(rate)))
 
-    def after_step(SimAuto, targets, progress):
+    def after_step(SimAuto: pw.SimAutoApi, targets: dict[str, pd.DataFrame], progress: int) -> int | None:
         gen = pw.get_df(SimAuto, 'Gen', GEN_FIELDS)
         swing, swing_buses = swing_mw(gen, slack)
         b_lo, b_hi = band(progress)

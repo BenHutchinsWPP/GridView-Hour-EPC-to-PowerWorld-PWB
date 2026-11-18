@@ -10,6 +10,7 @@ Gens and loads are handled by the same code. Their working tables ("targets") ar
     HeldReason       '' while the row is scaled. Otherwise, why it is held back for now (it is retried later).
     ExclusionReason  '' while the row is scaled or held. Otherwise, why it was excluded for good.
 """
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 import multiprocessing as mp
@@ -55,7 +56,7 @@ def write_fields(table: str) -> list[str]:
 def included(df: pd.DataFrame) -> pd.Series:
     return df['ExclusionReason'] == ''
 
-def exclude(df: pd.DataFrame, mask, reason: str):
+def exclude(df: pd.DataFrame, mask: Sequence[bool] | pd.Series | np.ndarray, reason: str) -> None:
     """Excludes rows from scaling. The first recorded reason is kept."""
     df.loc[pd.Series(mask, index=df.index) & included(df), 'ExclusionReason'] = reason
 
@@ -65,7 +66,7 @@ def scaling(df: pd.DataFrame) -> pd.Series:
 def held(df: pd.DataFrame) -> pd.Series:
     return included(df) & (df['HeldReason'] != '')
 
-def hold(df: pd.DataFrame, mask, reason: str):
+def hold(df: pd.DataFrame, mask: Sequence[bool] | pd.Series | np.ndarray, reason: str) -> None:
     """Holds rows back from scaling, at their current progress, until they are retried."""
     df.loc[pd.Series(mask, index=df.index) & scaling(df), 'HeldReason'] = reason
 
@@ -117,7 +118,7 @@ def report_gen_load_balance(targets: dict[str,pd.DataFrame]) -> pd.DataFrame:
     loads count (an Open one injects nothing, whatever its MW); dist gen only where its load and itself are Closed.
     """
     gen_df, load_df = targets['Gen'], targets['Load']
-    def totals(suffix):
+    def totals(suffix: str) -> list[float]:
         gen_on, load_on = gen_df['Status' + suffix] == 'Closed', load_df['Status' + suffix] == 'Closed'
         gen_mw = gen_df['MWSetPoint' + suffix].where(gen_on, 0.0).sum()
         dist_mw = load_df['DistMWInput' + suffix].where(load_on & (load_df['DistStatus' + suffix] == 'Closed'), 0.0).sum()
@@ -139,7 +140,7 @@ def report_gen_load_balance(targets: dict[str,pd.DataFrame]) -> pd.DataFrame:
     return total_delta_df
 
 # ------------------ Exclusions ------------------
-def compute_pvqv_exclusions(targets, pvqv_df) -> dict[str,pd.DataFrame]:
+def compute_pvqv_exclusions(targets: dict[str, pd.DataFrame], pvqv_df: pd.DataFrame) -> dict[str,pd.DataFrame]:
     """
     Checks if the proposed delta-P / delta-Q at each bus would cause a linear V change more than the limit.
     Returns {table: buses to exclude from scaling, sorted by |dv|}.
@@ -161,16 +162,16 @@ def compute_pvqv_exclusions(targets, pvqv_df) -> dict[str,pd.DataFrame]:
 def voltage_ok(df: pd.DataFrame, vpu_by_bus: pd.Series) -> pd.Series:
     return df['BusNum'].map(vpu_by_bus).between(EXCLUDE_VMIN, EXCLUDE_VMAX, inclusive='neither')
 
-def bus_vpu(SimAuto) -> pd.Series:
+def bus_vpu(SimAuto: pw.SimAutoApi) -> pd.Series:
     return pw.get_df(SimAuto, 'Bus', {'Number': int, 'Vpu': float}).set_index('Number')['Vpu']
 
 MAIN_ISLAND = 1     # Bus IslandNumber of the main island. Any other (or blank) is a separate island.
 
-def bus_islands(SimAuto) -> pd.Series:
+def bus_islands(SimAuto: pw.SimAutoApi) -> pd.Series:
     """IslandNumber of each bus (NaN where blank), by bus number."""
     return pw.get_df(SimAuto, 'Bus', {'Number': int, 'IslandNumber': int}).set_index('Number')['IslandNumber']
 
-def seed_islands(SimAuto, swing_buses) -> pd.Series | None:
+def seed_islands(SimAuto: pw.SimAutoApi, swing_buses: Iterable[int]) -> pd.Series | None:
     """
     With the seed PWB open: solves it, and returns bus_islands(), or None (islands not checked, with a warning) if the
     case doesn't solve or no swing bus is in island MAIN_ISLAND (the numbering isn't what this code expects). A live
@@ -209,20 +210,20 @@ def epc_off_island(df: pd.DataFrame, island_by_bus: pd.Series | None) -> pd.Seri
 def is_island_reason(reason: pd.Series) -> pd.Series:
     return reason.astype(str).str.startswith(('Island ', 'No island'))
 
-def print_islanded(counts: dict[str, int], reasons):
+def print_islanded(counts: dict[str, int], reasons: Iterable[str]) -> None:
     """One line for the units found outside the main island, if any."""
     if any(counts.values()):
         names = sorted({r.split(',')[0].replace('Island ', '') if r != 'No island' else 'blank' for r in reasons})
         print(f'Outside the main island, to be turned off: {counts.get("Gen", 0)} gens and {counts.get("Load", 0)} loads '
               f'(islands {", ".join(names)}).')
 
-def turn_off_targets(df: pd.DataFrame, table: str, mask):
+def turn_off_targets(df: pd.DataFrame, table: str, mask: Sequence[bool] | pd.Series | np.ndarray) -> None:
     """Targets of the rows in mask: every status Open, and the MW/Mvar fields it zeroes at 0 (STATUS)."""
     for status, zeroed in STATUS[table].items():
         df.loc[mask, f'{status}_Target'] = 'Open'
         df.loc[mask, [f'{c}_Target' for c in zeroed]] = 0.0
 
-def exclude_islands(targets, island_by_bus: pd.Series | None):
+def exclude_islands(targets: dict[str, pd.DataFrame], island_by_bus: pd.Series | None) -> None:
     """
     Per-unit (topology) targets: gens/loads outside the main island (island_reason()) are excluded from scaling, with
     that reason even over an earlier one (e.g. a second island's own 'Swing Unit'), and targeted Open at 0 MW, for
@@ -238,7 +239,7 @@ def exclude_islands(targets, island_by_bus: pd.Series | None):
         reasons |= set(r[off])
     print_islanded(counts, reasons)
 
-def turn_off_islanded(SimAuto, targets):
+def turn_off_islanded(SimAuto: pw.SimAutoApi, targets: dict[str, pd.DataFrame]) -> None:
     """
     With the case open, before scaling: writes every gen/load outside the main island (its ExclusionReason is an island
     one) that is Closed now Open at 0 MW, as its targets say. Each write is solve-checked and bisected; those which
@@ -261,7 +262,7 @@ def turn_off_islanded(SimAuto, targets):
               + (f'; {len(failed_ids)} stay on (the case diverged without them): {", ".join(map(str, failed_ids[:5]))}'
                  + (' ...' if len(failed_ids) > 5 else '') if failed_ids else '') + '.')
 
-def hold_voltage(targets, vpu_by_bus: pd.Series):
+def hold_voltage(targets: dict[str, pd.DataFrame], vpu_by_bus: pd.Series) -> None:
     # Once a bus exceeds the vmin/vmax limits, hold its gens/loads back from scaling until it recovers.
     # This avoids voltage collapse related issues during scaling.
     for df in targets.values():
@@ -269,7 +270,7 @@ def hold_voltage(targets, vpu_by_bus: pd.Series):
         hold(df, ~voltage_ok(df, vpu_by_bus) & (df['Progress'] < RESOLUTION if 'Progress' in df else True), 'Voltage')
 
 # ------------------ Applying changes ------------------
-def apply_rows(SimAuto, table: str, df: pd.DataFrame, new_df: pd.DataFrame, solves: int = 1) -> list:
+def apply_rows(SimAuto: pw.SimAutoApi, table: str, df: pd.DataFrame, new_df: pd.DataFrame, solves: int = 1) -> list:
     """
     Applies new_df (rows of df, with new values) to the case, bisecting to find rows which diverge.
     Records the rest in df. Returns the index labels of rows which diverged (left unchanged).
@@ -279,12 +280,12 @@ def apply_rows(SimAuto, table: str, df: pd.DataFrame, new_df: pd.DataFrame, solv
     df.loc[ok_df.index, ok_df.columns] = ok_df
     return failed
 
-def apply_or_exclude(SimAuto, table: str, df: pd.DataFrame, new_df: pd.DataFrame, reason: str):
+def apply_or_exclude(SimAuto: pw.SimAutoApi, table: str, df: pd.DataFrame, new_df: pd.DataFrame, reason: str) -> None:
     """Like apply_rows(), but excludes rows which diverge from scaling."""
     failed = apply_rows(SimAuto, table, df, new_df)
     exclude(df, df.index.isin(failed), reason)
 
-def close_all_related_gen_load(SimAuto, targets, label='Main scaling'):
+def close_all_related_gen_load(SimAuto: pw.SimAutoApi, targets: dict[str, pd.DataFrame], label: str = 'Main scaling') -> None:
     """
     Closes included gens & loads which are open now but closed in the target, at 0 MW / 0 Mvar.
     Does nothing (and prints nothing) when no status changes, as in a balance.
@@ -301,7 +302,7 @@ def close_all_related_gen_load(SimAuto, targets, label='Main scaling'):
             print(f'{label}: closing {changed.sum()} {table.lower()}s in at 0 MW')
         apply_or_exclude(SimAuto, table, df, new_df[changed], 'Diverged closing at 0 MW')
 
-def set_gen_load_status(SimAuto, targets, label='Main scaling'):
+def set_gen_load_status(SimAuto: pw.SimAutoApi, targets: dict[str, pd.DataFrame], label: str = 'Main scaling') -> None:
     """
     Sets included gens & loads to their final target statuses. Rows which diverge are excluded.
     Only rows whose status changes are written, so a balance (no status changes) writes and solves nothing.
@@ -318,21 +319,21 @@ def set_gen_load_status(SimAuto, targets, label='Main scaling'):
             print(f'{label}: {len(new_df)} {table.lower()}s change status')
         apply_or_exclude(SimAuto, table, df, new_df, 'Diverged setting final status')
 
-def mark_start(targets):
+def mark_start(targets: dict[str, pd.DataFrame]) -> None:
     """Records where scaling starts from. Call after close_all_related_gen_load(), which changes MW/Mvar."""
     for table, df in targets.items():
         for c in SCALED[table]:
             df[f'{c}_Start'] = df[c]
         df['Progress'] = 0
 
-def at_progress(table: str, df: pd.DataFrame, progress) -> pd.DataFrame:
+def at_progress(table: str, df: pd.DataFrame, progress: int | pd.Series) -> pd.DataFrame:
     """Rows of df, with scaled fields moved to `progress` (in 1/RESOLUTION units) of the way from start to target."""
     new_df = df.assign(Progress=progress)
     for c in SCALED[table]:
         new_df[c] = df[f'{c}_Start'] + (df[f'{c}_Target'] - df[f'{c}_Start']) * new_df['Progress'] / RESOLUTION
     return new_df
 
-def rescale(df: pd.DataFrame, factor: pd.Series, cols: list[str], cap: pd.Series | None = None):
+def rescale(df: pd.DataFrame, factor: pd.Series, cols: list[str], cap: pd.Series | None = None) -> None:
     """
     After rows were moved by `factor` (indexed by ObjectID) in the middle of scaling: multiplies their current, start and
     target values of `cols` in df by it, so at_progress() carries on from where they are instead of undoing the move.
@@ -350,7 +351,7 @@ def rescale(df: pd.DataFrame, factor: pd.Series, cols: list[str], cap: pd.Series
             df.loc[f.index, name] = new
 
 # ------------------ Voltage support ------------------
-def create_statcom_on_lowestv_bus(SimAuto, skip_buses, label='Main scaling'):
+def create_statcom_on_lowestv_bus(SimAuto: pw.SimAutoApi, skip_buses: Iterable[int], label: str = 'Main scaling') -> tuple[int, bool] | None:
     """
     If there is a bus with voltage lower than STATCOM_VPU, adds a STATCOM to the lowest voltage bus.
     Returns None if no bus needs one, otherwise (bus number, whether the STATCOM closed in successfully).
@@ -402,7 +403,7 @@ def create_statcom_on_lowestv_bus(SimAuto, skip_buses, label='Main scaling'):
 
     return (number, t.ok)
 
-def drop_collapsed_sections(SimAuto, label='Main scaling') -> list[str]:
+def drop_collapsed_sections(SimAuto: pw.SimAutoApi, label: str = 'Main scaling') -> list[str]:
     """
     Disconnects network sections which are beginning to show collapse.
     I.e. opens branches connecting from buses with OK voltage (>COLLAPSE_VPU) to buses with awful voltage (<COLLAPSE_VPU).
@@ -426,7 +427,7 @@ def drop_collapsed_sections(SimAuto, label='Main scaling') -> list[str]:
     return dropped
 
 # ------------------ Scaling ------------------
-def catch_up(SimAuto, targets, progress: int, step: int, bisect: bool) -> int:
+def catch_up(SimAuto: pw.SimAutoApi, targets: dict[str, pd.DataFrame], progress: int, step: int, bisect: bool) -> int:
     """
     Retries held gens/loads on buses within the voltage band, moving each up to `step` closer to `progress`.
     Those which reach `progress` resume scaling with the rest.
@@ -453,7 +454,7 @@ def catch_up(SimAuto, targets, progress: int, step: int, bisect: bool) -> int:
         df.loc[rows.index[df.loc[rows.index, 'Progress'] >= progress], 'HeldReason'] = ''
     return moved
 
-def retry_held(SimAuto, targets, label: str):
+def retry_held(SimAuto: pw.SimAutoApi, targets: dict[str, pd.DataFrame], label: str) -> None:
     """
     Once the rest have reached their targets: retries held gens/loads, bisecting to find those which still diverge.
     Tries one jump to target first, and halves the jump whenever a round moves nothing.
@@ -607,8 +608,9 @@ def runs_sheet(runs: list[Run]) -> pd.DataFrame:
         out[c] = out[c].astype(float)
     return out
 
-def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None, label='Main scaling',
-                                initial_step=None) -> dict[str,pd.DataFrame]:
+def iterate_to_gen_load_targets(SimAuto: pw.SimAutoApi, targets, pvqv_df: pd.DataFrame | None = None,
+                                after_step: Callable[[pw.SimAutoApi, dict[str, pd.DataFrame], int], float | None] | None = None,
+                                label: str = 'Main scaling', initial_step: int | None = None) -> dict[str,pd.DataFrame]:
     """
     Scales included gens & loads from their start to their targets. Returns the scale log sheets.
     Steps are in 1/RESOLUTION units. Each step which solves at its first size doubles the next one (up to MAX_STEP;
@@ -644,11 +646,11 @@ def iterate_to_gen_load_targets(SimAuto, targets, pvqv_df=None, after_step=None,
     step_log = []
     statcoms: dict[int,bool] = {}   # Bus number -> whether the STATCOM closed in successfully.
     dropped_branches: list[str] = []
-    def log(start, goal, result, caught_up=0):
+    def log(start: int, goal: int, result: str, caught_up: int = 0) -> None:
         held_count = sum(int(held(df).sum()) for df in targets.values())
         step_log.append({'From': start, 'To': goal, 'Result': result, 'CaughtUp': caught_up, 'Held': held_count})
 
-    def package():
+    def package() -> dict[str, pd.DataFrame]:
         return {
             **{table.lower(): df[~included(df)] for table, df in targets.items()}
             ,'step_df': pd.DataFrame(step_log)

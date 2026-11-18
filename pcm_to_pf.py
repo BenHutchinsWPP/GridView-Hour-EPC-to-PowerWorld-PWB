@@ -13,12 +13,14 @@ load to its own EPC value (topo.build_targets()).
 """
 import argparse
 import contextlib
+from collections.abc import Callable, Collection, Sequence
 import json
 import multiprocessing as mp
 import multiprocessing.connection
 import os
 import re
 from pathlib import Path
+from typing import Any
 import traceback
 import numpy as np
 import pandas as pd
@@ -76,7 +78,7 @@ def prepared_changes() -> list[str]:
     new = prep_stamp()
     return [f'{k}: {old.get(k)!r} -> {new.get(k)!r}' for k in sorted(set(old) | set(new)) if old.get(k) != new.get(k)]
 
-def prepare_if_needed():
+def prepare_if_needed() -> None:
     """Step 01, unless Prepared.pwb was made from the same settings and inputs."""
     changes = prepared_changes()
     if pw_fp.exists() and not changes:
@@ -93,7 +95,7 @@ def prepare_if_needed():
     prep_stamp_fp.unlink(missing_ok=True)
     prepare()
 
-def prepare():
+def prepare() -> None:
     stamp = prep_stamp()        # Before it runs: a seed changed meanwhile shows up as stale next time.
     topology = run['mode'] == 'topology'
     # First PowerWorld PWB. Topology mode: also the first GridView EPC (alphabetically), and all of them for XN loads.
@@ -112,12 +114,12 @@ def prepare():
     log = {}
     step = iter(range(1, 100))
 
-    def save(step_name) -> Path:
+    def save(step_name: str) -> Path:
         fp = prepared_dir / f'{next(step):02d}_{step_name}.pwb'
         pw.save_case(SimAuto, fp, run['case_format'])
         return fp
 
-    def try_step(step_name, fn, required=False):
+    def try_step(step_name: str, fn: Callable[[], Any], required: bool = False) -> Any:
         """Runs fn; rolls it back if the case no longer solves. required: stop instead of going on without it."""
         with pw.trial(SimAuto) as t:
             result = fn()
@@ -205,7 +207,7 @@ def prepare():
     SimAuto.CloseCase()
 
 # ================== Step 02: scale to each hour ==================
-def summary_line(hour, log) -> str:
+def summary_line(hour: str, log: dict[str, pd.DataFrame]) -> str:
     """The hour's one-line result, from the same `hours` row step 03 merges (_hour_row())."""
     row = _hour_row(hour, log)
     line = (f'{hour}: swing {row["Final Swing MW"]:.1f} MW; {row["Exceptions Gen/Load"]} exceptions; '
@@ -214,7 +216,7 @@ def summary_line(hour, log) -> str:
         line += f'; worst error area {row["Worst AreaNumber"]} {row["Worst Group"]} {row["Worst Error MW"]:.0f} MW'
     return line
 
-def clear_dist_gen(SimAuto, swing) -> list[scale.Run]:
+def clear_dist_gen(SimAuto: pw.SimAutoApi, swing: Callable[[], float]) -> list[scale.Run]:
     """
     Safety net: GridView ignores distributed generation, so sets it Open & 0 on every load still carrying it. On a seed
     converted by step 01 that finds only loads whose conversion (or dist gen clearing) diverged there. One solve-checked
@@ -233,7 +235,7 @@ def clear_dist_gen(SimAuto, swing) -> list[scale.Run]:
     print(note[0].upper() + note[1:] + '.')
     return [scale.Run('distgen', before=before, after=swing(), note=note)]
 
-def create_case(SimAuto, gv_fp, out_fp) -> str | None:
+def create_case(SimAuto: pw.SimAutoApi, gv_fp: Path, out_fp: Path) -> str | None:
     """Scales one hour. Returns its summary line (None if its log couldn't be built)."""
     pw.print_opened = pw.print_solve_errors = False     # Quiet the three opens an hour (step 01 keeps the line).
     area_mode = run['mode'] != 'topology'
@@ -264,7 +266,8 @@ def create_case(SimAuto, gv_fp, out_fp) -> str | None:
             pre_runs = [scale.Run('prebalance', moved=moved, note='targets moved before scaling')]
     log_fp = out_dir / (gv_fp.stem + '_Log.xlsx')
 
-    def build_log(runs, final, swing_buses=(), exception_runs=(), final_loss=None):
+    def build_log(runs: list[scale.Run], final: dict[str, pd.DataFrame] | None, swing_buses: Collection[int] = (),
+                  exception_runs: Sequence[scale.Run] = (), final_loss: pd.Series | None = None) -> dict[str, pd.DataFrame]:
         log = {'exceptions': scale.exceptions([*exception_runs, *runs], targets, final), 'runs': scale.runs_sheet(runs)}
         if area_mode:
             # Before scaling (final None) nothing has been reached or balanced yet: the plan alone.
@@ -335,7 +338,7 @@ def create_case(SimAuto, gv_fp, out_fp) -> str | None:
     SimAuto.CloseCase()
     return summary
 
-def check_inputs():
+def check_inputs() -> None:
     """Stops with a clear message if step 01 didn't leave what this run's settings need."""
     if not pw_fp.exists():
         raise SystemExit(f'Step 02 needs {pw_fp}: run step 01 (prepare) first.')
@@ -361,7 +364,7 @@ def hours_to_scale() -> list[tuple[Path, Path]]:
             todo.append((gv_fp, out_fp))
     return todo
 
-def scale_hours(workers: int = 1):
+def scale_hours(workers: int = 1) -> None:
     check_inputs()
     todo = hours_to_scale()
     if not todo:
@@ -382,7 +385,7 @@ def scale_hours(workers: int = 1):
             traceback.print_exc()
 
 # ------------------ Parallel: one process and PowerWorld instance per hour ------------------
-def _init_worker(workers: int):
+def _init_worker(workers: int) -> None:
     """Runs in each worker process (which has re-imported this module, so the settings are loaded)."""
     # pretest_gens starts its own PowerWorld instances: share the CPUs out between the hours running at once.
     scale.MAX_WORKERS = max(1, (scale.MAX_WORKERS or os.cpu_count() or 1) // workers)
@@ -398,7 +401,7 @@ def _scale_one(gv_fp: Path, out_fp: Path, console_fp: Path) -> tuple[str | None,
             traceback.print_exc()
             return None, repr(e)
 
-def _worker(gv_fp: Path, out_fp: Path, console_fp: Path, workers: int, conn):
+def _worker(gv_fp: Path, out_fp: Path, console_fp: Path, workers: int, conn: multiprocessing.connection.Connection) -> None:
     """A worker process: one hour, its result sent back on conn."""
     _init_worker(workers)
     conn.send(_scale_one(gv_fp, out_fp, console_fp))
@@ -429,7 +432,7 @@ def hour_progress(console_fp: Path) -> tuple[int, str]:
             return MAIN_SHARE * int(m[1]) // int(m[2]), stage
     return 0, stage
 
-def _scale_hours_parallel(todo: list[tuple[Path, Path]], workers: int):
+def _scale_hours_parallel(todo: list[tuple[Path, Path]], workers: int) -> None:
     """
     Each hour in a process of its own (spawn, as on Windows: it re-imports this module) with its own PowerWorld, at most
     `workers` at once. A process which dies (e.g. PowerWorld takes it down) costs only its own hour. A progress bar
@@ -442,7 +445,7 @@ def _scale_hours_parallel(todo: list[tuple[Path, Path]], workers: int):
     seen: dict[str, int] = {}       # Hour -> its progress so far (never goes back on the bar).
     with tqdm(total=100 * len(todo), unit='%', dynamic_ncols=True, smoothing=0.05,
               bar_format='{percentage:3.0f}% |{bar}| {elapsed}<{remaining} {desc}') as bar:
-        def redraw():
+        def redraw() -> None:
             hours = []
             for _, _, gv_fp, console_fp in running.values():
                 progress, stage = hour_progress(console_fp)
@@ -563,7 +566,7 @@ def merge(out_dir: Path = out_dir) -> Path:
     return target_fp
 
 # ================== The run ==================
-def main(argv=None):
+def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=(__doc__ or '').strip().splitlines()[0])
     parser.add_argument('steps', nargs='*', metavar='STEP',
                         help=f'Steps to run, from {", ".join(STEPS)}. Default: [run] steps in settings.toml.')

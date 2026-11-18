@@ -2,6 +2,7 @@
 Everything which talks to PowerWorld through SimAuto, plus the Excel report writer.
 Every SimAuto error raises SimAutoError.
 """
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -31,7 +32,7 @@ class SimAutoApi(Protocol):
 class SimAutoError(Exception):
     log: dict | None = None     # scale.iterate_to_gen_load_targets() hands its run's log on with it.
 
-def chk(SimAutoOutput, what: str):
+def chk(SimAutoOutput: Sequence[Any], what: str) -> Any:
     """
     Raises SimAutoError on any error passed back from SimAuto, otherwise returns the data.
 
@@ -54,7 +55,7 @@ def connect() -> SimAutoApi:
     import win32com.client
     return cast(SimAutoApi, win32com.client.Dispatch("pwrworld.SimulatorAuto"))
 
-def run(SimAuto: SimAutoApi, command: str):
+def run(SimAuto: SimAutoApi, command: str) -> Any:
     """Runs a script command."""
     return chk(SimAuto.RunScriptCommand(command), command)
 
@@ -73,7 +74,7 @@ def get_df(SimAuto: SimAutoApi, table: str, fields: dict[str,type], filter_group
             df[field] = df[field].astype(str).str.strip()      # Every non-numeric field is text.
     return df
 
-def set_df(SimAuto: SimAutoApi, table: str, df: pd.DataFrame, fields: list[str]):
+def set_df(SimAuto: SimAutoApi, table: str, df: pd.DataFrame, fields: list[str]) -> None:
     """Writes only `fields` of df. A named index (e.g. ObjectID) is available as a field. Missing values are sent as ''."""
     if len(df) == 0:
         return
@@ -81,7 +82,7 @@ def set_df(SimAuto: SimAutoApi, table: str, df: pd.DataFrame, fields: list[str])
     chk(SimAuto.ChangeParametersMultipleElementRect(table, fields, rows), f'Set {table}')
 
 @contextmanager
-def trial(SimAuto: SimAutoApi, solves: int = 1, keep_changes: bool = True):
+def trial(SimAuto: SimAutoApi, solves: int = 1, keep_changes: bool = True) -> Iterator[SimpleNamespace]:
     """
     Checkpoints the case, runs the body, then solves.
     Rolls back to the checkpoint if the case does not solve (or if keep_changes=False).
@@ -112,7 +113,7 @@ def trial(SimAuto: SimAutoApi, solves: int = 1, keep_changes: bool = True):
 _in_trial = False
 
 @contextmanager
-def creating(SimAuto: SimAutoApi):
+def creating(SimAuto: SimAutoApi) -> Iterator[None]:
     """Allows set_df to create objects which don't exist yet, only within this block."""
     run(SimAuto, 'EnterMode(EDIT);')
     SimAuto.CreateIfNotFound = True
@@ -131,7 +132,7 @@ def set_df_bisect(SimAuto: SimAutoApi, table: str, df: pd.DataFrame, fields: lis
     """
     failed: list = []
 
-    def apply(part: pd.DataFrame):
+    def apply(part: pd.DataFrame) -> None:
         if len(part) == 0:
             return
         if limit is not None and len(failed) >= limit:
@@ -154,14 +155,14 @@ def set_df_bisect(SimAuto: SimAutoApi, table: str, df: pd.DataFrame, fields: lis
 print_opened = True    # Step 02 turns this off: it opens the seed three times an hour.
 print_solve_errors = True   # Step 02 turns this off: its step lines say which steps diverged.
 
-def open_case(SimAuto: SimAutoApi, fp):
+def open_case(SimAuto: SimAutoApi, fp: str | Path) -> None:
     if not Path(fp).exists():
         raise FileNotFoundError(fp)
     chk(SimAuto.OpenCase(str(fp)), f'OpenCase {fp}')
     if print_opened:
         print(f'Opened: {str(fp)}')
 
-def save_case(SimAuto: SimAutoApi, fp, case_format = 'PWB22'):
+def save_case(SimAuto: SimAutoApi, fp: str | Path, case_format: str = 'PWB22') -> None:
     if not Path(fp).parent.exists():
         raise FileNotFoundError(Path(fp).parent)
     chk(SimAuto.SaveCase(str(fp), case_format, True), f'SaveCase {fp}')
@@ -183,7 +184,7 @@ def solve(SimAuto: SimAutoApi) -> bool:
     max_mismatch = ((df['MismatchP']**2.0 + df['MismatchQ']**2.0)**0.5).max()
     return bool(max_mismatch < MVA_MISMATCH_THRESHOLD)
 
-def write_excel(fp: Path, sheets: dict[str,pd.DataFrame]):
+def write_excel(fp: Path, sheets: dict[str,pd.DataFrame]) -> None:
     """Writes one sheet per dataframe. A named index (e.g. ObjectID) is written as a column."""
     with pd.ExcelWriter(fp, engine='openpyxl') as writer:
         for sheet_name, df in sheets.items():

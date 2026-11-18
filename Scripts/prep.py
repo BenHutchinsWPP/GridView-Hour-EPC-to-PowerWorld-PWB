@@ -31,9 +31,9 @@ def suggested_shunt_status(df: pd.DataFrame, vlow: float, vhigh: float) -> pd.Se
     new_status[(reactor & opened & high) | (capacitor & opened & low)] = 'Closed'
     return new_status
 
-def adjust_shunts(SimAuto):
+def adjust_shunts(SimAuto: pw.SimAutoApi) -> None:
     """Switches shunts to attempt to get buses back within a voltage band."""
-    def shunt_changes():
+    def shunt_changes() -> pd.DataFrame:
         df = pw.get_df(SimAuto, 'Shunt', {'ObjectID': str, 'MvarNom': float, 'Status': str, 'Vpu': float})
         new_status = suggested_shunt_status(df, SHUNT_VLOW, SHUNT_VHIGH)
         changed = df['Status'] != new_status
@@ -62,7 +62,7 @@ def adjust_shunts(SimAuto):
             failed.append(row_df['ObjectID'].iloc[0])
 
 # ------------------ Fault duty, PVQV, swing ------------------
-def get_fault_duty(SimAuto) -> pd.DataFrame:
+def get_fault_duty(SimAuto: pw.SimAutoApi) -> pd.DataFrame:
     """
     Returns a dataframe of fault duty at every bus.
     Note: deletes any existing Fault objects in the case.
@@ -106,7 +106,7 @@ def get_fault_duty(SimAuto) -> pd.DataFrame:
 
     return result_df
 
-def get_pvqv(SimAuto) -> pd.DataFrame:
+def get_pvqv(SimAuto: pw.SimAutoApi) -> pd.DataFrame:
     """
     Calculates bus voltage MW & MVAR self-sensitivity.
     Tools -> Sensitivities -> Flow and Voltage Sensitivities -> Self Sensitivity (Tab)
@@ -129,11 +129,11 @@ def get_pvqv(SimAuto) -> pd.DataFrame:
 def max_fault_duty_bus(fault_df) -> int:
     return int(fault_df.loc[fault_df['MVA'].idxmax(), 'BusNumber'])
 
-def slack_buses(SimAuto) -> list[int]:
+def slack_buses(SimAuto: pw.SimAutoApi) -> list[int]:
     """The case's swing buses."""
     return pw.get_df(SimAuto, 'Bus', {'Number': int, 'Slack': str}).query("Slack == 'YES'")['Number'].tolist()
 
-def create_giant_swing(SimAuto, bus_num: int) -> pd.DataFrame:
+def create_giant_swing(SimAuto: pw.SimAutoApi, bus_num: int) -> pd.DataFrame:
     """
     Creates a giant swing/slack unit on the given bus, e.g. max_fault_duty_bus() or slack_buses()[0].
     """
@@ -175,7 +175,7 @@ def create_giant_swing(SimAuto, bus_num: int) -> pd.DataFrame:
 
     return swing_df
 
-def disable_area_agc(SimAuto):
+def disable_area_agc(SimAuto: pw.SimAutoApi) -> None:
     """Turns off MW AGC in the solution options, so the swing takes up every imbalance while scaling."""
     pw.set_df(SimAuto, 'Sim_Solution_Options_Value', pd.DataFrame({'Option':['ChkMWAGC'], 'Value':['NO']}), ['Option', 'Value'])
 
@@ -194,12 +194,12 @@ def constant_power_rows(load: pd.DataFrame) -> pd.DataFrame:
     out['DistStatus'] = 'Open'
     return out.drop(columns=['NetMW', 'NetMvar'])
 
-def _swing_mw(SimAuto) -> float:
+def _swing_mw(SimAuto: pw.SimAutoApi) -> float:
     """MW of the Closed gens on the swing buses. (Not area.swing_mw: area imports this module.)"""
     gen = pw.get_df(SimAuto, 'Gen', {'BusNum': int, 'Status': str, 'MW': float})
     return float(gen.loc[(gen['Status'] == 'Closed') & gen['BusNum'].isin(slack_buses(SimAuto)), 'MW'].sum())
 
-def _read_loads(SimAuto) -> pd.DataFrame:
+def _read_loads(SimAuto: pw.SimAutoApi) -> pd.DataFrame:
     return pw.get_df(SimAuto, 'Load', {
         'ObjectID': str, 'BusNum': int, 'ID': str, 'AreaNumber': int, 'Status': str, 'MW': float, 'SMW': float, 'SMvar': float,
         'IMW': float, 'IMvar': float, 'ZMW': float, 'ZMvar': float, 'NetMW': float, 'NetMvar': float, 'DistMW': float,
@@ -232,7 +232,7 @@ def conversion_warnings(sheet: pd.DataFrame, done: pd.DataFrame) -> list[str]:
                    '(PowerWorld may reduce load at low voltage). Check them in the case.')
     return out
 
-def convert_loads_to_constant_power(SimAuto) -> dict[str, pd.DataFrame]:
+def convert_loads_to_constant_power(SimAuto: pw.SimAutoApi) -> dict[str, pd.DataFrame]:
     """
     Turns every Closed load into constant power at its solved NetMW/NetMvar, in one bisected edit (loads which make the
     case diverge keep their current/impedance/dist gen; step 02 ramps those to 0). Open loads only lose their dist gen.
