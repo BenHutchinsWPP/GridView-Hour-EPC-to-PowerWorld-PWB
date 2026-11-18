@@ -21,6 +21,15 @@ class FakeSimAuto:
         self.checkpoint: dict[tuple[str, str], dict] | None = None
         self.CreateIfNotFound = False
 
+    def OpenCase(self, fp):     # Tests which open cases use test_steps.CaseSimAuto.
+        raise NotImplementedError('FakeSimAuto has no cases to open')
+
+    def SaveCase(self, fp, case_format, overwrite):
+        raise NotImplementedError('FakeSimAuto has no case to save')
+
+    def CloseCase(self):
+        return ('',)
+
     def SaveState(self):
         self.checkpoint = dict(self.applied)
         return ('',)

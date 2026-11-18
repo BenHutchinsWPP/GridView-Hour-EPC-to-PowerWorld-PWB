@@ -5,10 +5,28 @@ Every SimAuto error raises SimAutoError.
 from pathlib import Path
 from contextlib import contextmanager
 from types import SimpleNamespace
+from typing import Any, Protocol, cast
 import pandas as pd
 import openpyxl.utils
 
 MVA_MISMATCH_THRESHOLD = 1.0    # Max bus MVA mismatch for a solve to count as converged.
+
+class SimAutoApi(Protocol):
+    """
+    The part of PowerWorld's SimAuto COM object this project uses (connect() returns the real one; the tests pass
+    fakes). Each call returns a tuple: [0] an error message ('' if none), then any data (chk() unpacks it).
+    Positional-only, so a fake's parameter names don't have to match.
+    """
+    CreateIfNotFound: bool
+
+    def OpenCase(self, fp: str, /) -> tuple[Any, ...]: ...
+    def SaveCase(self, fp: str, case_format: str, overwrite: bool, /) -> tuple[Any, ...]: ...
+    def CloseCase(self) -> tuple[Any, ...]: ...
+    def RunScriptCommand(self, command: str, /) -> tuple[Any, ...]: ...
+    def GetParametersMultipleElementRect(self, table: str, fields: list[str], filter_group: str, /) -> tuple[Any, ...]: ...
+    def ChangeParametersMultipleElementRect(self, table: str, fields: list[str], rows: list[list[Any]], /) -> tuple[Any, ...]: ...
+    def SaveState(self) -> tuple[Any, ...]: ...
+    def LoadState(self) -> tuple[Any, ...]: ...
 
 class SimAutoError(Exception):
     log: dict | None = None     # scale.iterate_to_gen_load_targets() hands its run's log on with it.
@@ -31,16 +49,16 @@ def chk(SimAutoOutput, what: str):
     else:
         return SimAutoOutput[1:]
 
-def connect():
+def connect() -> SimAutoApi:
     """Starts PowerWorld through SimAuto (Windows only: pywin32 is imported here, so nothing else needs it to import)."""
     import win32com.client
-    return win32com.client.Dispatch("pwrworld.SimulatorAuto")
+    return cast(SimAutoApi, win32com.client.Dispatch("pwrworld.SimulatorAuto"))
 
-def run(SimAuto, command: str):
+def run(SimAuto: SimAutoApi, command: str):
     """Runs a script command."""
     return chk(SimAuto.RunScriptCommand(command), command)
 
-def get_df(SimAuto, table: str, fields: dict[str,type], filter_group: str = '') -> pd.DataFrame:
+def get_df(SimAuto: SimAutoApi, table: str, fields: dict[str,type], filter_group: str = '') -> pd.DataFrame:
     """Reads `fields` of every object in `table` (optionally filtered), converted to the given types. Strings are trimmed."""
     rows = chk(SimAuto.GetParametersMultipleElementRect(table, list(fields), filter_group), f'Get {table}')
     df = pd.DataFrame(data=rows, columns=list(fields))
@@ -55,7 +73,7 @@ def get_df(SimAuto, table: str, fields: dict[str,type], filter_group: str = '') 
             df[field] = df[field].astype(str).str.strip()      # Every non-numeric field is text.
     return df
 
-def set_df(SimAuto, table: str, df: pd.DataFrame, fields: list[str]):
+def set_df(SimAuto: SimAutoApi, table: str, df: pd.DataFrame, fields: list[str]):
     """Writes only `fields` of df. A named index (e.g. ObjectID) is available as a field. Missing values are sent as ''."""
     if len(df) == 0:
         return
@@ -63,7 +81,7 @@ def set_df(SimAuto, table: str, df: pd.DataFrame, fields: list[str]):
     chk(SimAuto.ChangeParametersMultipleElementRect(table, fields, rows), f'Set {table}')
 
 @contextmanager
-def trial(SimAuto, solves: int = 1, keep_changes: bool = True):
+def trial(SimAuto: SimAutoApi, solves: int = 1, keep_changes: bool = True):
     """
     Checkpoints the case, runs the body, then solves.
     Rolls back to the checkpoint if the case does not solve (or if keep_changes=False).
@@ -94,7 +112,7 @@ def trial(SimAuto, solves: int = 1, keep_changes: bool = True):
 _in_trial = False
 
 @contextmanager
-def creating(SimAuto):
+def creating(SimAuto: SimAutoApi):
     """Allows set_df to create objects which don't exist yet, only within this block."""
     run(SimAuto, 'EnterMode(EDIT);')
     SimAuto.CreateIfNotFound = True
@@ -103,7 +121,7 @@ def creating(SimAuto):
     finally:
         SimAuto.CreateIfNotFound = False
 
-def set_df_bisect(SimAuto, table: str, df: pd.DataFrame, fields: list[str], solves: int = 1, limit: int | None = None) -> list:
+def set_df_bisect(SimAuto: SimAutoApi, table: str, df: pd.DataFrame, fields: list[str], solves: int = 1, limit: int | None = None) -> list:
     """
     Attempts to apply all rows of df in one bulk edit.
     If it fails, rolls back and bisects df into two halves to test recursively until reaching 1 row.
@@ -136,20 +154,20 @@ def set_df_bisect(SimAuto, table: str, df: pd.DataFrame, fields: list[str], solv
 print_opened = True    # Step 02 turns this off: it opens the seed three times an hour.
 print_solve_errors = True   # Step 02 turns this off: its step lines say which steps diverged.
 
-def open_case(SimAuto, fp):
+def open_case(SimAuto: SimAutoApi, fp):
     if not Path(fp).exists():
         raise FileNotFoundError(fp)
     chk(SimAuto.OpenCase(str(fp)), f'OpenCase {fp}')
     if print_opened:
         print(f'Opened: {str(fp)}')
 
-def save_case(SimAuto, fp, case_format = 'PWB22'):
+def save_case(SimAuto: SimAutoApi, fp, case_format = 'PWB22'):
     if not Path(fp).parent.exists():
         raise FileNotFoundError(Path(fp).parent)
     chk(SimAuto.SaveCase(str(fp), case_format, True), f'SaveCase {fp}')
     print(f'Saved: {str(fp)}')
 
-def solve(SimAuto) -> bool:
+def solve(SimAuto: SimAutoApi) -> bool:
     run(SimAuto, 'EnterMode(RUN);')
     result = SimAuto.RunScriptCommand('SolvePowerFlow(RECTNEWT);')
 
