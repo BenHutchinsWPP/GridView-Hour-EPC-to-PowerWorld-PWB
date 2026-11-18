@@ -80,6 +80,9 @@ max_unknown_share = 0.5
 # PWB units can't take at least this many MW of its EPC target (Unmet MW, before make-up). Flag 'no PWB units' marks a
 # group the PWB has no units for at all (e.g. 1000 MW of EPC Wind in an area with no PWB wind).
 shortfall_report_mw = 100.0
+# A gen whose key (bus & ID) is in both cases takes the PWB's unit and fuel type in the EPC too, so both are classified
+# the same way (the EPC's codes are often missing or wrong). false = each case keeps its own codes.
+gen_types_from_pwb = true
 # The GenTypes. Add one here to give it its own group, then map unit/fuel codes to it below.
 gen_types = ["Solar", "Hydro", "Wind", "Thermal", "Battery Storage", "Unknown"]
 

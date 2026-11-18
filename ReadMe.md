@@ -98,6 +98,7 @@ Loads and gens are matched key by key where they can be, and scaled where they c
 - `DC` (DC ties) are not scaled at all: `manual_unit_types` in `settings.toml`.
 - Battery Storage = `BA`, `FW`, `ES`, `CE` units, and the `MWH` fuel.
 - To change a mapping, or give pumped storage its own group, use `[area.unit_gentype]` / `[area.fuel_gentype]` and `gen_types` in `settings.toml`. Both cases are always classified by the same maps.
+- A gen whose key (`ObjectID`: bus & ID) is in both cases takes the PWB's `UnitTypeCode` and `FuelTypeCode` in the EPC too, so both cases classify it alike: the PWB's codes are taken as right, even where they are blank (`gen_types_from_pwb` in `[area]`, on; the console counts the gens whose codes differed and the MW that changed GenType). EPC-only gens keep their own codes. `false` keeps each case's own codes.
 - Codes in neither map are Unknown. The `areas` sheet shows the MW in each bucket, so an Unknown bucket with a lot of MW means a code is missing from the maps. If more than `max_unknown_share` (0.5, in `[area]`; 1.0 turns the check off) of the EPC's generation is Unknown, the run stops before scaling and names the MW.
 
 ### Open Questions (area mode)

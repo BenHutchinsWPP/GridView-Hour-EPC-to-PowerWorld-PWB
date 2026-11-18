@@ -65,6 +65,30 @@ MANUAL_UNIT_TYPES = {'DC'}
 # probably blank, and every typed bucket in the PWB would be scaled to 0. 1.0 turns the check off.
 MAX_UNKNOWN_SHARE = 0.5
 
+# A gen whose key (ObjectID) is in both cases takes the PWB's UnitTypeCode and FuelTypeCode in the EPC too, so both
+# cases classify it the same way (the EPC's codes are often missing or wrong). False: each case keeps its own codes.
+GEN_TYPES_FROM_PWB = True
+
+def pwb_gen_types(epc_gen: pd.DataFrame, case_gen: pd.DataFrame) -> pd.DataFrame:
+    """epc_gen with the UnitTypeCode and FuelTypeCode of case_gen's gen of the same ObjectID, where there is one."""
+    pwb = case_gen.drop_duplicates('ObjectID').set_index('ObjectID')
+    keyed = epc_gen['ObjectID'].isin(pwb.index)
+    out = epc_gen.copy()
+    for c in ('UnitTypeCode', 'FuelTypeCode'):
+        out.loc[keyed, c] = out.loc[keyed, 'ObjectID'].map(pwb[c])
+    differ = keyed & ((_code(out['UnitTypeCode']) != _code(epc_gen['UnitTypeCode'])) | (_code(out['FuelTypeCode']) != _code(epc_gen['FuelTypeCode'])))
+    was, now = classify_gen_type(epc_gen), classify_gen_type(out)
+    moved = (now != was) & keyed & closed(epc_gen)          # Only Closed gens carry target MW.
+    mw = epc_gen['MWSetPoint'].fillna(0.0).abs()
+    if not keyed.any():
+        print('Gen types: no EPC gen has a key in the PWB; each case keeps its own unit/fuel codes.')
+    elif differ.any():
+        top = mw[moved].sort_values(ascending=False).index[:5]
+        biggest = ', '.join(f'{epc_gen.at[i, "ObjectID"]} {was[i]} -> {now[i]} ({mw[i]:,.0f} MW)' for i in top)
+        print(f'Gen types: {differ.sum()} of the {keyed.sum()} EPC gens with a key in the PWB had other unit/fuel codes; '
+              f'using the PWB\'s ({moved.sum()} Closed change GenType, {mw[moved].sum():,.0f} MW' + (f'; biggest: {biggest}' if biggest else '') + ').')
+    return out
+
 def _code(s: pd.Series) -> pd.Series:
     """'HY', 'hy ', 'HY (Hydraulic Turbine)' -> 'HY'. Missing -> ''."""
     return s.fillna('').astype(str).str.strip().str.split(' ', n=1).str[0].str.upper()
@@ -413,7 +437,10 @@ def gen_targets(epc_gen: pd.DataFrame, case_gen: pd.DataFrame) -> tuple[pd.DataF
     """
     epc_gen, case_gen = scalable_gens(epc_gen), scalable_gens(case_gen)
     epc = epc_gen.assign(GenType=classify_gen_type(epc_gen), P=epc_gen['MWSetPoint'].fillna(0.0).where(closed(epc_gen), 0.0))
-    unknown, total = epc.loc[epc['GenType'] == 'Unknown', 'P'].abs().sum(), epc['P'].abs().sum()
+    # With GEN_TYPES_FROM_PWB a keyed gen has the PWB's codes, Unknown in both cases alike (its PWB unit takes its MW), so
+    # only the EPC-only gens can leave typed PWB buckets without their EPC MW.
+    own_codes = ~epc['ObjectID'].isin(case_gen['ObjectID']) if GEN_TYPES_FROM_PWB else pd.Series(True, index=epc.index)
+    unknown, total = epc.loc[(epc['GenType'] == 'Unknown') & own_codes, 'P'].abs().sum(), epc['P'].abs().sum()
     if unknown > MAX_UNKNOWN_SHARE * total:
         raise ValueError(f'{unknown:.0f} MW of the EPC\'s {total:.0f} MW of generation has no GenType (its unit and fuel codes '
                          f'are blank or unknown). Scaling would take the rest of the fleet offline. Map the codes in '
@@ -565,6 +592,8 @@ def build_targets(epc: dict[str, pd.DataFrame], case: dict[str, pd.DataFrame], s
     (Closed; not DC ties, swing-bus gens, or non-conforming loads) per (AreaNumber, Group).
     """
     epc = dict(epc)
+    if GEN_TYPES_FROM_PWB:
+        epc['Gen'] = pwb_gen_types(epc['Gen'], case['Gen'])
     off = {t: scale.epc_off_island(epc[t], island_by_bus) for t in ('Gen', 'Load')}
     og, ol = epc['Gen'][off['Gen']], epc['Load'][off['Load']]
     og = scalable_gens(og)

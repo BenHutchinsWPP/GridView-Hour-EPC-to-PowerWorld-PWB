@@ -40,7 +40,7 @@ SETTINGS = {
     'topology': {'tap_threshold', 'unsupported_gv_branch_types'},
     'area': {'commit', 'commit_max_cf', 'capacity_types', 'off_at_zero_types', 'manual_unit_types', 'scale_nonconforming',
              'loss_exponent', 'makeup', 'balance_tol_mw', 'balance_max_rounds', 'balance_trigger_mw',
-             'balance_at_swing_limits', 'max_unknown_share', 'shortfall_report_mw', 'gen_types', 'unit_gentype', 'fuel_gentype'},
+             'balance_at_swing_limits', 'max_unknown_share', 'shortfall_report_mw', 'gen_types_from_pwb', 'gen_types', 'unit_gentype', 'fuel_gentype'},
     'scale': {'add_statcoms', 'drop_collapsed', 'exclude_vmin', 'exclude_vmax', 'statcom_vpu', 'statcom_vnom_min',
               'collapse_vpu', 'pvqv_dv_limit', 'initial_step', 'max_step', 'step_solves', 'final_max_rounds', 'max_workers'},
 }

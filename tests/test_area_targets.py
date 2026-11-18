@@ -673,3 +673,32 @@ def test_shortfall_sheet_lists_epc_and_pwb_gens_side_by_side():
         area.SHORTFALL_REPORT_MW = 2000.0
         _, reports = area.build_targets({'Load': loads([]), 'Gen': epc}, {'Load': loads([]), 'Gen': case})
     assert reports['shortfall'].empty and 'PWB ID' in reports['shortfall']
+
+def test_keyed_epc_gens_take_the_pwbs_unit_and_fuel_types():
+    # g1 is wind in the PWB but coded thermal in the EPC; e2 is only in the EPC (keeps its own code).
+    case = gens([('g1', 1, '1', 'Closed', 'WT', 50.0, 100.0, 0.0), ('t1', 1, '2', 'Closed', 'GT', 100.0, 500.0, 0.0)])
+    epc = gens([('g1', 1, '1', 'Closed', 'GT', 80.0, 100.0, 0.0), ('e2', 1, '3', 'Closed', 'ST', 200.0, 300.0, 0.0),
+                ('t1', 1, '2', 'Closed', 'GT', 100.0, 500.0, 0.0)]).assign(FuelTypeCode=['NG', 'BIT', 'NG'])
+    out = area.pwb_gen_types(epc, case)
+    assert out['UnitTypeCode'].tolist() == ['WT', 'ST', 'GT'] and out['FuelTypeCode'].tolist() == ['', 'BIT', '']
+    _, reports = area.build_targets({'Load': loads([]), 'Gen': epc}, {'Load': loads([]), 'Gen': case})
+    r = reports['area_gen'].set_index('GenType')['Target MW']
+    assert r['Wind'] == 80 and r['Thermal'] == 300
+    with saved_settings():
+        area.GEN_TYPES_FROM_PWB = False
+        _, reports = area.build_targets({'Load': loads([]), 'Gen': epc}, {'Load': loads([]), 'Gen': case})
+    r = reports['area_gen'].set_index('GenType')['Target MW']
+    assert 'Wind' not in r or r['Wind'] == 0
+    assert r['Thermal'] == 380
+
+def test_pwb_gen_types_blank_codes_dont_trip_the_unknown_stop_and_open_gens_dont_count():
+    # t1's PWB copy has blank codes: Unknown in both cases, its PWB unit takes the 500 MW, so the run doesn't stop
+    # (500 of 600 MW Unknown is over max_unknown_share 0.5 if keyed gens counted).
+    case = gens([('t1', 1, '1', 'Closed', '', 100.0, 600.0, 0.0), ('w1', 1, '2', 'Closed', 'WT', 50.0, 100.0, 0.0),
+                 ('o1', 1, '3', 'Open', 'WT', 0.0, 400.0, 0.0)])
+    epc = gens([('t1', 1, '1', 'Closed', 'GT', 500.0, 600.0, 0.0), ('w1', 1, '2', 'Closed', 'WT', 100.0, 100.0, 0.0),
+                ('o1', 1, '3', 'Open', 'GT', 300.0, 400.0, 0.0)])
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        _, reports = area.build_targets({'Load': loads([]), 'Gen': epc}, {'Load': loads([]), 'Gen': case})
+    assert reports['area_gen'].set_index('GenType')['Target MW']['Unknown'] == 500
+    assert '(1 Closed change GenType, 500 MW; biggest: t1 Thermal -> Unknown (500 MW))' in out.getvalue()   # o1 (Open) not counted.
