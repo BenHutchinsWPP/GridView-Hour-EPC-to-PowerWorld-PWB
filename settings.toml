@@ -48,7 +48,7 @@ commit_max_cf = 0.94                    # Match types: commit until the target i
 # group's EPC total (each unit's own EPC MW is ignored). Every other type matches unit by unit (key basis), then scales.
 capacity_types = ["Wind", "Solar", "Battery Storage"]
 off_at_zero_types = ["Wind", "Solar", "Battery Storage"]   # At a target of 0, these go offline (other capacity types keep their status).
-manual_unit_types = ["DC"]              # Unit types never scaled (adjusted by hand).
+manual_unit_types = ["DC", "MP"]        # Unit types never scaled, in either case's totals (DC ties; MP motors / pumps, which are load).
 # Non-conforming loads (load AGC = NO in PowerWorld, or flagged in the EPC): false = never scaled, and left out of both
 # cases' area load totals; those whose key is in the EPC take its status and MW/Mvar 1:1, the rest keep their seed values.
 # true = scaled like any other load.

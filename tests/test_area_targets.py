@@ -166,9 +166,12 @@ def test_load_targets_negative_target_with_no_negative_seed_load_is_unmet():
     assert df['SMW_Target'].tolist() == [20.0]
     assert report['Unmet MW -'].tolist() == [-30.0] and report['Unmet MW +'].tolist() == [0.0]
 
-def test_gen_targets_leave_dc_ties_alone():
-    case = gens([('d1', 1, '1', 'Closed', 'DC', 300.0, 500.0, -500.0), ('g1', 1, '2', 'Closed', 'GT', 0.0, 100.0, 0.0)])
-    epc = gens([('d1', 1, '1', 'Closed', 'DC', -400.0, 500.0, -500.0), ('g2', 1, '2', 'Closed', 'GT', 60.0, 100.0, 0.0)])
+def test_gen_targets_leave_dc_ties_and_motors_alone():
+    # A pump (MP) of -80 MW in the PWB and -120 MW in the EPC: load, not generation. Neither it nor its EPC MW is scaled.
+    case = gens([('d1', 1, '1', 'Closed', 'DC', 300.0, 500.0, -500.0), ('g1', 1, '2', 'Closed', 'GT', 0.0, 100.0, 0.0),
+                 ('m1', 1, '3', 'Closed', 'MP', -80.0, 0.0, -100.0)])
+    epc = gens([('d1', 1, '1', 'Closed', 'DC', -400.0, 500.0, -500.0), ('g2', 1, '2', 'Closed', 'GT', 60.0, 100.0, 0.0),
+                ('m1', 1, '3', 'Closed', 'MP', -120.0, 0.0, -150.0)])
     df, report = area.gen_targets(epc, case)
     assert df.index.tolist() == ['g1'] and df.loc['g1', 'MWSetPoint_Target'] == 60
     assert report['GenType'].tolist() == ['Thermal']

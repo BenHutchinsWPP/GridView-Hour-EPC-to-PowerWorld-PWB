@@ -37,7 +37,8 @@ UNIT_GENTYPE: dict[str, str | None] = {
     # Battery Storage
     'BA': 'Battery Storage', 'FW': 'Battery Storage', 'ES': 'Battery Storage', 'CE': 'Battery Storage',
     # Not generation by type: never decided by fuel.
-    'SC': 'Unknown', 'SV': 'Unknown', 'MP': 'Unknown',  # DECIDE: condensers, SVCs, motor/pumps.
+    'SC': 'Unknown', 'SV': 'Unknown',   # DECIDE: condensers, SVCs.
+    'MP': 'Unknown',            # Motors / pumps: load, never scaled (MANUAL_UNIT_TYPES).
     'DC': 'Unknown',            # DC ties: never scaled (MANUAL_UNIT_TYPES).
     # Unit type unstated or generic: use the fuel.
     'UN': None, 'OT': None, 'FC': None, '': None,
@@ -59,7 +60,7 @@ FUEL_GENTYPE: dict[str, str] = {
 }
 
 # Unit types left out of the scaling, in both cases: adjusted by hand.
-MANUAL_UNIT_TYPES = {'DC'}
+MANUAL_UNIT_TYPES = {'DC', 'MP'}     # DC ties; motors / pumps (load modelled as gens).
 
 # Stop before scaling if more than this share of the EPC's generation (|MW|) has no GenType: its unit & fuel codes are
 # probably blank, and every typed bucket in the PWB would be scaled to 0. 1.0 turns the check off.
