@@ -1,0 +1,8 @@
+{
+  "include": ["pcm_to_pf.py", "Scripts", "tests"],
+  "venvPath": ".",
+  "venv": ".venv",
+  "typeCheckingMode": "standard",
+  "pythonVersion": "3.11",
+  "reportUnusedVariable": "error"
+}

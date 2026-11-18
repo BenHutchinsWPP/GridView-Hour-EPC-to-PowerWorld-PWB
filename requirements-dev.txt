@@ -1,0 +1,3 @@
+-r requirements.txt
+pyright          # The type checker VS Code's Pylance runs: `pyright` from the repo root must report 0 errors.
+pandas-stubs>=3,<4   # pandas types, as Pylance bundles them.

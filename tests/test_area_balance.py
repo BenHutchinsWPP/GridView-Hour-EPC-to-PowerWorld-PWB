@@ -228,7 +228,7 @@ def test_own_slack_ends_at_its_epc_mw_when_its_key_is_in_the_epc():
     giant = pd.concat([gen, gens([('xx', 1, 'xx', 'Closed', '', 0.0, 2e4, -2e4)]).assign(BusNum=9)])
     assert area.swing_epc(epc_gen, giant, [9]).empty and area.swing_goal(giant, [9], swing) == (0.0, 0.0)
     sa = SwingSimAuto(gen, load, slack=[9])
-    after_step, log = area.midrun_balancer(sa, swing)
+    after_step, _ = area.midrun_balancer(sa, swing)
     scale.iterate_to_gen_load_targets(sa, load_ramp_targets(), after_step=after_step)
     area.balance_swing(sa, epc=swing)
     assert abs(area.swing_mw(sa.table('Gen'), [9])[0] - 300.0) < area.BALANCE_TOL_MW and ('Gen', '9') not in sa.applied
@@ -268,7 +268,7 @@ def ledger_run(mutate=None, slack=(99,), makeup=False):
     return area.areas(area.read_case(sa), reports, targets, runs, swing_buses=list(slack)), targets
 
 def test_areas_ledger_holds_with_midrun_and_final_balances_and_a_diverging_gen():
-    out, targets = ledger_run()
+    out, _ = ledger_run()
     assert out.columns.tolist() == area.AREAS_COLUMNS and out.groupby(['AreaNumber', 'Group']).size().max() == 1
     ledger = out['Target MW'] - out['Unmet MW'] - out['Not Reached MW'] + out['Make-up MW'] + out['Balance MW']
     assert (abs(out['Final MW'] - ledger) < 1e-6).all(), out
@@ -280,7 +280,7 @@ def test_areas_ledger_holds_with_midrun_and_final_balances_and_a_diverging_gen()
 def test_areas_before_scaling_has_blank_final_columns():
     case = gens([('g1', 1, '1', 'Closed', 'GT', 100.0, 1000.0, 0.0)])
     epc = gens([('g1', 1, '1', 'Closed', 'GT', 150.0, 1000.0, 0.0), ('s1', 1, '2', 'Closed', 'PV', 40.0, 100.0, 0.0)])
-    targets, reports = area.build_targets({'Load': loads([]), 'Gen': epc}, {'Load': loads([]), 'Gen': case})
+    _, reports = area.build_targets({'Load': loads([]), 'Gen': epc}, {'Load': loads([]), 'Gen': case})
     out = area.areas(None, reports)
     assert out[['Group', 'Target MW', 'Unmet MW']].values.tolist() == [['Solar', 40.0, 40.0], ['Thermal', 150.0, 0.0]]
     assert out['Final MW'].isna().all() and (out['Not Reached MW'] == 0).all() and out.loc[0, 'Note'] == 'no PWB units'
@@ -321,7 +321,7 @@ def test_makeup_keeps_the_hour_and_its_note_when_its_scaling_fails():
     epc_load = loads([('l1', 1, 'Closed', 3200.0, 0.0, 0.0, 320.0)])
     sa = SwingSimAuto(gen, load)
     sa.bad = {'4'}
-    targets, reports = area.build_targets({'Load': epc_load, 'Gen': epc_gen}, {'Load': load, 'Gen': gen}, swing_buses=[99])
+    targets, _ = area.build_targets({'Load': epc_load, 'Gen': epc_gen}, {'Load': load, 'Gen': gen}, swing_buses=[99])
     scale.iterate_to_gen_load_targets(sa, targets)
     real, reads = scale.iterate_to_gen_load_targets, []
     def fails_for_makeup(*args, **kwargs):
@@ -472,7 +472,7 @@ def test_loss_estimate_uses_positive_load_and_caps_the_ratio():
 
 def test_areas_shows_final_losses_without_a_plan_estimate():
     case = gens([('g1', 1, '1', 'Closed', 'GT', 100.0, 1000.0, 0.0)])
-    targets, reports = area.build_targets({'Load': loads([]), 'Gen': case}, {'Load': loads([]), 'Gen': case})
+    _, reports = area.build_targets({'Load': loads([]), 'Gen': case}, {'Load': loads([]), 'Gen': case})
     out = area.areas(None, reports, final_loss=pd.Series({1: 7.0}))
     row = out[out['Group'] == 'Load'].iloc[0]
     assert len(out) == 2 and row['Final Loss MW'] == 7.0 and pd.isna(row['Seed Loss MW'])
@@ -504,7 +504,7 @@ def test_areas_ledger_holds_when_an_island_unit_stays_on():
     assert 'unexplained' not in row['Note'] and 'of which 100.0 MW stayed on' in row['Note']
 
 def test_areas_ledger_holds_with_a_makeup_and_the_held_gens_shortfall_lands_on_its_group():
-    out, targets = ledger_run(makeup=True)
+    out, _ = ledger_run(makeup=True)
     ledger = out['Target MW'] - out['Unmet MW'] - out['Not Reached MW'] + out['Make-up MW'] + out['Balance MW']
     assert (abs(out['Final MW'] - ledger) < 1e-6).all(), out
     assert not out['Note'].str.contains('unexplained').any(), out['Note']
@@ -634,12 +634,12 @@ def test_midrun_balance_of_an_own_slack_with_no_range_stays_cheap():
 def test_midrun_balance_of_an_own_slack_is_off_with_no_trigger_and_a_narrow_range():
     # Trigger 0: the band is the slack's 0 (not its MWMin 50) to MWMax; a range under 100 MW is not balanced midrun (the
     # final balance still runs). 0..90 MW here.
-    log, steps, swing, (lo, hi) = own_slack_ramp(50.0, 90.0, 0.0)
+    log, _, swing, (lo, hi) = own_slack_ramp(50.0, 90.0, 0.0)
     assert lo == 0.0
     assert log == [] and lo - area.BALANCE_TOL_MW <= swing <= hi + area.BALANCE_TOL_MW
-    log, steps, swing, _ = own_slack_ramp(0.0, 1000.0, 0.0)                  # A wide range: balanced at its limits, not every step.
+    log, _, swing, _ = own_slack_ramp(0.0, 1000.0, 0.0)                  # A wide range: balanced at its limits, not every step.
     assert 1 <= len(log) <= 5, len(log)
-    log, steps, swing, _ = own_slack_ramp(50.0, 100.0, 0.0)                  # 0..100, exactly MIN_OWN_RANGE_MW wide: still balanced (strict <).
+    log, _, swing, _ = own_slack_ramp(50.0, 100.0, 0.0)                  # 0..100, exactly MIN_OWN_RANGE_MW wide: still balanced (strict <).
     assert len(log) >= 1
 
 def test_areas_keeps_a_seed_gen_whose_id_is_the_statcom_id():

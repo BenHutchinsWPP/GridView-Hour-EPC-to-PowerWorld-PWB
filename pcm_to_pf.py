@@ -444,7 +444,7 @@ def _scale_hours_parallel(todo: list[tuple[Path, Path]], workers: int):
               bar_format='{percentage:3.0f}% |{bar}| {elapsed}<{remaining} {desc}') as bar:
         def redraw():
             hours = []
-            for p, recv, gv_fp, console_fp in running.values():
+            for _, _, gv_fp, console_fp in running.values():
                 progress, stage = hour_progress(console_fp)
                 seen[gv_fp.stem] = max(seen.get(gv_fp.stem, 0), progress)
                 hours.append(f'{gv_fp.stem} {stage} {progress}%')

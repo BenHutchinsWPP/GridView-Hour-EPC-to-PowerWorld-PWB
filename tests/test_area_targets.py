@@ -595,7 +595,7 @@ def test_makeup_leaves_non_conforming_loads_alone_unless_scale_nonconforming():
 def test_non_conforming_loads_open_in_both_cases_are_not_target_rows():
     # s1 is Open in the seed and in the EPC: nothing to change, so no target row (no write, no exception, not counted).
     # s2 is Closed in the EPC: the one row, so the Note says '1 load'.
-    sa, targets, reports, sheet, _ = nonc_hour(
+    _, targets, reports, sheet, _ = nonc_hour(
         [('s1', 1, 'Open', 7.0, 0.0, 0.0, 0.0), ('s2', 1, 'Open', 7.0, 0.0, 0.0, 0.0)],
         [('s1', 1, 'Open', 9.0, 0.0, 0.0, 0.0), ('s2', 1, 'Closed', 25.0, 0.0, 0.0, 0.0)], flags=('NO', 'NO'), epc_flags=('NO', 'NO'), low=(4,))
     assert reports['nonconforming'] == {'s1', 's2'} and 's1' not in targets['Load'].index
@@ -606,7 +606,7 @@ def test_non_conforming_loads_open_in_both_cases_are_not_target_rows():
 def test_nonconforming_loads_take_the_epc_status_and_those_without_a_key_are_left_alone():
     # s1: Open in the seed, Closed in the EPC (SMW 30; its I 5 and Z 5 don't count): closed in. s2: Closed in the seed, Open in the EPC: opened.
     # s3: no EPC key: untouched. Dist gen of the 1:1 loads goes Open & 0.
-    sa, targets, reports, sheet, _ = nonc_hour(
+    sa, targets, _, sheet, _ = nonc_hour(
         [('s1', 1, 'Open', 7.0, 0.0, 0.0, 0.0), ('s2', 1, 'Closed', 60.0, 0.0, 0.0, 0.0), ('s3', 1, 'Closed', 30.0, 0.0, 0.0, 0.0)],
         [('s1', 1, 'Closed', 30.0, 5.0, 5.0, 4.0), ('s2', 1, 'Open', 99.0, 0.0, 0.0, 0.0)],
         flags=('NO', 'NO', 'NO'), epc_flags=('NO', 'NO'))
@@ -658,7 +658,7 @@ def test_shortfall_sheet_lists_epc_and_pwb_gens_side_by_side():
                 ('e9', 1, '9', 'Closed', 'PV', 300.0, 300.0, 0.0), ('s1', 1, '1', 'Closed', 'PV', 100.0, 100.0, 0.0),
                 ('wo', 1, '6', 'Open', 'WT', 0.0, 900.0, 0.0),
                 ('t1', 1, '3', 'Closed', 'GT', 500.0, 3000.0, 0.0), ('h1', 2, '1', 'Closed', 'HY', 150.0, 150.0, 0.0)])
-    targets, reports = area.build_targets({'Load': loads([]), 'Gen': epc}, {'Load': loads([]), 'Gen': case})
+    _, reports = area.build_targets({'Load': loads([]), 'Gen': epc}, {'Load': loads([]), 'Gen': case})
     s = reports['shortfall']
     assert s[['AreaNumber', 'GenType', 'Flag']].drop_duplicates().values.tolist() == [
         [1, 'Wind', 'no PWB units'], [1, 'Solar', 'short of capacity']]

@@ -189,7 +189,7 @@ def exceptions_run():
     epc_load = loads([('l1', 1, 'Closed', 3200.0, 0.0, 0.0, 320.0)])
     sa = SwingSimAuto(gen, load)
     sa.bad = {'4'}                                              # Any write to g3 diverges: held in main, then excluded.
-    targets, reports = area.build_targets({'Load': epc_load, 'Gen': epc_gen}, {'Load': load, 'Gen': gen}, swing_buses=[99])
+    targets, _ = area.build_targets({'Load': epc_load, 'Gen': epc_gen}, {'Load': load, 'Gen': gen}, swing_buses=[99])
     after_step, midruns = area.midrun_balancer(sa)
     main = scale.Run('main', scale.iterate_to_gen_load_targets(sa, targets, after_step=after_step))
     return sa, targets, [main, *midruns, *area.balance_swing(sa, targets)]

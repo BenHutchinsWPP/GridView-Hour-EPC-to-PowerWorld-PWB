@@ -389,7 +389,7 @@ def step_02_hour_with_a_failure(fail_balance=False, fail_distgen=False):
     return sheets['runs'], sheets['areas'], sa.saved['h1.pwb']
 
 def test_step_02_keeps_the_hour_when_the_final_balance_raises():
-    runs, areas, out = step_02_hour_with_a_failure(fail_balance=True)
+    runs, areas, _ = step_02_hour_with_a_failure(fail_balance=True)
     assert runs['Run'].tolist()[-2:] == ['balance1', 'balance2'], runs                 # Round 1 is kept...
     assert pd.to_numeric(runs['Swing MW After'], errors='coerce').notna().iloc[-2], runs  # ...with its After.
     assert runs['Note'].iloc[-1].startswith("failed: RuntimeError('boom')"), runs
@@ -397,7 +397,7 @@ def test_step_02_keeps_the_hour_when_the_final_balance_raises():
     assert areas.loc[areas['Group'] != 'Load', 'Balance MW'].abs().sum() > 1, areas
 
 def test_step_02_keeps_the_hour_when_the_dist_gen_cleanup_raises():
-    runs, areas, out = step_02_hour_with_a_failure(fail_distgen=True)
+    runs, areas, _ = step_02_hour_with_a_failure(fail_distgen=True)
     row = runs[runs['Run'] == 'distgen'].iloc[0]
     assert row['Note'].startswith("failed: RuntimeError('no dist gen')"), runs
     assert not areas['Note'].astype(str).str.contains('unexplained').any(), areas
