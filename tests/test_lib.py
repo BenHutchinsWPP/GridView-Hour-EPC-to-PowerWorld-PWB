@@ -1869,6 +1869,40 @@ def test_makeup_targets_stay_in_the_group_and_respect_caps_islands_and_signs():
     moved, _ = area.makeup_targets(final, {'Gen': tg, 'Load': tl}, swing_buses=[], skip={'gx', 'gi', 'lx'})
     assert moved['Gen']['MWSetPoint_Target'].round(9).to_dict() == {'h1': 160.0}
 
+def test_a_gen_above_mwmax_is_not_raised_by_any_placement():
+    # In each placement a unit sits above its MWMax (600 vs 500) and the move is up: it stays at 600 and the other takes it all.
+    gen = gens([('hi', 1, '1', 'Closed', 'GT', 600.0, 500.0, 0.0), ('lo', 1, '2', 'Closed', 'GT', 100.0, 1000.0, 0.0)]).assign(BusNum=[1, 2])
+    # balance_targets: swing +100 MW, all of it onto lo.
+    t = area.balance_targets({'Gen': gen, 'Load': loads([])}, swing=100.0, swing_buses=[])
+    assert t['Gen']['MWSetPoint_Target'].to_dict() == {'hi': 600.0, 'lo': 200.0}
+    # prebalance_targets: load 200 -> 400 MW puts +200 on the swing; hi's target is above its MWMax, so lo takes all 200.
+    t = load_ramp_targets()
+    t['Load']['SMW_Target'] = 400.0
+    t['Gen'] = targets_df(ObjectID=['hi', 'lo'], BusNum=[1, 2], ID='1', Status='Closed', Status_Target='Closed',
+                          MWSetPoint=[600.0, 100.0], MWSetPoint_Target=[600.0, 100.0], MWMax=[500.0, 1000.0])
+    with contextlib.redirect_stdout(io.StringIO()):
+        area.prebalance_targets(t)
+    assert t['Gen']['MWSetPoint_Target'].to_dict() == {'hi': 600.0, 'lo': 300.0}
+    # makeup_targets: gx (same group) is 60 MW short; hi can't take any, lo takes all 60.
+    tg = targets_df(ObjectID=['hi', 'lo', 'gx'], AreaNumber=1, BusNum=[1, 2, 3], ID='1', UnitTypeCode='GT', FuelTypeCode='',
+                    Status='Closed', MWSetPoint=[600.0, 100.0, 40.0], MWSetPoint_Target=[600.0, 100.0, 100.0])
+    tg.loc['gx', 'ExclusionReason'] = 'Diverged during scaling'
+    tl = targets_df(ObjectID=['l1'], AreaNumber=1, BusNum=1, ID='1', Status='Closed',
+                    **{c: 0.0 for c in LOAD_P_ALL}, **{f'{c}_Target': 0.0 for c in LOAD_P_ALL})
+    final = {'Gen': tg.reset_index().assign(MWMax=[500.0, 1000.0, 1000.0]), 'Load': tl.reset_index().assign(AGC='YES', DistStatus='Open')}
+    moved, asked = area.makeup_targets(final, {'Gen': tg, 'Load': tl}, swing_buses=[], skip={'gx'})
+    assert asked['Gen'] == 60.0 and moved['Gen']['MWSetPoint_Target'].round(9).to_dict() == {'lo': 160.0}
+    # gen_targets plan make-up: Hydro (EPC 200 MW) has one 100 MW unit, so 100 MW go onto the area's Thermal, whose unit
+    # th sits at 600 above its MWMax 500 (the EPC's 700 Thermal MW leave it there): tl takes the 100 (MWMax 400, at 100).
+    case = gens([('h1', 1, '1', 'Closed', 'HY', 0.0, 100.0, 0.0), ('th', 1, '2', 'Closed', 'GT', 600.0, 500.0, 0.0),
+                 ('tl', 1, '3', 'Closed', 'GT', 100.0, 400.0, 0.0)])
+    epc = gens([('e1', 1, '1', 'Closed', 'HY', 200.0, 500.0, 0.0), ('e2', 1, '2', 'Closed', 'GT', 700.0, 1000.0, 0.0)])
+    with saved_settings():
+        area.MAKEUP = True
+        df, _ = area.gen_targets(epc, case)
+    assert df['MWSetPoint_Target'].round(9).to_dict() == {'h1': 100.0, 'th': 600.0, 'tl': 200.0}
+    assert df['Planned MW'].round(9).to_dict() == {'h1': 100.0, 'th': 600.0, 'tl': 200.0}
+
 def test_step_02_runs_a_makeup_only_in_area_mode_when_something_is_short():
     gen, load = two_cases()
     epc_gen = gens([('e1', 1, '1', 'Closed', 'GT', 150.0, 1000.0, 0.0), ('e2', 1, '2', 'Closed', 'HY', 50.0, 1000.0, 0.0)]).assign(BusNum=[1, 2], MW=0.0, NomkV=230.0, BusName='b')
