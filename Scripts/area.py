@@ -10,6 +10,7 @@ Working tables are in the shape Scripts/scale.py expects (see its docstring), pl
 """
 from collections.abc import Callable, Collection, Iterable, Sequence
 from collections.abc import Set as AbstractSet
+from typing import Any
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -75,10 +76,9 @@ def classify_gen_type(df: pd.DataFrame) -> pd.Series:
     return by_unit.fillna(by_fuel).fillna('Unknown')
 
 # ------------------ Fields read from each case ------------------
-_KEY = {'ObjectID': str, 'BusNum': int, 'BusName': str, 'NomkV': float, 'ID': str, 'AreaNumber': int}
-LOAD_FIELDS: dict[str, type] = {**_KEY, 'Status': str, 'AGC': str, 'DistStatus': str, **{c: float for c in scale.SCALED['Load']}}
-GEN_FIELDS: dict[str, type] = {**_KEY, 'Status': str, 'MW': float, 'MWSetPoint': float, 'MWMax': float, 'MWMin': float,
-                               'UnitTypeCode': str, 'FuelTypeCode': str}
+_KEY = ['ObjectID', 'BusNum', 'BusName', 'NomkV', 'ID', 'AreaNumber']
+LOAD_FIELDS = [*_KEY, 'Status', 'AGC', 'DistStatus', *scale.SCALED['Load']]
+GEN_FIELDS = [*_KEY, 'Status', 'MW', 'MWSetPoint', 'MWMax', 'MWMin', 'UnitTypeCode', 'FuelTypeCode']
 
 LOAD_P = ['SMW', 'IMW', 'ZMW']
 LOAD_Q = ['SMvar', 'IMvar', 'ZMvar']
@@ -850,7 +850,7 @@ def _area_notes(out: pd.DataFrame, plan: pd.DataFrame, ledger: pd.Series) -> lis
         notes.append('; '.join(n))
     return notes
 
-def compute_targets(SimAuto: pw.SimAutoApi, gv_fp: Path, pw_fp: Path) -> tuple[dict, dict]:
+def compute_targets(SimAuto: pw.SimAutoApi, gv_fp: Path, pw_fp: Path) -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
     """Opens the EPC and the PWB, and returns build_targets() of their loads & gens. Closes the case."""
     pw.open_case(SimAuto, gv_fp)
     epc = read_case(SimAuto)
@@ -872,7 +872,7 @@ LOSS_RATIO_MAX = 2.0    # An area's load ratio is capped at this (a small-load a
 
 def area_losses(SimAuto: pw.SimAutoApi) -> pd.Series:
     """LossMW of each area of the open case, by AreaNumber."""
-    df = pw.get_df(SimAuto, 'Area', {'Number': int, 'LossMW': float})
+    df = pw.get_df(SimAuto, 'Area', ['Number', 'LossMW'])
     return pd.Series(df['LossMW'].to_numpy(), index=pd.Index(df['Number'].to_numpy(), name='AreaNumber'), dtype=float)
 
 def loss_estimate(targets: dict[str, pd.DataFrame], area_load: pd.DataFrame, seed_loss: pd.Series) -> pd.DataFrame:
@@ -913,7 +913,7 @@ def swing_units(gen: pd.DataFrame, slack_buses: Collection[int]) -> pd.DataFrame
     swing = on[on['ID'] == prep.SWING_ID]
     return swing if len(swing) else on[on['BusNum'].isin(slack_buses)]
 
-def swing_mw(gen: pd.DataFrame, slack_buses: Collection[int]) -> tuple[float, list]:
+def swing_mw(gen: pd.DataFrame, slack_buses: Collection[int]) -> tuple[float, list[int]]:
     """MW on the swing, and the swing's bus numbers."""
     swing = swing_units(gen, slack_buses)
     return float(swing['MW'].sum()), sorted(set(swing['BusNum']))
@@ -959,7 +959,7 @@ def swing_goal(gen: pd.DataFrame, slack_buses: Collection[int], epc: pd.DataFram
     goal = epc_mw[matched].clip(lower=lo[matched], upper=hi[matched])
     return float(goal.sum() + lo[~matched].sum()), float(goal.sum() + hi[~matched].sum())
 
-def balance_skips(SimAuto: pw.SimAutoApi, final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFrame] | None = None) -> set:
+def balance_skips(SimAuto: pw.SimAutoApi, final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFrame] | None = None) -> set[str]:
     """
     ObjectIDs a balance leaves alone: gens/loads on buses outside the main island (the swing can't take what they
     move) or outside the scaling voltage band (the balance's own scaling would hold them at once, so their share would
@@ -969,17 +969,17 @@ def balance_skips(SimAuto: pw.SimAutoApi, final: dict[str, pd.DataFrame], target
     if not (island == scale.MAIN_ISLAND).any():     # Numbering not as expected (or blank): don't skip everything.
         island = pd.Series(scale.MAIN_ISLAND, index=island.index)
     skip = {oid for df in final.values()
-            for oid in df.loc[~scale.voltage_ok(df, vpu) | (df['BusNum'].map(island) != scale.MAIN_ISLAND), 'ObjectID']}
+            for oid in df.loc[~scale.voltage_ok(df, vpu) | (df['BusNum'].map(island) != scale.MAIN_ISLAND).fillna(True), 'ObjectID']}
     for df in (targets or {}).values():
         skip |= set(df.index[~scale.included(df) | scale.held(df)])
     return skip
 
-def movable_gens(gen: pd.DataFrame, swing_buses: Collection[int], skip: AbstractSet = frozenset()) -> pd.DataFrame:
+def movable_gens(gen: pd.DataFrame, swing_buses: Collection[int], skip: AbstractSet[str] = frozenset()) -> pd.DataFrame:
     """Gens a balance or make-up may move (a copy): scalable_gens(), Closed, MWSetPoint > 0, not on a swing bus, not in skip (ObjectIDs)."""
     gen = scalable_gens(gen)
     return gen[closed(gen) & (gen['MWSetPoint'] > 0) & ~gen['BusNum'].isin(swing_buses) & ~gen['ObjectID'].isin(skip)].copy()
 
-def balance_targets(final: dict[str, pd.DataFrame], swing: float, swing_buses: Collection[int], skip: AbstractSet = frozenset()) -> dict[str, pd.DataFrame]:
+def balance_targets(final: dict[str, pd.DataFrame], swing: float, swing_buses: Collection[int], skip: AbstractSet[str] = frozenset()) -> dict[str, pd.DataFrame]:
     """
     Targets which move `swing` MW off the swing onto generation only; load is never moved (it stays on its EPC target).
     (Swing at +X MW: gens up X.) One factor on every Closed gen with MW > 0 (not on a swing bus, not a DC tie), so each
@@ -1057,6 +1057,7 @@ def run_correction(SimAuto: pw.SimAutoApi, run: scale.Run, label: str) -> bool:
     exception propagates (balance_swing() and create_case() note a final balance's or make-up's as 'failed'; a
     midrun one ends the main scaling, so the hour). True: it ran to the end.
     """
+    assert run.moved is not None, f'{run.name}: no tables to scale'     # Every caller builds the Run with moved tables.
     try:
         run.log = scale.iterate_to_gen_load_targets(SimAuto, run.moved, label=label, initial_step=scale.MAX_STEP)
         return True
@@ -1131,7 +1132,7 @@ def rescale_targets(targets: dict[str, pd.DataFrame], moved: dict[str, pd.DataFr
 MAKEUP = True   # Keep area gen totals: plan Unmet and excluded units' shortfall go onto the group's, then the area's, other units.
 
 def makeup_targets(final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFrame], swing_buses: Collection[int],
-                   skip: AbstractSet = frozenset(), nonconforming: Iterable[str] = frozenset()) -> tuple[dict[str, pd.DataFrame], dict[str, float]] | None:
+                   skip: AbstractSet[str] = frozenset(), nonconforming: Iterable[str] = frozenset()) -> tuple[dict[str, pd.DataFrame], dict[str, float]] | None:
     """
     After the main scaling (area mode): per (AreaNumber, GenType) and per AreaNumber's load, the shortfall S = target -
     value of the main rows which were excluded (held units are excluded at the end of the main run; islanded rows are
@@ -1204,7 +1205,7 @@ def makeup(SimAuto: pw.SimAutoApi, targets: dict[str, pd.DataFrame], nonconformi
     return [run]
 
 def midrun_balancer(SimAuto: pw.SimAutoApi, epc: pd.DataFrame | None = None
-                    ) -> tuple[Callable[[pw.SimAutoApi, dict[str, pd.DataFrame], int], float | None], list[scale.Run]]:
+                    ) -> tuple[scale.AfterStep, list[scale.Run]]:
     """
     Returns (after_step, runs) for scale.iterate_to_gen_load_targets(). After each step, if the swing is outside
     its band, moves it onto the whole case's gen (balance_targets()), and keeps that in the scaling still to come

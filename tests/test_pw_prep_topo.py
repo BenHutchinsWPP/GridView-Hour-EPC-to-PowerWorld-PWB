@@ -354,6 +354,78 @@ def test_step_01_runs_the_conversion_after_agc_off_and_before_pvqv_and_the_giant
     order = [first(f'prep.{name}') for name in ('disable_area_agc', 'convert_loads_to_constant_power', 'get_pvqv', 'create_giant_swing')]
     assert order == sorted(order)
 
+class ThingSimAuto(FakeSimAuto):
+    """A 'Thing' table of the given rows [ObjectID, R, I, S]; counts GetFieldList calls and records the rows written."""
+    def __init__(self, rows, field_rows=None):
+        super().__init__()
+        self.rows, self.field_calls, self.written = rows, 0, []
+        self.field_rows = field_rows if field_rows is not None else [
+            ['Thing:R', 'R', 'Real', 'r', 'R', 'YES'], ['Thing:I', 'I', 'Integer', 'i', 'I', 'YES'], ['Thing:S', 'S', 'String', 's', 'S', 'YES']]
+
+    def GetFieldList(self, table):
+        self.field_calls += 1
+        return ('', self.field_rows)
+
+    def GetParametersMultipleElementRect(self, table, fields, filter_group):
+        names = ['ObjectID', 'R', 'I', 'S']
+        return ('', [[row[names.index(f)] for f in fields] for row in self.rows])
+
+    def ChangeParametersMultipleElementRect(self, table, fields, rows):
+        self.written = rows
+        return ('',)
+
+def test_blank_values_round_trip_through_get_df_and_set_df():
+    pw.clear_field_types()
+    rows = [['a', '1.5', '101', 'x'], ['b', '', '', ''], ['c', '2.5', '7', 'y']]
+    sa = ThingSimAuto(rows)
+    df = pw.get_df(sa, 'Thing', ['ObjectID', 'R', 'I', 'S'])
+    assert all(type(v) is str for v in [*df['S'], *df['ObjectID']])
+    assert str(df['R'].dtype) == 'float64' and str(df['I'].dtype) == 'Int64'
+    assert np.isnan(df.loc[1, 'R']) and df.loc[1, 'I'] is pd.NA and df.loc[1, 'S'] == ''
+    pw.set_df(sa, 'Thing', df, ['ObjectID', 'R', 'I', 'S'])
+    assert sa.written == rows
+    pw.clear_field_types()
+
+def test_field_types_keys_by_variable_name_and_concise_name_and_falls_back_to_the_base_name():
+    pw.clear_field_types()
+    sa = ThingSimAuto([['a', '1', '2', 'x']], field_rows=[
+        ['Thing:R', 'RealVarName', 'Real', 'd', 'RConcise', 'YES'], ['Thing:I', 'CustomInteger', 'Integer', 'd', '', 'YES'],
+        ['Thing:S', 'Odd', 'Weird', 'd', 'SConcise', 'YES'], ['Thing:N', 'NoConcise', 'Real']])
+    assert pw.field_types(sa, 'Thing') == {'realvarname': 'Real', 'rconcise': 'Real', 'custominteger': 'Integer',
+                                           'odd': 'String', 'sconcise': 'String', 'noconcise': 'Real'}
+    assert pw._field_type(sa, 'Thing', 'CustomInteger:0') == 'Integer' and pw._field_type(sa, 'Thing', 'RConcise') == 'Real'
+    assert pw._field_type(sa, 'Thing', 'realVARname') == 'Real'      # PowerWorld's names ignore case.
+    pw.clear_field_types()
+    # A concise name ([4]) never overrides another field's variable name ([1]).
+    sa = ThingSimAuto([], field_rows=[['Thing:A', 'A', 'Real', 'd', 'B', 'YES'], ['Thing:B', 'B', 'String', 'd', '', 'YES']])
+    assert pw.field_types(sa, 'Thing') == {'a': 'Real', 'b': 'String'}
+    assert pw._field_type(sa, 'Thing', 'ObjectID') == 'String'
+    pw.clear_field_types()
+
+def test_a_field_missing_from_the_field_list_stops_the_read():
+    pw.clear_field_types()
+    sa = ThingSimAuto([['a', '1.5', '101', 'x']])
+    try:
+        pw.get_df(sa, 'Thing', ['ObjectID', 'R', 'Mystery', 'Other:1'])
+        assert False
+    except pw.SimAutoError as e:
+        assert 'GetFieldList(Thing) has no type for Mystery, Other:1.' in str(e)
+    # An Integer field with a fraction: a SimAutoError, not a TypeError.
+    try:
+        pw.get_df(ThingSimAuto([['a', '1', '1.5', 'x']]), 'Thing', ['I'])
+        assert False
+    except pw.SimAutoError as e:
+        assert 'Thing.I' in str(e)
+    pw.clear_field_types()
+
+def test_get_field_list_is_called_once_per_table():
+    pw.clear_field_types()
+    sa = ThingSimAuto([['a', '1.5', '101', 'x']])
+    pw.get_df(sa, 'Thing', ['ObjectID', 'R'])
+    pw.get_df(sa, 'Thing', ['I', 'S'])
+    assert sa.field_calls == 1
+    pw.clear_field_types()
+
 def test_settings_check_steps_and_workers():
     with saved_settings(), tempfile.TemporaryDirectory() as d:
         fp = Path(d) / 's.toml'

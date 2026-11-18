@@ -3,7 +3,7 @@ Topology mode: step 01 makes the PWB seed case match the GridView topology (miss
 branch statuses, distributed generation loads). Step 02 targets each gen & load to its own EPC value (build_targets()).
 The preparation both modes share is in prep.py.
 """
-from collections.abc import Iterable
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 import pandas as pd
@@ -17,225 +17,226 @@ TAP_THRESHOLD = 0.15            # Transformer taps / nominal kV further than thi
 UNSUPPORTED_GV_BRANCH_TYPES = ['Breaker', 'Disconnect', 'Fuse', 'Ground Disconnect', 'Load Break Disconnect', 'ZBR']
 
 # ------------------ Case data ------------------
+CaseDict = dict[str, dict[str, Any]]    # get_case_data(): table -> {'df': its DataFrame, ...}.
 # All the required network-parameters to fully define each object, for copying missing elements.
-def _owners(n: int) -> dict[str,type]:
-    return {k: t for i in range(1, n + 1) for k, t in ((f'OwnerNum{i}', int), (f'OwnerPerc{i}', float))}
+def _owners(n: int) -> list[str]:
+    return [k for i in range(1, n + 1) for k in (f'OwnerNum{i}', f'OwnerPerc{i}')]
 
-_LIMITS_MVA = {f'LimitMVA{c}': float for c in 'ABCDEFGHIJKLMNO'}
+_LIMITS_MVA = [f'LimitMVA{c}' for c in 'ABCDEFGHIJKLMNO']
 
-_EMS_BRANCH = {
-    'EMSType': str
-    ,'EMSID': str
-    ,'EMSLineID': str
-    ,'EMSCBTyp': str
-    ,'EMSID2From': str
-    ,'EMSID2To': str
-    ,'DataMaintainerAssign': str
-    ,'DataMaintainerInherit': str
-    ,'AllLabels': str
-}
+_EMS_BRANCH = [
+    'EMSType'
+    ,'EMSID'
+    ,'EMSLineID'
+    ,'EMSCBTyp'
+    ,'EMSID2From'
+    ,'EMSID2To'
+    ,'DataMaintainerAssign'
+    ,'DataMaintainerInherit'
+    ,'AllLabels'
+]
 
-BUS_PARAMS: dict[str,type] = {
-    'ObjectID': str
-    ,'Number': int
-    ,'Name': str
-    ,'NomkV': float
-    ,'Slack': str
-    ,'NomB': float
-    ,'NomG': float
-    ,'Vpu': float
-    ,'Vangle': float
-    ,'DCLossMultiplier': float
-    ,'AreaNumber': int
-    ,'ZoneNumber': int
-    ,'BANumber': int
-    ,'OwnerNumber': int
-    ,'SubNumber': int
-    ,'Monitor': str
-    ,'LimitSet': str
-    ,'UseSpecificLimits': str
-    ,**{f'LimitLow{c}': float for c in 'ABCD'}
-    ,**{f'LimitHigh{c}': float for c in 'ABCD'}
-    ,'Latitude': float
-    ,'Longitude': float
-    ,'TopologyBusType': str
-    ,'Priority': float
-    ,'EMSType': str
-    ,'EMSID': str
-    ,'DataMaintainerAssign': str
-    ,'DataMaintainerInherit': str
-    ,'DataMaintainerInheritBlock': str
-    ,'AllLabels': str
-}
+BUS_PARAMS: list[str] = [
+    'ObjectID'
+    ,'Number'
+    ,'Name'
+    ,'NomkV'
+    ,'Slack'
+    ,'NomB'
+    ,'NomG'
+    ,'Vpu'
+    ,'Vangle'
+    ,'DCLossMultiplier'
+    ,'AreaNumber'
+    ,'ZoneNumber'
+    ,'BANumber'
+    ,'OwnerNumber'
+    ,'SubNumber'
+    ,'Monitor'
+    ,'LimitSet'
+    ,'UseSpecificLimits'
+    ,*[f'LimitLow{c}' for c in 'ABCD']
+    ,*[f'LimitHigh{c}' for c in 'ABCD']
+    ,'Latitude'
+    ,'Longitude'
+    ,'TopologyBusType'
+    ,'Priority'
+    ,'EMSType'
+    ,'EMSID'
+    ,'DataMaintainerAssign'
+    ,'DataMaintainerInherit'
+    ,'DataMaintainerInheritBlock'
+    ,'AllLabels'
+]
 
-LOAD_PARAMS: dict[str,type] = {
-    'ObjectID': str
-    ,'BusNum': int
-    ,'ID': str
-    ,'Status': str
-    ,'AGC': str
-    ,'SMW': float
-    ,'SMvar': float
-    ,'IMW': float
-    ,'IMvar': float
-    ,'ZMW': float
-    ,'ZMvar': float
-    ,'DistStatus': str
-    ,'DistMWInput': float
-    ,'DistMvarInput': float
-    ,'Interruptible': str
-    ,'MWMax': float
-    ,'MWMin': float
-    ,'DistMWMax': float
-    ,'DistMWMin': float
-    ,'DistUnitTypeCode': str
-    ,'LoadModelGroup': str
-    ,'AreaNumber': int
-    ,'ZoneNumber': int
-    ,'BANumber': int
-    ,'OwnerNumber': int
-    ,'EMSType': str
-    ,'EMSID': str
-    ,'DataMaintainerAssign': str
-    ,'DataMaintainerInherit': str
-    ,'AllLabels': str
-}
+LOAD_PARAMS: list[str] = [
+    'ObjectID'
+    ,'BusNum'
+    ,'ID'
+    ,'Status'
+    ,'AGC'
+    ,'SMW'
+    ,'SMvar'
+    ,'IMW'
+    ,'IMvar'
+    ,'ZMW'
+    ,'ZMvar'
+    ,'DistStatus'
+    ,'DistMWInput'
+    ,'DistMvarInput'
+    ,'Interruptible'
+    ,'MWMax'
+    ,'MWMin'
+    ,'DistMWMax'
+    ,'DistMWMin'
+    ,'DistUnitTypeCode'
+    ,'LoadModelGroup'
+    ,'AreaNumber'
+    ,'ZoneNumber'
+    ,'BANumber'
+    ,'OwnerNumber'
+    ,'EMSType'
+    ,'EMSID'
+    ,'DataMaintainerAssign'
+    ,'DataMaintainerInherit'
+    ,'AllLabels'
+]
 
-GEN_PARAMS: dict[str,type] = {
+GEN_PARAMS: list[str] = [
     # Note: ReactiveCapability curve data is not necessary in the comparisons.
     # The Anchor Data Set may have additional generators, but none of them use ReactiveCapability curves.
-    'ObjectID': str
-    ,'BusNum': int
-    ,'ID': str
-    ,'Status': str
-    ,'VoltSet': float
-    ,'VoltSetTol': float
-    ,'RegBusNum': int
-    ,'RegFactor': float
-    ,'AGC': str
-    ,'PartFact': float
-    ,'MWSetPoint': float
-    ,'MWMax': float
-    ,'MWMin': float
-    ,'EnforceMWLimit': str
-    ,'AVR': str
-    ,'MvarSetPoint': float
-    ,'MvarMax': float
-    ,'MvarMin': float
-    ,'UseCapCurve': str
-    ,'WindContMode': str
-    ,'WindContModePF': float
-    ,'UseLineDrop': str
-    ,'Rcomp': float
-    ,'Xcomp': float
-    ,'VoltageDroopControl': str
-    ,'MVABase': float
-    ,'GenR': float
-    ,'GenX': float
-    ,'StepR': float
-    ,'StepX': float
-    ,'StepTap': float
-    ,'GovRespLimit': str
-    ,'UnitTypeCode': str
-    ,'FuelTypeCode': str
-    ,'AreaNumber': int
-    ,'ZoneNumber': int
-    ,'BANumber': int
-    ,**_owners(8)
-    ,'EMSType': str
-    ,'EMSID': str
-    ,'DataMaintainerAssign': str
-    ,'DataMaintainerInherit': str
-    ,'AllLabels': str
-}
+    'ObjectID'
+    ,'BusNum'
+    ,'ID'
+    ,'Status'
+    ,'VoltSet'
+    ,'VoltSetTol'
+    ,'RegBusNum'
+    ,'RegFactor'
+    ,'AGC'
+    ,'PartFact'
+    ,'MWSetPoint'
+    ,'MWMax'
+    ,'MWMin'
+    ,'EnforceMWLimit'
+    ,'AVR'
+    ,'MvarSetPoint'
+    ,'MvarMax'
+    ,'MvarMin'
+    ,'UseCapCurve'
+    ,'WindContMode'
+    ,'WindContModePF'
+    ,'UseLineDrop'
+    ,'Rcomp'
+    ,'Xcomp'
+    ,'VoltageDroopControl'
+    ,'MVABase'
+    ,'GenR'
+    ,'GenX'
+    ,'StepR'
+    ,'StepX'
+    ,'StepTap'
+    ,'GovRespLimit'
+    ,'UnitTypeCode'
+    ,'FuelTypeCode'
+    ,'AreaNumber'
+    ,'ZoneNumber'
+    ,'BANumber'
+    ,*_owners(8)
+    ,'EMSType'
+    ,'EMSID'
+    ,'DataMaintainerAssign'
+    ,'DataMaintainerInherit'
+    ,'AllLabels'
+]
 
-BRANCH_PARAMS: dict[str,type] = {
+BRANCH_PARAMS: list[str] = [
     # Non-transformer branches.
-    'ObjectID': str
-    ,'BusNumFrom': int
-    ,'BusNumTo': int
-    ,'Circuit': str
-    ,'BranchDeviceType': str
-    ,'ConsolidateAllow': str
-    ,'OpenOrCloseBreakersAllow': str
-    ,'Status': str
-    ,'StatusNormal': str
-    ,'ByPass': str
-    ,'MeteredBus': str
-    ,'R': float
-    ,'X': float
-    ,'B': float
-    ,'G': float
-    ,'LineLength': float
-    ,'Monitor': str
-    ,'LimitSet': str
-    ,**_LIMITS_MVA
-    ,**_owners(8)
-    ,**_EMS_BRANCH
-}
+    'ObjectID'
+    ,'BusNumFrom'
+    ,'BusNumTo'
+    ,'Circuit'
+    ,'BranchDeviceType'
+    ,'ConsolidateAllow'
+    ,'OpenOrCloseBreakersAllow'
+    ,'Status'
+    ,'StatusNormal'
+    ,'ByPass'
+    ,'MeteredBus'
+    ,'R'
+    ,'X'
+    ,'B'
+    ,'G'
+    ,'LineLength'
+    ,'Monitor'
+    ,'LimitSet'
+    ,*_LIMITS_MVA
+    ,*_owners(8)
+    ,*_EMS_BRANCH
+]
 
-TRANSFORMER_PARAMS: dict[str,type] = {
+TRANSFORMER_PARAMS: list[str] = [
     # Transformers in the branch table.
-    'ObjectID': str
-    ,'BusNumFrom': int
-    ,'BusNumTo': int
-    ,'Circuit': str
-    ,'BranchDeviceType': str
-    ,'Status': str
-    ,'StatusNormal': str
-    ,'ByPass': str
-    ,'MeteredBus': str
-    ,'ControlType': str
-    ,'AutoControl': str
-    ,'RegBusNum': int
-    ,'UseLineDrop': str
-    ,'Rcomp': float
-    ,'Xcomp': float
-    ,'RegMax': float
-    ,'RegMin': float
-    ,'RegTargetType': str
-    ,'XFMVABase': float
-    ,'XFNomkVbaseFrom': float
-    ,'XFNomkVbaseTo': float
-    ,'Rxfbase': float
-    ,'Xxfbase': float
-    ,'Gxfbase': float
-    ,'Bxfbase': float
-    ,'Gmagxfbase': float
-    ,'Bmagxfbase': float
-    ,'TapFixedFrom': float
-    ,'TapFixedTo': float
-    ,'TapMaxxfbase': float
-    ,'TapMinxfbase': float
-    ,'TapStepSizexfbase': float
-    ,'Tapxfbase': float
-    ,'Phase': float
-    ,'ImpCorrTable': float
-    ,'LineLength': float
-    ,'Monitor': str
-    ,'LimitSet': str
-    ,**_LIMITS_MVA
-    ,**_owners(8)
-    ,**_EMS_BRANCH
-}
+    'ObjectID'
+    ,'BusNumFrom'
+    ,'BusNumTo'
+    ,'Circuit'
+    ,'BranchDeviceType'
+    ,'Status'
+    ,'StatusNormal'
+    ,'ByPass'
+    ,'MeteredBus'
+    ,'ControlType'
+    ,'AutoControl'
+    ,'RegBusNum'
+    ,'UseLineDrop'
+    ,'Rcomp'
+    ,'Xcomp'
+    ,'RegMax'
+    ,'RegMin'
+    ,'RegTargetType'
+    ,'XFMVABase'
+    ,'XFNomkVbaseFrom'
+    ,'XFNomkVbaseTo'
+    ,'Rxfbase'
+    ,'Xxfbase'
+    ,'Gxfbase'
+    ,'Bxfbase'
+    ,'Gmagxfbase'
+    ,'Bmagxfbase'
+    ,'TapFixedFrom'
+    ,'TapFixedTo'
+    ,'TapMaxxfbase'
+    ,'TapMinxfbase'
+    ,'TapStepSizexfbase'
+    ,'Tapxfbase'
+    ,'Phase'
+    ,'ImpCorrTable'
+    ,'LineLength'
+    ,'Monitor'
+    ,'LimitSet'
+    ,*_LIMITS_MVA
+    ,*_owners(8)
+    ,*_EMS_BRANCH
+]
 
-LINESHUNT_PARAMS: dict[str,type] = {
-    'ObjectID': str
-    ,'BusNumFrom': int
-    ,'BusNumTo': int
-    ,'Circuit': str
-    ,'ID': str
-    ,'BusNumLoc': int
-    ,'Status': str
-    ,'MWNom': float
-    ,'MvarNom': float
-    ,**_owners(4)
-    ,'DataMaintainerAssign': str
-    ,'DataMaintainerInherit': str
-}
+LINESHUNT_PARAMS: list[str] = [
+    'ObjectID'
+    ,'BusNumFrom'
+    ,'BusNumTo'
+    ,'Circuit'
+    ,'ID'
+    ,'BusNumLoc'
+    ,'Status'
+    ,'MWNom'
+    ,'MvarNom'
+    ,*_owners(4)
+    ,'DataMaintainerAssign'
+    ,'DataMaintainerInherit'
+]
 
 
-def get_case_data(SimAuto: pw.SimAutoApi) -> dict[str,dict[str,object]]:
+def get_case_data(SimAuto: pw.SimAutoApi) -> CaseDict:
     print('get_case_data()')
     return {
         'Bus':{
@@ -288,7 +289,7 @@ def missing_rows(left_df: pd.DataFrame, right_df: pd.DataFrame) -> pd.DataFrame:
     """Rows of left_df whose ObjectID is not in right_df."""
     return left_df[~left_df['ObjectID'].isin(right_df['ObjectID'])].copy()
 
-def create_missing_elements(SimAuto: pw.SimAutoApi, left_case_dict: dict[str, dict[str, Any]], right_case_dict: dict[str, dict[str, Any]]) -> dict[str,pd.DataFrame]:
+def create_missing_elements(SimAuto: pw.SimAutoApi, left_case_dict: CaseDict, right_case_dict: CaseDict) -> dict[str,pd.DataFrame]:
     # Any elements on the left, which aren't on the right, will get created.
     print('create_missing_elements()')
 
@@ -333,7 +334,7 @@ def create_distgen_XN_loads(SimAuto: pw.SimAutoApi, gv_load_df: pd.DataFrame) ->
     New loads will be in a normal-open status, with MW=0 MVAR=0 for all related values.
     Returns a dataframe of all distributed generation loads which were created.
     """
-    pw_load_df = pw.get_df(SimAuto, 'Load', {'ObjectID': str})
+    pw_load_df = pw.get_df(SimAuto, 'Load', ['ObjectID'])
     missing_df = missing_rows(gv_load_df, pw_load_df)
     missing_df[['Status', 'DistStatus']] = 'Open'
     missing_df[['SMW', 'SMvar', 'DistMWInput', 'DistMvarInput', 'IMW', 'IMvar', 'ZMW', 'ZMvar']] = 0
@@ -356,17 +357,17 @@ def fix_transformer_taps(SimAuto: pw.SimAutoApi) -> pd.DataFrame:
     # In GridView, some transformer models may have transformer nominal kV and tap positions which are aggregious errors.
     # GridView doesn't have issues with this (DC Loadflow), but this certainly will cause problems in PowerWorld.
     # If Nominal kV and Tap positions are far out of range, fix them to 1.0 PU based on the bus nominal kV.
-    fields: dict[str,type] = {
-        'ObjectID': str
-        ,'ControlType': str
-        ,'NomkVFrom': float
-        ,'XFNomkVbaseFrom': float
-        ,'NomkVTo': float
-        ,'XFNomkVbaseTo': float
-        ,'TapFixedFrom': float
-        ,'TapFixedTo': float
-        ,'Tap': float
-    }
+    fields = [
+        'ObjectID'
+        ,'ControlType'
+        ,'NomkVFrom'
+        ,'XFNomkVbaseFrom'
+        ,'NomkVTo'
+        ,'XFNomkVbaseTo'
+        ,'TapFixedFrom'
+        ,'TapFixedTo'
+        ,'Tap'
+    ]
     df = pw.get_df(SimAuto, 'Branch', fields, "BranchDeviceType = 'Transformer'")
     bad_df = df[~transformer_is_okay(df)]
 
@@ -382,13 +383,13 @@ def fix_transformer_taps(SimAuto: pw.SimAutoApi) -> pd.DataFrame:
     return bad_df
 
 # ------------------ Branch statuses ------------------
-def branch_status_changes(left_case_dict: dict[str, dict[str, Any]], right_case_dict: dict[str, dict[str, Any]]) -> tuple[pd.DataFrame, pd.DataFrame]:
+def branch_status_changes(left_case_dict: CaseDict, right_case_dict: CaseDict) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Returns:
         status_targets_df: branches whose status differs between the models (for reporting).
         changes_df: ['ObjectID', 'Status', 'StatusLeft'] for right-model branches which need a status change.
     """
-    def branches(case_dict: dict[str, dict[str, Any]]) -> pd.DataFrame:
+    def branches(case_dict: CaseDict) -> pd.DataFrame:
         # Get Transformer and Non-Transformer branch statuses by ObjectID.
         df = pd.concat([case_dict[k]['df'][['ObjectID','Status','BranchDeviceType']] for k in ('Branch', 'Transformer')], ignore_index=True)
         # GridView may drop some branch types from its EPC exports. Exclude them from the status changes.
@@ -406,7 +407,7 @@ def branch_status_changes(left_case_dict: dict[str, dict[str, Any]], right_case_
 
     return status_targets_df, changes_df
 
-def set_branch_statuses(SimAuto: pw.SimAutoApi, left_case_dict: dict[str, dict[str, Any]], right_case_dict: dict[str, dict[str, Any]]) -> list[pd.DataFrame]:
+def set_branch_statuses(SimAuto: pw.SimAutoApi, left_case_dict: CaseDict, right_case_dict: CaseDict) -> list[pd.DataFrame]:
     """
     With the "Right" case open, sets the "Right" model branch statuses to match those from the "Left" model.
     Returns [status_targets_df, fail_df].
@@ -417,15 +418,13 @@ def set_branch_statuses(SimAuto: pw.SimAutoApi, left_case_dict: dict[str, dict[s
 
 # ------------------ Targets (step 02) ------------------
 TARGET_FIELDS = {
-    table: {'ObjectID': str, 'BusNum': int, 'BusName': str, 'NomkV': float, 'ID': str,
-            **{s: str for s in scale.STATUS[table]}, **{c: float for c in scale.SCALED[table]},
+    table: ['ObjectID', 'BusNum', 'BusName', 'NomkV', 'ID', *scale.STATUS[table], *scale.SCALED[table],
             # Gens: the swing balances raise them up to MWMax, spread by area & GenType like area mode.
-            **({'MW': float, 'MWMin': float, 'MWMax': float, 'AreaNumber': int, 'UnitTypeCode': str, 'FuelTypeCode': str}
-               if table == 'Gen' else {})}
+            *(['MW', 'MWMin', 'MWMax', 'AreaNumber', 'UnitTypeCode', 'FuelTypeCode'] if table == 'Gen' else [])]
     for table in scale.STATUS
 }
 
-def compute_pw_targets(SimAuto: pw.SimAutoApi, gv_fp: Path, pw_fp: Path, dummy_bus_fp: Path) -> tuple[dict[str, pd.DataFrame], dict]:
+def compute_pw_targets(SimAuto: pw.SimAutoApi, gv_fp: Path, pw_fp: Path, dummy_bus_fp: Path) -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
     """
     Returns (targets {'Gen': df, 'Load': df}, reports {'swing': area.swing_epc() of the main island's gens}), taking the
     GridView EPC's gens & loads into the PWB case. See build_targets().
@@ -444,7 +443,7 @@ def compute_pw_targets(SimAuto: pw.SimAutoApi, gv_fp: Path, pw_fp: Path, dummy_b
     main_gen = case['Gen'][scale.island_reason(case['Gen'], islands) == '']    # A second island's slack has no goal.
     return targets, {'swing': area.swing_epc(gv['Gen'], main_gen, slack)}
 
-def build_targets(gv: dict[str,pd.DataFrame], case: dict[str,pd.DataFrame], swing_buses: Iterable[int] = ()) -> dict[str,pd.DataFrame]:
+def build_targets(gv: dict[str,pd.DataFrame], case: dict[str,pd.DataFrame], swing_buses: Collection[int] = ()) -> dict[str,pd.DataFrame]:
     """
     Puts the case's gens & loads side by side with their GridView targets (each element to its own EPC value).
     The swing is never scaled: the giant swing, and any gen on swing_buses (the slack bus). The solution sets their MW.

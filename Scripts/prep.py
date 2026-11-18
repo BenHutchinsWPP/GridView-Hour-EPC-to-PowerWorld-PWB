@@ -34,7 +34,7 @@ def suggested_shunt_status(df: pd.DataFrame, vlow: float, vhigh: float) -> pd.Se
 def adjust_shunts(SimAuto: pw.SimAutoApi) -> None:
     """Switches shunts to attempt to get buses back within a voltage band."""
     def shunt_changes() -> pd.DataFrame:
-        df = pw.get_df(SimAuto, 'Shunt', {'ObjectID': str, 'MvarNom': float, 'Status': str, 'Vpu': float})
+        df = pw.get_df(SimAuto, 'Shunt', ['ObjectID', 'MvarNom', 'Status', 'Vpu'])
         new_status = suggested_shunt_status(df, SHUNT_VLOW, SHUNT_VHIGH)
         changed = df['Status'] != new_status
         # Filter both sides: assigning a full Series to an empty frame makes one blank row per shunt.
@@ -67,7 +67,7 @@ def get_fault_duty(SimAuto: pw.SimAutoApi) -> pd.DataFrame:
     Returns a dataframe of fault duty at every bus.
     Note: deletes any existing Fault objects in the case.
     """
-    bus_df = pw.get_df(SimAuto, 'Bus', {'ObjectID': str, 'Number': int, 'Name': str, 'NomkV': float})
+    bus_df = pw.get_df(SimAuto, 'Bus', ['ObjectID', 'Number', 'Name', 'NomkV'])
 
     fault_df = pd.DataFrame()
     fault_df['FaultName'] = bus_df['Number'].astype(str) + ' : ' + bus_df['Name'].astype(str) + ' : ' + bus_df['NomkV'].astype(str)
@@ -81,16 +81,16 @@ def get_fault_duty(SimAuto: pw.SimAutoApi) -> pd.DataFrame:
         pw.run(SimAuto, 'Delete(Fault);')
         pw.set_df(SimAuto, 'Fault', fault_df, list(fault_df.columns))
 
-    fault_fields = {
-        'FaultName': str
-        ,'WhoAmI': str
-        ,'CustomInteger:0': int
-        ,'FaultType': str
-        ,'FaultImpedance': float
-        ,'FaultImpedance:1': float
-        ,'BusNomVolt': float
-        ,'ABCPhaseI': float
-    }
+    fault_fields = [
+        'FaultName'
+        ,'WhoAmI'
+        ,'CustomInteger:0'
+        ,'FaultType'
+        ,'FaultImpedance'
+        ,'FaultImpedance:1'
+        ,'BusNomVolt'
+        ,'ABCPhaseI'
+    ]
 
     pw.run(SimAuto, 'EnterMode(RUN);')
     pw.run(SimAuto, 'FaultMultiple(NO);')
@@ -111,16 +111,16 @@ def get_pvqv(SimAuto: pw.SimAutoApi) -> pd.DataFrame:
     Calculates bus voltage MW & MVAR self-sensitivity.
     Tools -> Sensitivities -> Flow and Voltage Sensitivities -> Self Sensitivity (Tab)
     """
-    bus_fields = {
-        'Number': int
-        ,'Name': str
-        ,'NomkV': float
-        ,'AreaNumber': int
-        ,'AreaName': str
-        ,'SensdVdPself': float
-        ,'SensdVdQself': float
-        ,'Vpu': float
-    }
+    bus_fields = [
+        'Number'
+        ,'Name'
+        ,'NomkV'
+        ,'AreaNumber'
+        ,'AreaName'
+        ,'SensdVdPself'
+        ,'SensdVdQself'
+        ,'Vpu'
+    ]
 
     pw.run(SimAuto, 'EnterMode(RUN);')
     pw.run(SimAuto, 'CalculateVoltSelfSense();')
@@ -131,14 +131,14 @@ def max_fault_duty_bus(fault_df) -> int:
 
 def slack_buses(SimAuto: pw.SimAutoApi) -> list[int]:
     """The case's swing buses."""
-    return pw.get_df(SimAuto, 'Bus', {'Number': int, 'Slack': str}).query("Slack == 'YES'")['Number'].tolist()
+    return pw.get_df(SimAuto, 'Bus', ['Number', 'Slack']).query("Slack == 'YES'")['Number'].tolist()
 
 def create_giant_swing(SimAuto: pw.SimAutoApi, bus_num: int) -> pd.DataFrame:
     """
     Creates a giant swing/slack unit on the given bus, e.g. max_fault_duty_bus() or slack_buses()[0].
     """
     # Get current bus information at the swing bus.
-    bus_df = pw.get_df(SimAuto, 'Bus', {'Number': int, 'Name': str, 'NomkV': float, 'Vpu': float})
+    bus_df = pw.get_df(SimAuto, 'Bus', ['Number', 'Name', 'NomkV', 'Vpu'])
     at_bus = bus_df.loc[bus_df['Number'] == bus_num]
     if at_bus.empty:
         raise ValueError(f'The giant swing bus {bus_num} is not in the case. Set swing_bus to a bus number in it, "slack" or "max_fault_duty".')
@@ -196,14 +196,13 @@ def constant_power_rows(load: pd.DataFrame) -> pd.DataFrame:
 
 def _swing_mw(SimAuto: pw.SimAutoApi) -> float:
     """MW of the Closed gens on the swing buses. (Not area.swing_mw: area imports this module.)"""
-    gen = pw.get_df(SimAuto, 'Gen', {'BusNum': int, 'Status': str, 'MW': float})
+    gen = pw.get_df(SimAuto, 'Gen', ['BusNum', 'Status', 'MW'])
     return float(gen.loc[(gen['Status'] == 'Closed') & gen['BusNum'].isin(slack_buses(SimAuto)), 'MW'].sum())
 
 def _read_loads(SimAuto: pw.SimAutoApi) -> pd.DataFrame:
-    return pw.get_df(SimAuto, 'Load', {
-        'ObjectID': str, 'BusNum': int, 'ID': str, 'AreaNumber': int, 'Status': str, 'MW': float, 'SMW': float, 'SMvar': float,
-        'IMW': float, 'IMvar': float, 'ZMW': float, 'ZMvar': float, 'NetMW': float, 'NetMvar': float, 'DistMW': float,
-        'DistStatus': str, 'DistMWInput': float, 'DistMvarInput': float})
+    return pw.get_df(SimAuto, 'Load', [
+        'ObjectID', 'BusNum', 'ID', 'AreaNumber', 'Status', 'MW', 'SMW', 'SMvar', 'IMW', 'IMvar', 'ZMW', 'ZMvar', 'NetMW', 'NetMvar',
+        'DistMW', 'DistStatus', 'DistMWInput', 'DistMvarInput'])
 
 def _area_net(load: pd.DataFrame) -> pd.DataFrame:
     closed = load[load['Status'] == 'Closed']

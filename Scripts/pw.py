@@ -3,6 +3,7 @@ Everything which talks to PowerWorld through SimAuto, plus the Excel report writ
 Every SimAuto error raises SimAutoError.
 """
 from collections.abc import Iterator, Sequence
+from numbers import Integral
 from pathlib import Path
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -24,6 +25,7 @@ class SimAutoApi(Protocol):
     def SaveCase(self, fp: str, case_format: str, overwrite: bool, /) -> tuple[Any, ...]: ...
     def CloseCase(self) -> tuple[Any, ...]: ...
     def RunScriptCommand(self, command: str, /) -> tuple[Any, ...]: ...
+    def GetFieldList(self, table: str, /) -> tuple[Any, ...]: ...
     def GetParametersMultipleElementRect(self, table: str, fields: list[str], filter_group: str, /) -> tuple[Any, ...]: ...
     def ChangeParametersMultipleElementRect(self, table: str, fields: list[str], rows: list[list[Any]], /) -> tuple[Any, ...]: ...
     def SaveState(self) -> tuple[Any, ...]: ...
@@ -59,26 +61,78 @@ def run(SimAuto: SimAutoApi, command: str) -> Any:
     """Runs a script command."""
     return chk(SimAuto.RunScriptCommand(command), command)
 
-def get_df(SimAuto: SimAutoApi, table: str, fields: dict[str,type], filter_group: str = '') -> pd.DataFrame:
-    """Reads `fields` of every object in `table` (optionally filtered), converted to the given types. Strings are trimmed."""
-    rows = chk(SimAuto.GetParametersMultipleElementRect(table, list(fields), filter_group), f'Get {table}')
-    df = pd.DataFrame(data=rows, columns=list(fields))
-    for field, typ in fields.items():
-        if typ in [int, float]:
-            # Handle numeric types with coerce for empty strings.
-            df[field] = pd.to_numeric(df[field], errors='coerce')
-            if typ is float:
-                # Whole-number values would otherwise come back as int64, which float values can't later be written into.
-                df[field] = df[field].astype(float)
-        else:
-            df[field] = df[field].astype(str).str.strip()      # Every non-numeric field is text.
+_field_types: dict[str, dict[str, str]] = {}   # table -> {lower-case field name: 'String' | 'Integer' | 'Real'}, one GetFieldList call per table.
+
+def clear_field_types() -> None:
+    """Forgets the cached field types (for tests)."""
+    _field_types.clear()
+
+def field_types(SimAuto: SimAutoApi, table: str) -> dict[str, str]:
+    """
+    PowerWorld's type of each field of `table` (GetFieldList): lower-case name -> 'String' | 'Integer' | 'Real' (PowerWorld's
+    field names ignore case). Keyed by each row's variable name ([1]) and, where that doesn't clash with a variable name,
+    its concise name ([4]). Cached per table.
+    """
+    if table not in _field_types:
+        rows = chk(SimAuto.GetFieldList(table), f'GetFieldList {table}') or []
+        typ = lambda row: str(row[2]).strip() if str(row[2]).strip() in ('Integer', 'Real') else 'String'
+        name = lambda row, i: str(row[i]).strip().lower() if len(row) > i else ''
+        types = {name(r, 1): typ(r) for r in rows if name(r, 1)}
+        for r in rows:
+            if name(r, 4):
+                types.setdefault(name(r, 4), typ(r))
+        _field_types[table] = types
+    return _field_types[table]
+
+def _field_type(SimAuto: SimAutoApi, table: str, field: str) -> str | None:
+    """Type of a requested field: its name (any case), else the name before a ':' location suffix. None: not listed."""
+    if field == 'ObjectID':
+        return 'String'
+    types = field_types(SimAuto, table)
+    for name in (field.lower(), field.split(':')[0].lower()):
+        if name in types:
+            return types[name]
+    return None
+
+def get_df(SimAuto: SimAutoApi, table: str, fields: Sequence[str], filter_group: str = '') -> pd.DataFrame:
+    """
+    Reads `fields` of every object in `table` (optionally filtered). Types come from PowerWorld (field_types), values are trimmed:
+    Real -> float64 (blank NaN), Integer -> Int64 (blank NA), String -> str (blank '').
+    """
+    fields = list(fields)
+    typ_of = {f: _field_type(SimAuto, table, f) for f in fields}
+    unknown = [f for f, t in typ_of.items() if t is None]
+    if unknown:     # Never guess: a number read as text breaks the scaling far from here, or silently.
+        raise SimAutoError(f'GetFieldList({table}) has no type for {", ".join(unknown)}. Check these field names against '
+                           f'pw.field_types(SimAuto, {table!r}).')
+    rows = chk(SimAuto.GetParametersMultipleElementRect(table, fields, filter_group), f'Get {table}')
+    df = pd.DataFrame(data=rows, columns=fields)
+    for field in fields:
+        df[field] = df[field].astype(str).str.strip()
+        typ = typ_of[field]
+        if typ == 'Real':
+            # Whole-number values would otherwise come back as int64, which float values can't later be written into.
+            df[field] = pd.to_numeric(df[field], errors='coerce').astype(float)
+        elif typ == 'Integer':
+            try:
+                df[field] = pd.to_numeric(df[field], errors='coerce').astype('Int64')
+            except TypeError as e:      # e.g. '1.5'
+                raise SimAutoError(f'{table}.{field}: PowerWorld types it Integer, but not every value is a whole number') from e
     return df
+
+def _text(v: Any) -> str:
+    """A cell as SimAuto text: missing -> '', whole numbers without '.0'."""
+    if pd.isna(v):
+        return ''
+    if isinstance(v, Integral) and not isinstance(v, bool):
+        return str(int(v))
+    return str(v)
 
 def set_df(SimAuto: SimAutoApi, table: str, df: pd.DataFrame, fields: list[str]) -> None:
     """Writes only `fields` of df. A named index (e.g. ObjectID) is available as a field. Missing values are sent as ''."""
     if len(df) == 0:
         return
-    rows = [['' if pd.isna(v) else str(v) for v in row] for row in df.reset_index()[fields].itertuples(index=False)]
+    rows = [[_text(v) for v in row] for row in df.reset_index()[fields].itertuples(index=False)]
     chk(SimAuto.ChangeParametersMultipleElementRect(table, fields, rows), f'Set {table}')
 
 @contextmanager
@@ -180,7 +234,7 @@ def solve(SimAuto: SimAutoApi) -> bool:
     run(SimAuto, 'EnterMode(EDIT);')
 
     # A "solved" case with large mismatches doesn't count.
-    df = get_df(SimAuto, 'Bus', {'Busnum':int, 'MismatchP':float, 'MismatchQ':float})
+    df = get_df(SimAuto, 'Bus', ['Busnum', 'MismatchP', 'MismatchQ'])
     max_mismatch = ((df['MismatchP']**2.0 + df['MismatchQ']**2.0)**0.5).max()
     return bool(max_mismatch < MVA_MISMATCH_THRESHOLD)
 

@@ -10,13 +10,16 @@ Gens and loads are handled by the same code. Their working tables ("targets") ar
     HeldReason       '' while the row is scaled. Otherwise, why it is held back for now (it is retried later).
     ExclusionReason  '' while the row is scaled or held. Otherwise, why it was excluded for good.
 """
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 import multiprocessing as mp
 import numpy as np
 import pandas as pd
 from . import pw, prep
+
+# Called after each scaling step with (SimAuto, targets, progress): returns a cap on the next step's size, or None.
+AfterStep = Callable[[pw.SimAutoApi, dict[str, pd.DataFrame], int], int | None]
 
 # ------------------ Tuning thresholds ------------------
 EXCLUDE_VMIN = 0.88             # Hold gens/loads back from scaling on buses below this Vpu...
@@ -163,15 +166,15 @@ def voltage_ok(df: pd.DataFrame, vpu_by_bus: pd.Series) -> pd.Series:
     return df['BusNum'].map(vpu_by_bus).between(EXCLUDE_VMIN, EXCLUDE_VMAX, inclusive='neither')
 
 def bus_vpu(SimAuto: pw.SimAutoApi) -> pd.Series:
-    return pw.get_df(SimAuto, 'Bus', {'Number': int, 'Vpu': float}).set_index('Number')['Vpu']
+    return pw.get_df(SimAuto, 'Bus', ['Number', 'Vpu']).set_index('Number')['Vpu']
 
 MAIN_ISLAND = 1     # Bus IslandNumber of the main island. Any other (or blank) is a separate island.
 
 def bus_islands(SimAuto: pw.SimAutoApi) -> pd.Series:
     """IslandNumber of each bus (NaN where blank), by bus number."""
-    return pw.get_df(SimAuto, 'Bus', {'Number': int, 'IslandNumber': int}).set_index('Number')['IslandNumber']
+    return pw.get_df(SimAuto, 'Bus', ['Number', 'IslandNumber']).set_index('Number')['IslandNumber']
 
-def seed_islands(SimAuto: pw.SimAutoApi, swing_buses: Iterable[int]) -> pd.Series | None:
+def seed_islands(SimAuto: pw.SimAutoApi, swing_buses: Collection[int]) -> pd.Series | None:
     """
     With the seed PWB open: solves it, and returns bus_islands(), or None (islands not checked, with a warning) if the
     case doesn't solve or no swing bus is in island MAIN_ISLAND (the numbering isn't what this code expects). A live
@@ -196,7 +199,7 @@ def island_reason(df: pd.DataFrame, island_by_bus: pd.Series | None) -> pd.Serie
         return pd.Series('', index=df.index, dtype=object)
     island = df['BusNum'].map(island_by_bus)
     reason = island.map(lambda i: 'No island' if pd.isna(i) else f'Island {int(i)}, not the main island')
-    return reason.where(island != MAIN_ISLAND, '').astype(object)
+    return reason.where((island != MAIN_ISLAND).fillna(True), '').astype(object)
 
 def epc_off_island(df: pd.DataFrame, island_by_bus: pd.Series | None) -> pd.Series:
     """
@@ -205,7 +208,7 @@ def epc_off_island(df: pd.DataFrame, island_by_bus: pd.Series | None) -> pd.Seri
     """
     if island_by_bus is None or not len(df):
         return pd.Series(False, index=df.index)
-    return df['BusNum'].isin(island_by_bus.index) & (df['BusNum'].map(island_by_bus) != MAIN_ISLAND)
+    return df['BusNum'].isin(island_by_bus.index) & (df['BusNum'].map(island_by_bus) != MAIN_ISLAND).fillna(True)
 
 def is_island_reason(reason: pd.Series) -> pd.Series:
     return reason.astype(str).str.startswith(('Island ', 'No island'))
@@ -351,24 +354,24 @@ def rescale(df: pd.DataFrame, factor: pd.Series, cols: list[str], cap: pd.Series
             df.loc[f.index, name] = new
 
 # ------------------ Voltage support ------------------
-def create_statcom_on_lowestv_bus(SimAuto: pw.SimAutoApi, skip_buses: Iterable[int], label: str = 'Main scaling') -> tuple[int, bool] | None:
+def create_statcom_on_lowestv_bus(SimAuto: pw.SimAutoApi, skip_buses: Collection[int], label: str = 'Main scaling') -> tuple[int, bool] | None:
     """
     If there is a bus with voltage lower than STATCOM_VPU, adds a STATCOM to the lowest voltage bus.
     Returns None if no bus needs one, otherwise (bus number, whether the STATCOM closed in successfully).
     Buses which already have one in the case (from any scaling run, e.g. an earlier balance) are skipped, as are
     skip_buses (this run's attempts, including those rolled back).
     """
-    gen_df = pw.get_df(SimAuto, 'Gen', {'BusNum': int, 'ID': str})
+    gen_df = pw.get_df(SimAuto, 'Gen', ['BusNum', 'ID'])
     skip_buses = set(skip_buses) | set(gen_df.loc[gen_df['ID'] == STATCOM_ID, 'BusNum'])
-    bus_fields: dict[str,type] = {
-        'Number': int
-        ,'BusNomVolt': float
-        ,'Vpu': float
-        ,'IslandNumber': int
-        ,'BusIsStarBus:1': str
-    }
+    bus_fields = [
+        'Number'
+        ,'BusNomVolt'
+        ,'Vpu'
+        ,'IslandNumber'
+        ,'BusIsStarBus:1'
+    ]
     bus_df = pw.get_df(SimAuto, 'Bus', bus_fields)
-    filtered_df = bus_df[(bus_df['IslandNumber'] == 1) &
+    filtered_df = bus_df[(bus_df['IslandNumber'] == 1).fillna(False) &
                          (bus_df['BusIsStarBus:1'] == 'NO') &
                          (bus_df['BusNomVolt'] > STATCOM_VNOM_MIN) &
                          (bus_df['Vpu'] < STATCOM_VPU) &
@@ -409,7 +412,7 @@ def drop_collapsed_sections(SimAuto: pw.SimAutoApi, label: str = 'Main scaling')
     I.e. opens branches connecting from buses with OK voltage (>COLLAPSE_VPU) to buses with awful voltage (<COLLAPSE_VPU).
     Returns the ObjectIDs of branches dropped.
     """
-    df = pw.get_df(SimAuto, 'Branch', {'ObjectID': str, 'Status': str, 'BranchVpuHigh': float, 'BranchVpuLow': float})
+    df = pw.get_df(SimAuto, 'Branch', ['ObjectID', 'Status', 'BranchVpuHigh', 'BranchVpuLow'])
     filtered_df = df[(df['Status'] == 'Closed') & (df['BranchVpuHigh'] > COLLAPSE_VPU) & (df['BranchVpuLow'] < COLLAPSE_VPU)]
     if len(filtered_df) == 0:
         return []
@@ -608,8 +611,8 @@ def runs_sheet(runs: list[Run]) -> pd.DataFrame:
         out[c] = out[c].astype(float)
     return out
 
-def iterate_to_gen_load_targets(SimAuto: pw.SimAutoApi, targets, pvqv_df: pd.DataFrame | None = None,
-                                after_step: Callable[[pw.SimAutoApi, dict[str, pd.DataFrame], int], float | None] | None = None,
+def iterate_to_gen_load_targets(SimAuto: pw.SimAutoApi, targets: dict[str, pd.DataFrame], pvqv_df: pd.DataFrame | None = None,
+                                after_step: AfterStep | None = None,
                                 label: str = 'Main scaling', initial_step: int | None = None) -> dict[str,pd.DataFrame]:
     """
     Scales included gens & loads from their start to their targets. Returns the scale log sheets.

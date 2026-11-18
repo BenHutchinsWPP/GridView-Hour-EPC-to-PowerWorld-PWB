@@ -9,6 +9,82 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from Scripts import pw, scale, settings
 
+# Field types by table, as PowerWorld's GetFieldList reports them: the types the code's field lists used to declare.
+# A location-suffixed field (e.g. 'BusIsStarBus:1') is listed by its base name.
+FIELD_TYPES: dict[str, dict[str, str]] = {
+    'Bus': {
+        'Number': 'Integer', 'Vpu': 'Real', 'IslandNumber': 'Integer', 'Slack': 'String', 'BusNum': 'Integer',
+        'MismatchP': 'Real', 'MismatchQ': 'Real', 'BusNomVolt': 'Real', 'BusIsStarBus': 'String', 'Name': 'String',
+        'NomkV': 'Real', 'ObjectID': 'String', 'NomB': 'Real', 'NomG': 'Real', 'Vangle': 'Real', 'DCLossMultiplier': 'Real',
+        'AreaNumber': 'Integer', 'ZoneNumber': 'Integer', 'BANumber': 'Integer', 'OwnerNumber': 'Integer',
+        'SubNumber': 'Integer', 'Monitor': 'String', 'LimitSet': 'String', 'UseSpecificLimits': 'String', 'LimitLowA': 'Real',
+        'LimitLowB': 'Real', 'LimitLowC': 'Real', 'LimitLowD': 'Real', 'LimitHighA': 'Real', 'LimitHighB': 'Real',
+        'LimitHighC': 'Real', 'LimitHighD': 'Real', 'Latitude': 'Real', 'Longitude': 'Real', 'TopologyBusType': 'String',
+        'Priority': 'Real', 'EMSType': 'String', 'EMSID': 'String', 'DataMaintainerAssign': 'String',
+        'DataMaintainerInherit': 'String', 'DataMaintainerInheritBlock': 'String', 'AllLabels': 'String', 'AreaName': 'String',
+        'SensdVdPself': 'Real', 'SensdVdQself': 'Real',
+    },
+    'Gen': {
+        'ObjectID': 'String', 'BusNum': 'Integer', 'BusName': 'String', 'NomkV': 'Real', 'ID': 'String',
+        'AreaNumber': 'Integer', 'Status': 'String', 'MW': 'Real', 'MWSetPoint': 'Real', 'MWMax': 'Real', 'MWMin': 'Real',
+        'UnitTypeCode': 'String', 'FuelTypeCode': 'String', 'VoltSet': 'Real', 'VoltSetTol': 'Real', 'RegBusNum': 'Integer',
+        'RegFactor': 'Real', 'AGC': 'String', 'PartFact': 'Real', 'EnforceMWLimit': 'String', 'AVR': 'String',
+        'MvarSetPoint': 'Real', 'MvarMax': 'Real', 'MvarMin': 'Real', 'UseCapCurve': 'String', 'WindContMode': 'String',
+        'WindContModePF': 'Real', 'UseLineDrop': 'String', 'Rcomp': 'Real', 'Xcomp': 'Real', 'VoltageDroopControl': 'String',
+        'MVABase': 'Real', 'GenR': 'Real', 'GenX': 'Real', 'StepR': 'Real', 'StepX': 'Real', 'StepTap': 'Real',
+        'GovRespLimit': 'String', 'ZoneNumber': 'Integer', 'BANumber': 'Integer', 'OwnerNum1': 'Integer', 'OwnerPerc1': 'Real',
+        'OwnerNum2': 'Integer', 'OwnerPerc2': 'Real', 'OwnerNum3': 'Integer', 'OwnerPerc3': 'Real', 'OwnerNum4': 'Integer',
+        'OwnerPerc4': 'Real', 'OwnerNum5': 'Integer', 'OwnerPerc5': 'Real', 'OwnerNum6': 'Integer', 'OwnerPerc6': 'Real',
+        'OwnerNum7': 'Integer', 'OwnerPerc7': 'Real', 'OwnerNum8': 'Integer', 'OwnerPerc8': 'Real', 'EMSType': 'String',
+        'EMSID': 'String', 'DataMaintainerAssign': 'String', 'DataMaintainerInherit': 'String', 'AllLabels': 'String',
+    },
+    'Shunt': {
+        'ObjectID': 'String', 'MvarNom': 'Real', 'Status': 'String', 'Vpu': 'Real',
+    },
+    'Branch': {
+        'ObjectID': 'String', 'Status': 'String', 'BranchVpuHigh': 'Real', 'BranchVpuLow': 'Real', 'BusNumFrom': 'Integer',
+        'BusNumTo': 'Integer', 'Circuit': 'String', 'BranchDeviceType': 'String', 'ConsolidateAllow': 'String',
+        'OpenOrCloseBreakersAllow': 'String', 'StatusNormal': 'String', 'ByPass': 'String', 'MeteredBus': 'String',
+        'R': 'Real', 'X': 'Real', 'B': 'Real', 'G': 'Real', 'LineLength': 'Real', 'Monitor': 'String', 'LimitSet': 'String',
+        'LimitMVAA': 'Real', 'LimitMVAB': 'Real', 'LimitMVAC': 'Real', 'LimitMVAD': 'Real', 'LimitMVAE': 'Real',
+        'LimitMVAF': 'Real', 'LimitMVAG': 'Real', 'LimitMVAH': 'Real', 'LimitMVAI': 'Real', 'LimitMVAJ': 'Real',
+        'LimitMVAK': 'Real', 'LimitMVAL': 'Real', 'LimitMVAM': 'Real', 'LimitMVAN': 'Real', 'LimitMVAO': 'Real',
+        'OwnerNum1': 'Integer', 'OwnerPerc1': 'Real', 'OwnerNum2': 'Integer', 'OwnerPerc2': 'Real', 'OwnerNum3': 'Integer',
+        'OwnerPerc3': 'Real', 'OwnerNum4': 'Integer', 'OwnerPerc4': 'Real', 'OwnerNum5': 'Integer', 'OwnerPerc5': 'Real',
+        'OwnerNum6': 'Integer', 'OwnerPerc6': 'Real', 'OwnerNum7': 'Integer', 'OwnerPerc7': 'Real', 'OwnerNum8': 'Integer',
+        'OwnerPerc8': 'Real', 'EMSType': 'String', 'EMSID': 'String', 'EMSLineID': 'String', 'EMSCBTyp': 'String',
+        'EMSID2From': 'String', 'EMSID2To': 'String', 'DataMaintainerAssign': 'String', 'DataMaintainerInherit': 'String',
+        'AllLabels': 'String', 'ControlType': 'String', 'AutoControl': 'String', 'RegBusNum': 'Integer',
+        'UseLineDrop': 'String', 'Rcomp': 'Real', 'Xcomp': 'Real', 'RegMax': 'Real', 'RegMin': 'Real',
+        'RegTargetType': 'String', 'XFMVABase': 'Real', 'XFNomkVbaseFrom': 'Real', 'XFNomkVbaseTo': 'Real', 'Rxfbase': 'Real',
+        'Xxfbase': 'Real', 'Gxfbase': 'Real', 'Bxfbase': 'Real', 'Gmagxfbase': 'Real', 'Bmagxfbase': 'Real',
+        'TapFixedFrom': 'Real', 'TapFixedTo': 'Real', 'TapMaxxfbase': 'Real', 'TapMinxfbase': 'Real',
+        'TapStepSizexfbase': 'Real', 'Tapxfbase': 'Real', 'Phase': 'Real', 'ImpCorrTable': 'Real',
+    },
+    'Load': {
+        'ObjectID': 'String', 'BusNum': 'Integer', 'BusName': 'String', 'NomkV': 'Real', 'ID': 'String',
+        'AreaNumber': 'Integer', 'Status': 'String', 'AGC': 'String', 'DistStatus': 'String', 'SMW': 'Real', 'SMvar': 'Real',
+        'IMW': 'Real', 'IMvar': 'Real', 'ZMW': 'Real', 'ZMvar': 'Real', 'DistMWInput': 'Real', 'DistMvarInput': 'Real',
+        'MW': 'Real', 'NetMW': 'Real', 'NetMvar': 'Real', 'DistMW': 'Real', 'Interruptible': 'String', 'MWMax': 'Real',
+        'MWMin': 'Real', 'DistMWMax': 'Real', 'DistMWMin': 'Real', 'DistUnitTypeCode': 'String', 'LoadModelGroup': 'String',
+        'ZoneNumber': 'Integer', 'BANumber': 'Integer', 'OwnerNumber': 'Integer', 'EMSType': 'String', 'EMSID': 'String',
+        'DataMaintainerAssign': 'String', 'DataMaintainerInherit': 'String', 'AllLabels': 'String',
+    },
+    'Area': {
+        'Number': 'Integer', 'LossMW': 'Real',
+    },
+    'LineShunt': {
+        'ObjectID': 'String', 'BusNumFrom': 'Integer', 'BusNumTo': 'Integer', 'Circuit': 'String', 'ID': 'String',
+        'BusNumLoc': 'Integer', 'Status': 'String', 'MWNom': 'Real', 'MvarNom': 'Real', 'OwnerNum1': 'Integer',
+        'OwnerPerc1': 'Real', 'OwnerNum2': 'Integer', 'OwnerPerc2': 'Real', 'OwnerNum3': 'Integer', 'OwnerPerc3': 'Real',
+        'OwnerNum4': 'Integer', 'OwnerPerc4': 'Real', 'DataMaintainerAssign': 'String', 'DataMaintainerInherit': 'String',
+    },
+    'Fault': {
+        'FaultName': 'String', 'WhoAmI': 'String', 'CustomInteger': 'Integer', 'FaultType': 'String', 'FaultImpedance': 'Real',
+        'BusNomVolt': 'Real', 'ABCPhaseI': 'Real',
+    },
+}
+
 class FakeSimAuto:
     """
     In-memory stand-in for SimAuto. Records written rows by (table, first field value).
@@ -51,6 +127,10 @@ class FakeSimAuto:
         for row in rows:
             self.applied[(table, row[0])] = dict(zip(fields, row))
         return ('',)
+
+    def GetFieldList(self, table):
+        """Rows in PowerWorld's shape: [key, variable name, type, description, concise name, enterable]."""
+        return ('', [[f'{table}:{f}', f, t, f, f, 'YES'] for f, t in FIELD_TYPES.get(table, {}).items()])
 
     def GetParametersMultipleElementRect(self, table, fields, filter_group):
         if table != 'Bus':
