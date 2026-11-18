@@ -460,7 +460,7 @@ def _scale_hours_parallel(todo: list[tuple[Path, Path]], workers: int):
                 p.start()
                 send.close()        # The child's end: recv then sees EOF if the child dies without sending.
                 running[p.sentinel] = (p, recv, gv_fp, console_fp)
-            for sentinel in mp.connection.wait(list(running), timeout=2.0):
+            for sentinel in multiprocessing.connection.wait(list(running), timeout=2.0):
                 p, recv, gv_fp, _ = running.pop(sentinel)
                 try:
                     summary, error = recv.recv()
@@ -487,7 +487,7 @@ HOUR_COLUMNS = ['Hour', 'Status', 'Final Swing MW', 'Unmet MW', 'Not Reached MW'
 
 def _hour_row(hour: str, sheets: dict[str, pd.DataFrame]) -> dict:
     """One `hours` row from one hour's sheets (missing or empty sheets give blanks, or 0 for counts)."""
-    row = dict.fromkeys(HOUR_COLUMNS, np.nan)
+    row: dict[str, object] = dict.fromkeys(HOUR_COLUMNS, np.nan)
     row['Hour'] = hour
     runs = sheets.get('runs')
     # Step 02 writes the plan's log before scaling: without a `main` run the hour failed or never finished, and the
@@ -507,7 +507,7 @@ def _hour_row(hour: str, sheets: dict[str, pd.DataFrame]) -> dict:
         row['Balance MW'] = areas.loc[areas['Group'] != 'Load', 'Balance MW'].sum()     # Balancing moves gens only.
         err = areas['Error MW'].abs()
         if err.notna().any():
-            worst = areas.loc[err.idxmax()]
+            worst = areas.iloc[int(np.nanargmax(err.to_numpy()))]
             row['Worst Error MW'] = worst['Error MW']
             row['Worst AreaNumber'] = worst['AreaNumber']
             row['Worst Group'] = worst['Group']
@@ -564,7 +564,7 @@ def merge(out_dir: Path = out_dir) -> Path:
 
 # ================== The run ==================
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or '').strip().splitlines()[0])
     parser.add_argument('steps', nargs='*', metavar='STEP',
                         help=f'Steps to run, from {", ".join(STEPS)}. Default: [run] steps in settings.toml.')
     args = parser.parse_args(argv)

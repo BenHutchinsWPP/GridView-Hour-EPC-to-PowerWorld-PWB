@@ -375,7 +375,7 @@ def create_statcom_on_lowestv_bus(SimAuto, skip_buses, label='Main scaling'):
     if len(filtered_df) == 0:
         return None
 
-    min_row = filtered_df.loc[filtered_df['Vpu'].idxmin()]
+    min_row = filtered_df.iloc[int(filtered_df['Vpu'].to_numpy().argmin())]
     number = int(min_row['Number'])
 
     # Create a STATCOM, Closed. Roll back if it doesn't solve.
@@ -597,10 +597,10 @@ def runs_sheet(runs: list[Run]) -> pd.DataFrame:
     for run in runs:
         moved = area.mw_changes(run.moved) if run.moved is not None else {}
         steps = run.log.get('step_df')
-        has = steps is not None and 'Result' in steps.columns
+        result = steps['Result'] if steps is not None and 'Result' in steps.columns else pd.Series(dtype=object)
         rows.append({'Run': run.name, 'At': run.at, 'Swing MW Before': run.before, 'Swing MW After': run.after,
                      'Gen MW Moved': moved.get('Gen MW Change', np.nan), 'Load MW Moved': moved.get('Load MW Change', np.nan),
-                     'Steps': len(steps) if has else 0, 'Diverged Steps': int((steps['Result'] != 'Solved').sum()) if has else 0,
+                     'Steps': len(result), 'Diverged Steps': int((result != 'Solved').sum()),
                      'Note': run.note})
     out = pd.DataFrame(rows, columns=RUN_COLUMNS)
     for c in ('Swing MW Before', 'Swing MW After', 'Gen MW Moved', 'Load MW Moved'):

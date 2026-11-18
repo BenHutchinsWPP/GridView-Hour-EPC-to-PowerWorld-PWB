@@ -125,7 +125,7 @@ def load(fp: Path = DEFAULT_FP) -> dict:
             _check_type(fp, f'[{section}] {key}', current, value)
             if (module, name) in CODE_KEYS:
                 value = {k.upper(): v for k, v in value.items()} if isinstance(value, dict) else [v.upper() for v in value]
-            if isinstance(current, dict):
+            if isinstance(current, dict) and isinstance(value, dict):     # _check_type() made sure of it.
                 # Tables add to / override the default map, rather than replace it.
                 value = {**current, **{k: (None if v == FUEL else v) for k, v in value.items()}}
             elif isinstance(current, set):

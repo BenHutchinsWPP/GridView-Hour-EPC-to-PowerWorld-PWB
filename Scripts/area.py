@@ -8,6 +8,7 @@ make-up, balancing the swing) are in ReadMe.md, "Area Mode".
 
 Working tables are in the shape Scripts/scale.py expects (see its docstring), plus AreaNumber, GenType and Method.
 """
+from collections.abc import Set as AbstractSet
 import numpy as np
 import pandas as pd
 from . import prep, pw, scale
@@ -276,7 +277,7 @@ def spread_by_group(ask: pd.Series, mw: pd.Series, cap: pd.Series, area: pd.Seri
         x[rows] += add
         return a - add.sum()
     left: dict = {}         # area -> {sign: (MW left, groups asked that way)}
-    for (a, g), v in ask.items():
+    for (a, g), v in zip(ask.index, ask.to_numpy()):
         rest = place(v, by_group.get((a, g), []))
         sign = 1 if v > 0 else -1
         mw_left, groups = left.setdefault(a, {}).get(sign, (0.0, set()))
@@ -433,7 +434,7 @@ def gen_targets(epc_gen: pd.DataFrame, case_gen: pd.DataFrame) -> tuple[pd.DataF
     bucket_method = {}
     for bucket, rows in df.groupby(keys):
         t = float(tgt.get(bucket, 0.0))
-        status, mw, bucket_method[bucket] = dispatch_bucket(rows, t, bucket[1], epc_online)
+        status, mw, bucket_method[bucket] = dispatch_bucket(rows, t, str(bucket[1]), epc_online)
         df.loc[rows.index, 'Status_Target'] = status
         df.loc[rows.index, 'MWSetPoint_Target'] = mw.where(status == 'Closed', 0.0)
     own = df.groupby(keys)['MWSetPoint_Target'].sum()       # What each bucket's own units took.
@@ -459,7 +460,7 @@ def gen_targets(epc_gen: pd.DataFrame, case_gen: pd.DataFrame) -> tuple[pd.DataF
             for g, c in off_cap.items():
                 rows = rows_a[rows_a['GenType'] == g]
                 more = float(df.loc[rows.index, 'MWSetPoint_Target'].sum()) + mw_left * c / off_cap.sum()
-                status, mw, _ = dispatch_bucket(rows, more, g, epc_online)
+                status, mw, _ = dispatch_bucket(rows, more, str(g), epc_online)
                 df.loc[rows.index, 'Status_Target'] = status
                 df.loc[rows.index, 'MWSetPoint_Target'] = mw.where(status == 'Closed', 0.0)
     df['Plan Make-up MW'] = df['MWSetPoint_Target'] - own_mw
@@ -757,6 +758,7 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
             start = parts[col] if col in parts else _by_group(g.iloc[:0], [])
             parts[col] = (start.add(_by_group(g, g['MWSetPoint'] - g['MWSetPoint_Seed'], classify_gen_type(g)), fill_value=0.0)
                           .add(_by_group(l, p_of(l, LOAD_P) - l['P_Seed']), fill_value=0.0))
+    out_ids: set = set()
     if final is not None:
         # Islanded units (excluded rows of the targets) are left out of Final MW, as they are out of Seed and Target.
         out_ids = set().union(*[df.index[scale.is_island_reason(df['ExclusionReason'])] for df in (targets or {}).values()])
@@ -809,7 +811,7 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
         still_on = (_by_group(on_g, on_g['MWSetPoint'], classify_gen_type(on_g)).add(_by_group(on_l, p_of(on_l, LOAD_P)), fill_value=0.0)
                     .reindex(index).fillna(0.0))
     note = pd.Series([('outside main island, turned off: ' + (f'{mw - on:.1f} MW' if not on else f'{mw:.1f} MW, of which {on:.1f} MW stayed on'))
-                      if mw else '' for mw, on in zip(islanded, still_on)], index=index)
+                      if mw else '' for mw, on in zip(islanded.to_numpy(), still_on.to_numpy())], index=index)
     epc_off = reports.get('islanded_epc', pd.Series(dtype=float)).reindex(index).fillna(0.0)
     epc_note = ['EPC outside main island, left out: ' + f'{mw:.1f} MW' if mw else '' for mw in epc_off]
     out['Note'] = ['; '.join(filter(None, [n, i, e])) for n, i, e in zip(out['Note'], note, epc_note)]
@@ -920,7 +922,7 @@ def _limits(units: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     unlimited. 0 rather than a positive MWMin (owner 2026-11-17): a wider range for the slack to take up imbalance.
     """
     a, b = units['MWMin'].astype(float).fillna(-np.inf), units['MWMax'].astype(float).fillna(np.inf)
-    return np.minimum(np.minimum(a, b), 0.0), np.maximum(a, b)
+    return a.where(a < b, b).clip(upper=0.0), a.where(a > b, b)
 
 def swing_band(gen: pd.DataFrame, slack_buses) -> tuple[float, float]:
     """
@@ -970,12 +972,12 @@ def balance_skips(SimAuto, final: dict[str, pd.DataFrame], targets: dict[str, pd
         skip |= set(df.index[~scale.included(df) | scale.held(df)])
     return skip
 
-def movable_gens(gen: pd.DataFrame, swing_buses, skip=frozenset()) -> pd.DataFrame:
+def movable_gens(gen: pd.DataFrame, swing_buses, skip: AbstractSet = frozenset()) -> pd.DataFrame:
     """Gens a balance or make-up may move (a copy): scalable_gens(), Closed, MWSetPoint > 0, not on a swing bus, not in skip (ObjectIDs)."""
     gen = scalable_gens(gen)
     return gen[closed(gen) & (gen['MWSetPoint'] > 0) & ~gen['BusNum'].isin(swing_buses) & ~gen['ObjectID'].isin(skip)].copy()
 
-def balance_targets(final: dict[str, pd.DataFrame], swing: float, swing_buses, skip=frozenset()) -> dict[str, pd.DataFrame]:
+def balance_targets(final: dict[str, pd.DataFrame], swing: float, swing_buses, skip: AbstractSet = frozenset()) -> dict[str, pd.DataFrame]:
     """
     Targets which move `swing` MW off the swing onto generation only; load is never moved (it stays on its EPC target).
     (Swing at +X MW: gens up X.) One factor on every Closed gen with MW > 0 (not on a swing bus, not a DC tie), so each
@@ -1127,7 +1129,7 @@ def rescale_targets(targets: dict[str, pd.DataFrame], moved: dict[str, pd.DataFr
 MAKEUP = True   # Keep area gen totals: plan Unmet and excluded units' shortfall go onto the group's, then the area's, other units.
 
 def makeup_targets(final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFrame], swing_buses,
-                   skip=frozenset(), nonconforming=frozenset()) -> tuple[dict[str, pd.DataFrame], float] | None:
+                   skip: AbstractSet = frozenset(), nonconforming=frozenset()) -> tuple[dict[str, pd.DataFrame], dict[str, float]] | None:
     """
     After the main scaling (area mode): per (AreaNumber, GenType) and per AreaNumber's load, the shortfall S = target -
     value of the main rows which were excluded (held units are excluded at the end of the main run; islanded rows are
@@ -1224,6 +1226,7 @@ def midrun_balancer(SimAuto, epc: pd.DataFrame | None = None):
     lo, hi = swing_band(gen0, slack)
     units0 = swing_units(gen0, slack)
     own_slack = bool(len(units0)) and not (units0['ID'] == prep.SWING_ID).any()
+    start = end = 0.0      # Used only with own_slack.
     if own_slack:
         start = swing_mw(gen0, slack)[0]
         end = float(np.clip(start, *swing_goal(gen0, slack, epc)))     # Where the pre-balance planned it to end.

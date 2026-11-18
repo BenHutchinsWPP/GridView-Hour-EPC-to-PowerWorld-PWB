@@ -11,7 +11,7 @@ import openpyxl.utils
 MVA_MISMATCH_THRESHOLD = 1.0    # Max bus MVA mismatch for a solve to count as converged.
 
 class SimAutoError(Exception):
-    pass
+    log: dict | None = None     # scale.iterate_to_gen_load_targets() hands its run's log on with it.
 
 def chk(SimAutoOutput, what: str):
     """
@@ -52,7 +52,7 @@ def get_df(SimAuto, table: str, fields: dict[str,type], filter_group: str = '') 
                 # Whole-number values would otherwise come back as int64, which float values can't later be written into.
                 df[field] = df[field].astype(float)
         else:
-            df[field] = df[field].astype(typ).str.strip()
+            df[field] = df[field].astype(str).str.strip()      # Every non-numeric field is text.
     return df
 
 def set_df(SimAuto, table: str, df: pd.DataFrame, fields: list[str]):
