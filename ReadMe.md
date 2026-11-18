@@ -10,7 +10,7 @@ Produce (Output): a solved PWB for every provided GridView hour. Two modes, set 
 - **`topology`**: the same topology (buses, branches, loads, gens, and their statuses) and the same MW/Mvar on every load and gen (unless `balance_swing` moves them: see [Topology Mode](#topology-mode)). Missing elements are created in the PWB.
 
 ## Status
-Area mode: first draft (2026-11-15), first written in `~/projects/areascale` (the work is on branch `area-mode` here; `areascale-draft` is the old draft). Neither mode's current code has been run against PowerWorld yet. The offline tests in `tests/test_lib.py` pass.
+Area mode: first draft (2026-11-15), first written in `~/projects/areascale` (the work is on branch `area-mode` here; `areascale-draft` is the old draft). Neither mode's current code has been run against PowerWorld yet. The offline tests (`tests/test_*.py`) pass.
 
 ## Prerequisites
 - PowerWorld v23+ with a SimAuto license
@@ -34,7 +34,7 @@ Area mode: first draft (2026-11-15), first written in `~/projects/areascale` (th
   - Note: It may take ~1-2 hours per EPC, depending on your CPU's speed.
   - `[run] workers = N` scales N hours at once, each in its own process and PowerWorld instance (each takes a SimAuto seat and the case's memory). Each hour's console then goes to `<hour>_Console.txt`. The console shows one line per finished hour, under a progress bar (tqdm) with the time left and what each running hour is doing (e.g. `h03 Main scaling 47%`); each hour counts 100, 95 of them for its main scaling. With `pretest_gens`, its `max_workers` (or the CPU count) is shared out between them.
 - Step 03, `merge`: merges every hour's log into `03 Merge Reports.xlsx`. Its `hours` sheet has a `Status` column: `ok` when the hour's `runs` sheet has a `main` row and no later run failed or stopped; `check` when one did (make-up, dist gen clearing or a balance: the swing may be off its goal); else `incomplete` (the hour failed or never finished: the log is only the plan, or is missing its result; its `areas` rows are still merged, but show the plan).
-- Code layout: `pcm_to_pf.py` runs the three steps. `Scripts/pw.py` talks to PowerWorld. `Scripts/prep.py` holds the seed preparation both modes share, `Scripts/topo.py` the topology mode's matching and targets, and `Scripts/area.py` the area mode's targets and the swing balancing. `Scripts/scale.py` moves the case to the targets. `Scripts/settings.py` reads `settings.toml`. `tests/test_lib.py` runs without PowerWorld: `python tests/test_lib.py`.
+- Code layout: `pcm_to_pf.py` runs the three steps. `Scripts/pw.py` talks to PowerWorld. `Scripts/prep.py` holds the seed preparation both modes share, `Scripts/topo.py` the topology mode's matching and targets, and `Scripts/area.py` the area mode's targets and the swing balancing. `Scripts/scale.py` moves the case to the targets. `Scripts/settings.py` reads `settings.toml`. The tests in `tests/` run without PowerWorld: `python tests/run.py` runs all of them (`python tests/run.py makeup` those whose name contains "makeup"); `tests/helpers.py` holds the shared fakes and table builders.
 
 ## Settings
 `settings.toml`, at the top of the repo, with a comment on each setting. `[run]` holds the switches `pcm_to_pf.py` reads:
