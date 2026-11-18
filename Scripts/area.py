@@ -921,6 +921,11 @@ def balance_skips(SimAuto, final: dict[str, pd.DataFrame], targets: dict[str, pd
         skip |= set(df.index[~scale.included(df) | scale.held(df)])
     return skip
 
+def movable_gens(gen: pd.DataFrame, swing_buses, skip=frozenset()) -> pd.DataFrame:
+    """Gens a balance or make-up may move (a copy): scalable_gens(), Closed, MWSetPoint > 0, not on a swing bus, not in skip (ObjectIDs)."""
+    gen = scalable_gens(gen)
+    return gen[closed(gen) & (gen['MWSetPoint'] > 0) & ~gen['BusNum'].isin(swing_buses) & ~gen['ObjectID'].isin(skip)].copy()
+
 def balance_targets(final: dict[str, pd.DataFrame], swing: float, swing_buses, skip=frozenset()) -> dict[str, pd.DataFrame]:
     """
     Targets which move `swing` MW off the swing onto generation only; load is never moved (it stays on its EPC target).
@@ -929,8 +934,7 @@ def balance_targets(final: dict[str, pd.DataFrame], swing: float, swing_buses, s
     area, then onto every gen (spread_evenly()). Statuses are unchanged. The Load table is empty.
     skip: ObjectIDs left out (balance_skips()); the rest take their share.
     """
-    gen = scalable_gens(final['Gen'])
-    gen = gen[closed(gen) & (gen['MWSetPoint'] > 0) & ~gen['BusNum'].isin(swing_buses) & ~gen['ObjectID'].isin(skip)].copy()
+    gen = movable_gens(final['Gen'], swing_buses, skip)
     cap = gen['MWMax'].where(gen['MWMax'] > gen['MWSetPoint'], gen['MWSetPoint'])  # A unit already above MWMax isn't raised.
     change, _ = spread_evenly(swing, gen['MWSetPoint'], cap, *gen_keys(gen))
     gen['MWSetPoint_Target'] = gen['MWSetPoint'] + change
@@ -1101,9 +1105,8 @@ def makeup_targets(final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFra
     if not (len(s_gen) or len(s_load)):
         return None
 
-    gen = scalable_gens(final['Gen'])
-    gen = gen[closed(gen) & (gen['MWSetPoint'] > 0) & ~gen['BusNum'].isin(swing_buses) & ~gen['ObjectID'].isin(skip)
-              & gen['AreaNumber'].isin(s_gen.index.get_level_values('AreaNumber'))].copy()
+    gen = movable_gens(final['Gen'], swing_buses, skip)
+    gen = gen[gen['AreaNumber'].isin(s_gen.index.get_level_values('AreaNumber'))].copy()
     cap = gen['MWMax'].where(gen['MWMax'] > gen['MWSetPoint'], gen['MWSetPoint'])
     change, _ = spread_by_group(s_gen, gen['MWSetPoint'], cap, *gen_keys(gen), spill_all=False)
     gen = gen[change.abs() > 1e-9]
