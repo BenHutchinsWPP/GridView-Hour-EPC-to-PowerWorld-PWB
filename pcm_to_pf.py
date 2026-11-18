@@ -205,18 +205,13 @@ def prepare():
     SimAuto.CloseCase()
 
 # ================== Step 02: scale to each hour ==================
-def summary_line(hour, log, area_mode):
-    """The hour's one-line result, from the sheets of its log."""
-    runs, exc = log['runs'], log['exceptions']
-    swing = runs['Swing MW After'].iloc[-1] if len(runs) else float('nan')
-    n_statcom, n_branch = int((exc['Table'] == 'STATCOM').sum()), int((exc['Table'] == 'Branch').sum())
-    n_exc = len(exc) - n_statcom - n_branch
-    line = f'{hour}: swing {swing:.1f} MW; {n_exc} exceptions; {n_statcom} STATCOMs, {n_branch} branches opened'
-    if area_mode:
-        err = log['areas']['Error MW'].abs()
-        if err.notna().any():
-            worst = log['areas'].loc[err.idxmax()]
-            line += f'; worst error area {worst["AreaNumber"]} {worst["Group"]} {worst["Error MW"]:.0f} MW'
+def summary_line(hour, log) -> str:
+    """The hour's one-line result, from the same `hours` row step 03 merges (_hour_row())."""
+    row = _hour_row(hour, log)
+    line = (f'{hour}: swing {row["Final Swing MW"]:.1f} MW; {row["Exceptions Gen/Load"]} exceptions; '
+            f'{row["Exceptions STATCOM"]} STATCOMs, {row["Exceptions Branch"]} branches opened')
+    if pd.notna(row['Worst Error MW']):        # Area mode: the areas sheet's worst |Error MW|.
+        line += f'; worst error area {row["Worst AreaNumber"]} {row["Worst Group"]} {row["Worst Error MW"]:.0f} MW'
     return line
 
 def clear_dist_gen(SimAuto, swing) -> list[scale.Run]:
@@ -330,7 +325,7 @@ def create_case(SimAuto, gv_fp, out_fp) -> str | None:
     summary = None
     try:
         log = build_log(runs, final, swing_buses, final_loss=final_loss)
-        summary = summary_line(gv_fp.stem, log, area_mode)
+        summary = summary_line(gv_fp.stem, log)
         print(summary)
         pw.write_excel(log_fp, log)
     except Exception as e:     # Never lose the hour over its log.
