@@ -38,14 +38,14 @@ SETTINGS = {
     'pw': {'mva_mismatch_threshold'},
     'prep': {'swing_mw_max', 'swing_mw_min', 'shunt_vlow', 'shunt_vhigh', 'shunt_max_iterations'},
     'topology': {'tap_threshold', 'unsupported_gv_branch_types'},
-    'area': {'commit', 'commit_max_cf', 'capacity_types', 'off_at_zero_types', 'manual_unit_types', 'scale_nonconforming',
+    'area': {'commit', 'commit_max_cf', 'capacity_types', 'off_at_zero_types', 'manual_unit_types', 'load_unit_types', 'scale_nonconforming',
              'loss_exponent', 'makeup', 'balance_tol_mw', 'balance_max_rounds', 'balance_trigger_mw',
              'balance_at_swing_limits', 'max_unknown_share', 'shortfall_report_mw', 'gen_types_from_pwb', 'gen_types', 'unit_gentype', 'fuel_gentype'},
     'scale': {'add_statcoms', 'drop_collapsed', 'exclude_vmin', 'exclude_vmax', 'statcom_vpu', 'statcom_vnom_min',
               'collapse_vpu', 'pvqv_dv_limit', 'initial_step', 'max_step', 'step_solves', 'final_max_rounds', 'max_workers'},
 }
 # Code letter sets / maps: compared against upper-cased codes.
-CODE_KEYS = {(area, 'UNIT_GENTYPE'), (area, 'FUEL_GENTYPE'), (area, 'MANUAL_UNIT_TYPES')}
+CODE_KEYS = {(area, 'UNIT_GENTYPE'), (area, 'FUEL_GENTYPE'), (area, 'MANUAL_UNIT_TYPES'), (area, 'LOAD_UNIT_TYPES')}
 FUEL = 'fuel'   # In [area.unit_gentype]: decide by the fuel type.
 
 def _check_type(fp: Path, what: str, default: Any, value: Any, allow_int: bool = False) -> None:
@@ -95,6 +95,8 @@ def _check_ranges(fp: Path, get: Callable[[ModuleType, str], Any]) -> None:
           f'[prep] swing_mw_min ({get(prep, "SWING_MW_MIN")}) must be below swing_mw_max ({get(prep, "SWING_MW_MAX")})')
     _need(fp, get(area, 'SHORTFALL_REPORT_MW') >= 0, f'[area] shortfall_report_mw must be 0 or more, not {get(area, "SHORTFALL_REPORT_MW")}')
     _need(fp, get(area, 'LOSS_EXPONENT') >= 0, f'[area] loss_exponent must be 0 or more, not {get(area, "LOSS_EXPONENT")}')
+    both = get(area, 'MANUAL_UNIT_TYPES') & get(area, 'LOAD_UNIT_TYPES')
+    _need(fp, not both, f'[area] unit types {sorted(both)} are in both manual_unit_types and load_unit_types: a unit is either left alone or load')
     gen_types = set(get(area, 'GEN_TYPES'))
     bad = {v for n in ('UNIT_GENTYPE', 'FUEL_GENTYPE') for v in get(area, n).values() if v is not None and v not in gen_types}
     bad |= (get(area, 'CAPACITY_TYPES') | get(area, 'OFF_AT_ZERO_TYPES')) - gen_types

@@ -111,6 +111,16 @@ def test_settings_reject_a_negative_loss_exponent():
         except ValueError as e:
             assert 'loss_exponent' in str(e)
 
+def test_settings_reject_a_unit_type_which_is_both_manual_and_load():
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        fp = Path(d) / 's.toml'
+        fp.write_text('[area]\nmanual_unit_types = ["DC", "mp"]\nload_unit_types = ["MP"]\n')
+        try:
+            settings.load(fp)
+            assert False, 'MP in both lists must be rejected'
+        except ValueError as e:
+            assert 'MP' in str(e) and 'manual_unit_types' in str(e) and 'load_unit_types' in str(e)
+
 def test_settings_apply_and_reject():
     import tempfile
     saved = (scale.EXCLUDE_VMIN, dict(area.UNIT_GENTYPE), set(area.CAPACITY_TYPES), list(area.GEN_TYPES))

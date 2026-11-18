@@ -62,6 +62,37 @@ def test_step_02_area_mode_end_to_end():
     assert areas['Target MW'].to_dict() == {'Hydro': 50.0, 'Load': 300.0, 'Thermal': 150.0}
     assert areas['Final MW'].notna().all()
 
+def test_step_02_counts_load_units_as_area_load_and_never_balances_them():
+    # Motors (MP): m1 keyed (-80 -> EPC -120), m2 PWB-only (-50, scaled with the load), m3 EPC-only (-30). All load.
+    gen, load = two_cases()
+    gen = pd.concat([gen, gens([('m1', 1, '3', 'Closed', 'MP', -80.0, 0.0, -200.0), ('m2', 1, '4', 'Closed', 'MP', -50.0, 0.0, -200.0)]
+                               ).assign(BusNum=[5, 6], MW=[-80.0, -50.0], NomkV=230.0, BusName='b')], ignore_index=True)
+    epc_gen = gens([('e1', 1, '1', 'Closed', 'GT', 150.0, 1000.0, 0.0), ('e2', 1, '2', 'Closed', 'HY', 50.0, 1000.0, 0.0),
+                    ('m1', 1, '3', 'Closed', 'MP', -120.0, 0.0, -200.0), ('m3', 1, '5', 'Closed', 'MP', -30.0, 0.0, -200.0)]
+                   ).assign(BusNum=[1, 2, 5, 7], MW=0.0, NomkV=230.0, BusName='b')
+    epc_load = loads([('e1', 1, 'Closed', 300.0, 0.0, 0.0, 30.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        step = load_step_02(Path(d), 'area')
+        sa = CaseSimAuto({'h1.epc': (epc_gen, epc_load), 'Prepared.pwb': (gen, load)}, slack=[99])
+        seen = []
+        real = area.balance_targets
+        area.balance_targets = lambda *a, **k: seen.append(real(*a, **k)) or seen[-1]
+        try:
+            step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')
+        finally:
+            area.balance_targets = real
+        sheets = pd.read_excel(step.out_dir / 'h1_Log.xlsx', sheet_name=None)
+    out = sa.saved['h1.pwb']
+    assert out['Gen'].loc['m1', 'MWSetPoint'] == -120.0                          # Keyed: the EPC's MW.
+    areas = sheets['areas'].set_index('Group')
+    target, seed, final, note = (cell(areas, 'Load', c) for c in ('Target MW', 'Seed MW', 'Final MW', 'Note'))
+    assert target == 300.0 + 30.0 + 120.0 and seed == 200.0 + 80.0 + 50.0, areas
+    assert abs(final - target) < 1e-6, areas                                     # l1 and m2 carry the rest of the 330.
+    assert 'unexplained' not in note and 'load units (MP) set to EPC: 120.0 MW (1)' in note, note
+    assert 'Load unit' not in sheets['areas']['Group'].tolist() and 'Unknown' not in sheets['areas']['Group'].tolist()
+    assert not sheets['areas']['Note'].fillna('').str.contains('unexplained').any()
+    assert seen and all(m not in t.index for t in (r['Gen'] for r in seen) for m in ('m1', 'm2'))   # Never moved by a balance.
+
 def test_step_02_topology_mode_end_to_end():
     gen, load = two_cases()
     epc_gen = gen.assign(MWSetPoint=[0.0, 150.0, 50.0]).iloc[1:]

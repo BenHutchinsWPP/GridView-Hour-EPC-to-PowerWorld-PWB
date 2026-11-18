@@ -38,7 +38,7 @@ UNIT_GENTYPE: dict[str, str | None] = {
     'BA': 'Battery Storage', 'FW': 'Battery Storage', 'ES': 'Battery Storage', 'CE': 'Battery Storage',
     # Not generation by type: never decided by fuel.
     'SC': 'Unknown', 'SV': 'Unknown',   # DECIDE: condensers, SVCs.
-    'MP': 'Unknown',            # Motors / pumps: load, never scaled (MANUAL_UNIT_TYPES).
+    'MP': 'Unknown',            # Motors / pumps: load while in LOAD_UNIT_TYPES; Unknown generation if taken out of it.
     'DC': 'Unknown',            # DC ties: never scaled (MANUAL_UNIT_TYPES).
     # Unit type unstated or generic: use the fuel.
     'UN': None, 'OT': None, 'FC': None, '': None,
@@ -60,7 +60,12 @@ FUEL_GENTYPE: dict[str, str] = {
 }
 
 # Unit types left out of the scaling, in both cases: adjusted by hand.
-MANUAL_UNIT_TYPES = {'DC', 'MP'}     # DC ties; motors / pumps (load modelled as gens).
+MANUAL_UNIT_TYPES = {'DC'}
+
+# Unit types which are load modelled as gens (motors / pumps: MWSetPoint < 0 is a load of -MWSetPoint). They never take
+# part in generation: they are area load (build_targets()). [] = they are ordinary generation (Unknown, for MP).
+LOAD_UNIT_TYPES = {'MP'}
+LOAD_UNIT = 'Load unit'     # classify_gen_type() of a gen whose unit type is in LOAD_UNIT_TYPES.
 
 # Stop before scaling if more than this share of the EPC's generation (|MW|) has no GenType: its unit & fuel codes are
 # probably blank, and every typed bucket in the PWB would be scaled to 0. 1.0 turns the check off.
@@ -95,10 +100,16 @@ def _code(s: pd.Series) -> pd.Series:
     return s.fillna('').astype(str).str.strip().str.split(' ', n=1).str[0].str.upper()
 
 def classify_gen_type(df: pd.DataFrame) -> pd.Series:
-    """GenType of each gen, from its UnitTypeCode, else its FuelTypeCode. Codes in neither map are Unknown."""
+    """GenType of each gen, from its UnitTypeCode, else its FuelTypeCode. Codes in neither map are Unknown. LOAD_UNIT_TYPES: LOAD_UNIT."""
     by_unit = _code(df['UnitTypeCode']).map(UNIT_GENTYPE)
     by_fuel = _code(df['FuelTypeCode']).map(FUEL_GENTYPE)
-    return by_unit.fillna(by_fuel).fillna('Unknown')
+    return by_unit.fillna(by_fuel).fillna('Unknown').where(~is_load_unit(df), LOAD_UNIT)
+
+def is_load_unit(df: pd.DataFrame) -> pd.Series:
+    """Gens whose UnitTypeCode is in LOAD_UNIT_TYPES (all False for a table without UnitTypeCode)."""
+    if 'UnitTypeCode' not in df:
+        return pd.Series(False, index=df.index)
+    return _code(df['UnitTypeCode']).isin(LOAD_UNIT_TYPES)
 
 # ------------------ Fields read from each case ------------------
 _KEY = ['ObjectID', 'BusNum', 'BusName', 'NomkV', 'ID', 'AreaNumber']
@@ -191,10 +202,11 @@ def nonconforming_targets(epc_load: pd.DataFrame, case_load: pd.DataFrame) -> pd
     df['Nonconforming'] = True
     return df.set_index('ObjectID')
 
-def load_targets(epc_load: pd.DataFrame, case_load: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_targets(epc_load: pd.DataFrame, case_load: pd.DataFrame, no_mvar: Collection[str] = ()) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Returns (targets, area report). targets holds the case's Closed loads. Open loads aren't scaled.
     An EPC load counts by its SMW and SMvar only: GridView ignores its I, Z and dist gen. The seed side sums S + I + Z.
+    no_mvar: ObjectIDs which take no share of an area's fallback Mvar (sign_share(): the load units, whose Mvar is set by the solution).
     """
     epc = epc_load.assign(P=epc_load['SMW'].fillna(0.0).where(closed(epc_load), 0.0),
                           Q=epc_load['SMvar'].fillna(0.0).where(closed(epc_load), 0.0))
@@ -215,7 +227,8 @@ def load_targets(epc_load: pd.DataFrame, case_load: pd.DataFrame) -> tuple[pd.Da
     seed = pd.concat([sign_totals(df['P'], df['AreaNumber'], 'MW'), sign_totals(df['Q'], df['AreaNumber'], 'Mvar')], axis=1)
     df['SMW_Target'] = sign_share(df['Basis MW'], df['AreaNumber'], tgt['MW +'], tgt['MW -'])
     # Mvar of a sign which no load in the area has is spread over its zero-Mvar loads in proportion to |MW|.
-    df['SMvar_Target'] = sign_share(df['Basis Mvar'], df['AreaNumber'], tgt['Mvar +'], tgt['Mvar -'], fallback=df['Basis MW'].abs())
+    df['SMvar_Target'] = sign_share(df['Basis Mvar'], df['AreaNumber'], tgt['Mvar +'], tgt['Mvar -'],
+                                    fallback=df['Basis MW'].abs().where(~df['ObjectID'].isin(no_mvar), 0.0))
 
     for c in ['IMW', 'IMvar', 'ZMW', 'ZMvar', 'DistMWInput', 'DistMvarInput']:
         df[f'{c}_Target'] = 0.0
@@ -249,6 +262,78 @@ def load_targets(epc_load: pd.DataFrame, case_load: pd.DataFrame) -> tuple[pd.Da
         report[f'Unmet {c}'] = report[f'Target {c}'] - report[f'Planned {c}']
     report.index.name = 'AreaNumber'
     return df.drop(columns=['P', 'Q']).set_index('ObjectID'), report.reset_index()
+
+# ------------------ Load units ------------------
+# Gens whose unit type is in LOAD_UNIT_TYPES are area load, with load MW = -MWSetPoint, and never generation (scalable_gens()).
+# Their keys decide how: in both cases' load units, the EPC's status and MW 1:1 (load_unit_targets()), and out of both
+# cases' load totals; PWB-only, scaled with the area's load (load_unit_loads(), then load_unit_scaled()); EPC-only, added to
+# the area's EPC load target (load_unit_loads()). They are target rows of the Gen table (the engine moves gens there),
+# GenType LOAD_UNIT, which no GenType grouping or balance takes.
+def load_unit_loads(units: pd.DataFrame) -> pd.DataFrame:
+    """Load units as load_targets() rows (Closed ones' SMW = -MWSetPoint, no Mvar, conforming, no dist gen)."""
+    df = units[[c for c in [*_KEY, 'Status'] if c in units]].copy()
+    for c in scale.SCALED['Load']:
+        df[c] = 0.0
+    df['SMW'] = -units['MWSetPoint'].fillna(0.0)
+    df['AGC'], df['DistStatus'] = '', 'Open'
+    return df
+
+def _with_units(load: pd.DataFrame, units: pd.DataFrame) -> pd.DataFrame:
+    """`load` with load_unit_loads(units) added (unchanged if there are no units)."""
+    return pd.concat([load, load_unit_loads(units)], ignore_index=True) if len(units) else load
+
+def _load_unit_rows(units: pd.DataFrame, method: str, status: pd.Series, mw: pd.Series) -> pd.DataFrame:
+    """Gen-table target rows (gen_targets()' columns) for load units, with the given target status and MWSetPoint."""
+    df = units.copy()
+    df['GenType'], df['Method'] = LOAD_UNIT, method
+    if LOAD_UNIT_TYPES:     # Decided by key: a unit coded otherwise in this case is still a load unit (areas() reads the code).
+        df['UnitTypeCode'] = df['UnitTypeCode'].where(is_load_unit(df), sorted(LOAD_UNIT_TYPES)[0])
+    df['Basis Status'] = df['Status_Target'] = status.to_numpy()
+    df['Basis MW'] = df['MWSetPoint_Target'] = df['Planned MW'] = np.where(status.to_numpy() == 'Closed', mw.to_numpy(), 0.0)
+    df['MWSetPoint'] = df['MWSetPoint'].where(closed(df), 0.0)      # Open units are at 0 MW, as the engine expects.
+    df['Status_Seed'], df['MWSetPoint_Seed'] = df['Status'], df['MWSetPoint']
+    df['ExclusionReason'] = ''
+    return df.set_index('ObjectID')
+
+def load_unit_targets(epc_units: pd.DataFrame, case_units: pd.DataFrame) -> pd.DataFrame:
+    """
+    Gen-table target rows (Method 'EPC 1:1') for the PWB load units whose key is in epc_units (the EPC's load units):
+    the EPC's status and MWSetPoint (0 MW if Open there), as nonconforming_targets() does for loads. Any seed status:
+    one Closed in the EPC is closed in by the engine (at 0 MW, then ramped), one Open there is ramped down and opened.
+    """
+    epc = epc_units.drop_duplicates('ObjectID').set_index('ObjectID')
+    status = case_units['ObjectID'].map(epc['Status'])
+    return _load_unit_rows(case_units, 'EPC 1:1', status, case_units['ObjectID'].map(epc['MWSetPoint']).fillna(0.0))
+
+def load_unit_scaled(units: pd.DataFrame, load: pd.DataFrame) -> pd.DataFrame:
+    """
+    Gen-table target rows (Method 'Scaled as load') for the PWB-only load units (Closed, `units`), from their rows in
+    load_targets()' result `load` (by ObjectID): MWSetPoint_Target = -SMW_Target.
+    """
+    mw = -units['ObjectID'].map(load['SMW_Target'])
+    return _load_unit_rows(units, 'Scaled as load', pd.Series('Closed', index=units.index), mw)
+
+def _load_unit_report(load_report: pd.DataFrame, case_units: pd.DataFrame, keyed: pd.DataFrame, scaled: pd.DataFrame) -> pd.DataFrame:
+    """
+    load_report with the load units counted in the Load row's Seed, Target and Planned MW (the PWB-only ones are in
+    them already, as loads; the keyed ones are added here: their seed load, and their EPC load as both Target and
+    Planned, so they are never Unmet), and the columns 'LU Set To EPC MW / Loads', 'LU Scaled MW / Loads' (per area).
+    """
+    load = lambda df, col: -df[col].groupby(df['AreaNumber']).sum()
+    seed = case_units[closed(case_units) & case_units['ObjectID'].isin(keyed.index)]
+    on = keyed[keyed['Status_Target'] == 'Closed']
+    cols = pd.DataFrame({'Seed MW': load(seed, 'MWSetPoint'), 'Target MW': load(keyed, 'MWSetPoint_Target'),
+                         'Planned MW': load(keyed, 'MWSetPoint_Target'), 'Seed Loads': seed.groupby('AreaNumber').size(),
+                         'LU Set To EPC MW': load(keyed, 'MWSetPoint_Target'), 'LU Set To EPC Loads': on.groupby('AreaNumber').size(),
+                         'LU Scaled MW': load(scaled, 'MWSetPoint_Target'), 'LU Scaled Loads': scaled.groupby('AreaNumber').size()})
+    report = load_report.set_index('AreaNumber')
+    report = report.reindex(report.index.union(cols.index)).fillna(0.0)
+    cols = cols.reindex(report.index).fillna(0.0)
+    for c in ('Seed MW', 'Target MW', 'Planned MW', 'Seed Loads'):
+        report[c] += cols[c]
+    report[['LU Set To EPC MW', 'LU Set To EPC Loads', 'LU Scaled MW', 'LU Scaled Loads']] = cols[['LU Set To EPC MW', 'LU Set To EPC Loads', 'LU Scaled MW', 'LU Scaled Loads']]
+    report.index.name = 'AreaNumber'
+    return report.reset_index()
 
 # ------------------ Gen targets ------------------
 def capacity_share(target: float, cap: pd.Series) -> pd.Series:
@@ -327,8 +412,8 @@ def spread_evenly(total: float, mw: pd.Series, cap: pd.Series, area: pd.Series, 
     return spread_by_group(ask, mw, cap, area, group)
 
 def scalable_gens(df: pd.DataFrame) -> pd.DataFrame:
-    """All gens but the giant swing and MANUAL_UNIT_TYPES."""
-    return df[(df['ID'] != prep.SWING_ID) & ~_code(df['UnitTypeCode']).isin(MANUAL_UNIT_TYPES)]
+    """All gens but the giant swing, MANUAL_UNIT_TYPES and the load units (LOAD_UNIT_TYPES)."""
+    return df[(df['ID'] != prep.SWING_ID) & ~_code(df['UnitTypeCode']).isin(MANUAL_UNIT_TYPES) & ~is_load_unit(df)]
 
 # ------------------ Unit commitment ------------------
 # Per (area, GenType) bucket, which PWB units are online is chosen to fit the target, rather than kept from the seed.
@@ -597,12 +682,14 @@ def build_targets(epc: dict[str, pd.DataFrame], case: dict[str, pd.DataFrame], s
         epc['Gen'] = pwb_gen_types(epc['Gen'], case['Gen'])
     off = {t: scale.epc_off_island(epc[t], island_by_bus) for t in ('Gen', 'Load')}
     og, ol = epc['Gen'][off['Gen']], epc['Load'][off['Load']]
+    lu = og[is_load_unit(og) & closed(og) & ~og['BusNum'].isin(swing_buses)]     # Load units: load, -MW.
     og = scalable_gens(og)
     og = og[closed(og) & ~og['BusNum'].isin(swing_buses)]
     ol = ol[closed(ol)]
     if not SCALE_NONCONFORMING:
         ol = ol[conforming(ol)]
-    islanded_epc = pd.concat([_by_group(og, og['MWSetPoint'].fillna(0.0), classify_gen_type(og)), _by_group(ol, ol['SMW'].fillna(0.0))])
+    islanded_epc = pd.concat([_by_group(og, og['MWSetPoint'].fillna(0.0), classify_gen_type(og)),
+                              _by_group(ol, ol['SMW'].fillna(0.0)), _by_group(lu, -lu['MWSetPoint'].fillna(0.0))])
     if off['Gen'].any() or off['Load'].any():
         print(f"EPC: {off['Gen'].sum()} gens ({og['MWSetPoint'].sum():.1f} MW) and {off['Load'].sum()} loads ({ol['SMW'].sum():.1f} MW) "
               f"on buses outside the seed's main island left out of the targets.")
@@ -611,6 +698,21 @@ def build_targets(epc: dict[str, pd.DataFrame], case: dict[str, pd.DataFrame], s
     islanded = {t: case[t][case_reason[t] != ''].assign(ExclusionReason=case_reason[t]) for t in ('Gen', 'Load')}
     case = {t: case[t][case_reason[t] == ''] for t in ('Gen', 'Load')}
     epc_load, case_load = epc['Load'], case['Load']
+    off_swing = lambda df: df[~df['BusNum'].isin(swing_buses)]
+    # Load units (LOAD_UNIT_TYPES, after the PWB's codes were given to the EPC's keyed gens) are loads, not gens. A key in
+    # both cases' load units: the EPC's status and MW 1:1, and out of both cases' load totals (unless Open in both:
+    # nothing to change). The PWB-only ones (Closed) join the PWB's loads, the EPC-only ones (Closed) the EPC's.
+    # Decided by key: a gen coded as a load unit in either case is one in both (they differ only without GEN_TYPES_FROM_PWB).
+    lu_ids = set(epc['Gen'].loc[is_load_unit(epc['Gen']), 'ObjectID']) | set(case['Gen'].loc[is_load_unit(case['Gen']), 'ObjectID'])
+    is_lu = lambda df: is_load_unit(df) | df['ObjectID'].isin(lu_ids)
+    e_lu, c_lu = (off_swing(df[is_lu(df)]) for df in (epc['Gen'], case['Gen']))
+    swing_gens = (epc['Gen'], case['Gen'])      # With the load units: a slack-bus motor still counts for swing_epc().
+    epc['Gen'], case['Gen'] = epc['Gen'][~is_lu(epc['Gen'])], case['Gen'][~is_lu(case['Gen'])]
+    lu_keyed = c_lu['ObjectID'].isin(e_lu['ObjectID'])
+    lu_status = c_lu['ObjectID'].map(e_lu.drop_duplicates('ObjectID').set_index('ObjectID')['Status'])
+    lu_rows = load_unit_targets(e_lu, c_lu[lu_keyed & ~((lu_status == 'Open') & (c_lu['Status'] == 'Open'))])
+    lu_pwb = c_lu[~lu_keyed & closed(c_lu)]
+    lu_epc = e_lu[~e_lu['ObjectID'].isin(c_lu['ObjectID']) & closed(e_lu)]
     # Non-conforming is decided by key: a PWB load flagged in either case is out of both cases' totals (and so is an
     # EPC load flagged, or with a flagged PWB key).
     if SCALE_NONCONFORMING:
@@ -622,7 +724,11 @@ def build_targets(epc: dict[str, pd.DataFrame], case: dict[str, pd.DataFrame], s
         epc_nonc = epc_flagged | epc_load['ObjectID'].isin(nonc_ids)
     is_nonc = case_load['ObjectID'].isin(nonc_ids)
     case_nonc = case_load[is_nonc]
-    load, load_report = load_targets(epc_load[~epc_nonc], case_load[~is_nonc])
+    load, load_report = load_targets(_with_units(epc_load[~epc_nonc], lu_epc),
+                                     _with_units(case_load[~is_nonc], lu_pwb), no_mvar=lu_pwb['ObjectID'])
+    lu_scaled = load_unit_scaled(lu_pwb, load)
+    load = load.drop(index=lu_pwb['ObjectID'])
+    load_report = _load_unit_report(load_report, c_lu, lu_rows, lu_scaled)
     # Those with a key in the EPC take its status and MW 1:1 (target rows), unless Open in both cases (nothing to
     # change); the rest keep their seed values.
     epc_status = case_nonc['ObjectID'].map(epc_load.set_index('ObjectID')['Status'])
@@ -630,12 +736,23 @@ def build_targets(epc: dict[str, pd.DataFrame], case: dict[str, pd.DataFrame], s
     nonc_rows = nonconforming_targets(epc_load, case_nonc[keyed])
     load = pd.concat([load, nonc_rows])
     load_report = _nonconforming_report(load_report, case_nonc, keyed, nonc_rows)
-    off_swing = lambda df: df[~df['BusNum'].isin(swing_buses)]
     gen, gen_report = gen_targets(off_swing(epc['Gen']), off_swing(case['Gen']))
     short = shortfall(off_swing(epc['Gen']), off_swing(case['Gen']), gen_report, gen['Planned MW'])
+    gen = pd.concat([gen, lu_rows, lu_scaled])
+    _warn_load_unit_limits(pd.concat([lu_rows, lu_scaled]))
     gen, load, islanded_mw = _add_islanded(gen, load, islanded['Gen'], islanded['Load'])
     return {'Gen': gen, 'Load': load}, {'area_load': load_report, 'area_gen': gen_report, 'islanded': islanded_mw, 'islanded_epc': islanded_epc,
-                                        'nonconforming': nonc_ids, 'shortfall': short, 'swing': swing_epc(epc['Gen'], case['Gen'], swing_buses)}
+                                        'nonconforming': nonc_ids, 'shortfall': short, 'swing': swing_epc(*swing_gens, swing_buses)}
+
+def _warn_load_unit_limits(rows: pd.DataFrame) -> None:
+    """One line naming each load unit planned past its MWMin or MWMax (not clamped: the plan keeps the EPC's / scaled MW)."""
+    mw = rows['MWSetPoint_Target'].astype(float)
+    past = []
+    for name, bad in (('MWMin', mw < rows['MWMin'].astype(float) - 1e-6), ('MWMax', mw > rows['MWMax'].astype(float) + 1e-6)):
+        limit = rows[name].astype(float)
+        past += [f'{i} {mw[i]:.0f} MW ({name} {limit[i]:.0f})' for i in rows.index[bad.to_numpy()]]
+    if past:
+        print('WARNING: Load units planned past their MW limits: ' + ', '.join(past))
 
 def _nonconforming_report(load_report: pd.DataFrame, case_nonc: pd.DataFrame, keyed: pd.Series,
                           nonc_rows: pd.DataFrame) -> pd.DataFrame:
@@ -688,7 +805,7 @@ def _add_islanded(gen: pd.DataFrame, load: pd.DataFrame, i_gen: pd.DataFrame, i_
     i_gen['GenType'] = classify_gen_type(i_gen)
     i_gen['Planned MW'], i_load['Planned MW'] = 0.0, 0.0
     i_load['Nonconforming'] = False
-    mw = pd.concat([_by_group(i_gen, i_gen['MWSetPoint'], i_gen['GenType']), _by_group(i_load, i_load[LOAD_P].sum(axis=1))])
+    mw = pd.concat([_by_gen(i_gen, i_gen['MWSetPoint']), _by_group(i_load, i_load[LOAD_P].sum(axis=1))])
     scale.print_islanded({'Gen': len(i_gen), 'Load': len(i_load)}, set(i_gen['ExclusionReason']) | set(i_load['ExclusionReason']))
     join = lambda a, b: pd.concat([a, b.set_index('ObjectID')]) if len(b) else a
     return join(gen, i_gen), join(load, i_load), mw
@@ -735,6 +852,16 @@ AREAS_COLUMNS = ['AreaNumber', 'Group', 'Seed MW', 'Target MW', 'Unmet MW', 'Not
                  'Target Mvar', 'Final Mvar', 'Online Seed', 'Online Final', 'Seed Loss MW', 'Est. Loss MW', 'Final Loss MW', 'Note']
 LEDGER_TOL_MW = 1.0     # A row's Final further than this from its ledger is noted as unexplained.
 
+def _gen_group(gen: pd.DataFrame) -> pd.Series:
+    """Area ledger group of each gen: its GenType, 'Load' for a load unit."""
+    group = classify_gen_type(gen)
+    return group.where(group != LOAD_UNIT, 'Load')
+
+def _by_gen(gen: pd.DataFrame, value: pd.Series | np.ndarray | Sequence[float] | float) -> pd.Series:
+    """_by_group() of a gen table's MW-like `value`: a load unit counts as load (-value), under 'Load'."""
+    sign = np.where(is_load_unit(gen), -1.0, 1.0)
+    return _by_group(gen, np.asarray(value, dtype=float) * sign, _gen_group(gen))
+
 def _by_group(df: pd.DataFrame, value: pd.Series | np.ndarray | Sequence[float] | float, group: pd.Series | np.ndarray | None = None) -> pd.Series:
     """Sum of `value` (aligned to df's rows) by (AreaNumber, Group). Group: GenType of a gen table, else 'Load'."""
     if group is None:
@@ -775,11 +902,10 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
         g, l = targets['Gen'], targets['Load']
         # Islanded rows are out of the ledger, as they are out of Seed, Target and Final (even one that stayed on).
         g, l = g[~scale.is_island_reason(g['ExclusionReason'])], l[~scale.is_island_reason(l['ExclusionReason']) & ~l.index.isin(nonc)]
-        gg = classify_gen_type(g)
-        not_reached = (_by_group(g, g['MWSetPoint_Target'] - g['MWSetPoint'], gg)
+        not_reached = (_by_gen(g, g['MWSetPoint_Target'] - g['MWSetPoint'])
                        .add(_by_group(l, p_of(l, [f'{c}_Target' for c in LOAD_P]) - p_of(l, LOAD_P)), fill_value=0.0))
-        end_target = (_by_group(g, g['MWSetPoint_Target'], gg).add(_by_group(l, p_of(l, [f'{c}_Target' for c in LOAD_P])), fill_value=0.0))
-        planned = _by_group(g, g['Planned MW'], gg).add(_by_group(l, l['Planned MW']), fill_value=0.0)
+        end_target = (_by_gen(g, g['MWSetPoint_Target']).add(_by_group(l, p_of(l, [f'{c}_Target' for c in LOAD_P])), fill_value=0.0))
+        planned = _by_gen(g, g['Planned MW']).add(_by_group(l, l['Planned MW']), fill_value=0.0)
         parts['Not Reached MW'] = not_reached
         parts['Balance MW'] = end_target.sub(planned, fill_value=0.0)        # The midrun part.
     moved = lambda ok: [r.moved for r in runs if r.moved is not None and ok(r.name)]
@@ -788,20 +914,24 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
             g, l = t['Gen'], t['Load']
             g = g[~g['BusNum'].isin(swing_buses)]       # Left out of Final MW too (a second slack bus beside the giant swing).
             start = parts[col] if col in parts else _by_group(g.iloc[:0], [])
-            parts[col] = (start.add(_by_group(g, g['MWSetPoint'] - g['MWSetPoint_Seed'], classify_gen_type(g)), fill_value=0.0)
+            parts[col] = (start.add(_by_gen(g, g['MWSetPoint'] - g['MWSetPoint_Seed']), fill_value=0.0)
                           .add(_by_group(l, p_of(l, LOAD_P) - l['P_Seed']), fill_value=0.0))
     out_ids: set = set()
     if final is not None:
         # Islanded units (excluded rows of the targets) are left out of Final MW, as they are out of Seed and Target.
         out_ids = set().union(*[df.index[scale.is_island_reason(df['ExclusionReason'])] for df in (targets or {}).values()])
         load = final['Load'][closed(final['Load']) & ~final['Load']['ObjectID'].isin(out_ids | nonc)]
-        gen = scalable_gens(final['Gen'])
+        fg = final['Gen']
+        lu_ids = set(targets['Gen'].index[is_load_unit(targets['Gen'])]) if targets is not None else set()
+        fl = is_load_unit(fg) | fg['ObjectID'].isin(lu_ids)
+        # Load units count as load (one coded otherwise in the PWB is a load unit by key: its target row says so).
+        gen = pd.concat([scalable_gens(fg[~fl]), fg[fl].assign(UnitTypeCode=sorted(LOAD_UNIT_TYPES)[0] if LOAD_UNIT_TYPES else '')])
         # STATCOMs the scaling added (ID 'SC', not in the targets) are not generation; a seed gen with that ID is.
         added = (gen['ID'] == scale.STATCOM_ID) & ~gen['ObjectID'].isin(targets['Gen'].index if targets is not None else [])
         gen = gen[closed(gen) & ~gen['BusNum'].isin(swing_buses) & ~gen['ObjectID'].isin(out_ids) & ~added]
-        parts['Final MW'] = _by_group(gen, gen['MWSetPoint'], classify_gen_type(gen)).add(_by_group(load, p_of(load, LOAD_P)), fill_value=0.0)
+        parts['Final MW'] = _by_gen(gen, gen['MWSetPoint']).add(_by_group(load, p_of(load, LOAD_P)), fill_value=0.0)
         parts['Final Mvar'] = _by_group(load, p_of(load, LOAD_Q))
-        parts['Online Final'] = _by_group(gen, 1.0, classify_gen_type(gen)).add(_by_group(load, 1.0), fill_value=0.0)
+        parts['Online Final'] = _by_group(gen, 1.0, _gen_group(gen)).add(_by_group(load, 1.0), fill_value=0.0)
 
     index = plan.index
     for s in [*parts.values(), reports.get('islanded', pd.Series(dtype=float)), reports.get('islanded_epc', pd.Series(dtype=float))]:
@@ -840,7 +970,7 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
     if final is not None and targets is not None:     # Island units whose turn-off diverged: still Closed at the end.
         on_g = final['Gen'][closed(final['Gen']) & final['Gen']['ObjectID'].isin(out_ids)]
         on_l = final['Load'][closed(final['Load']) & final['Load']['ObjectID'].isin(out_ids)]
-        still_on = (_by_group(on_g, on_g['MWSetPoint'], classify_gen_type(on_g)).add(_by_group(on_l, p_of(on_l, LOAD_P)), fill_value=0.0)
+        still_on = (_by_gen(on_g, on_g['MWSetPoint']).add(_by_group(on_l, p_of(on_l, LOAD_P)), fill_value=0.0)
                     .reindex(index).fillna(0.0))
     note = pd.Series([('outside main island, turned off: ' + (f'{mw - on:.1f} MW' if not on else f'{mw:.1f} MW, of which {on:.1f} MW stayed on'))
                       if mw else '' for mw, on in zip(islanded.to_numpy(), still_on.to_numpy())], index=index)
@@ -862,6 +992,10 @@ def _area_notes(out: pd.DataFrame, plan: pd.DataFrame, ledger: pd.Series) -> lis
                 n.append(f"non-conforming set to EPC: {p['Set To EPC MW']:.1f} MW ({int(n_set)} load{'s' if n_set != 1 else ''})")
             if pd.notna(left) and left != 0:
                 n.append(f'non-conforming left as is: {left:.1f} MW')
+            label = f"load units ({'/'.join(sorted(LOAD_UNIT_TYPES))})"
+            for what, mw, count in (('set to EPC', 'LU Set To EPC MW', 'LU Set To EPC Loads'), ('scaled with load', 'LU Scaled MW', 'LU Scaled Loads')):
+                if p.get(count, 0) and pd.notna(p.get(count)):
+                    n.append(f'{label} {what}: {p[mw]:.1f} MW ({int(p[count])})')
         else:
             units = p.get('All Units MWMax', 0) or p.get('Seed Online', 0)
             if target != 0 and not units:
@@ -909,7 +1043,7 @@ def loss_estimate(targets: dict[str, pd.DataFrame], area_load: pd.DataFrame, see
     """
     Seed and estimated target LossMW per area (columns 'Seed Loss MW', 'Est. Loss MW', index AreaNumber). An area's load
     is its positive Closed load MW in the targets (negative loads, e.g. DC converters, left out; non-conforming loads
-    with an EPC key are target rows, at their EPC values), plus the seed MW of the non-conforming loads left as is
+    with an EPC key are target rows, at their EPC values; load units count as loads, of -MWSetPoint), plus the seed MW of the non-conforming loads left as is
     (area_load's 'Left As Is MW').
     The ratio is capped at LOSS_RATIO_MAX (printed). An area with no seed load keeps its seed losses.
     """
@@ -918,8 +1052,15 @@ def loss_estimate(targets: dict[str, pd.DataFrame], area_load: pd.DataFrame, see
     def total(suffix: str) -> pd.Series:
         p = l[[c + suffix for c in LOAD_P]].sum(axis=1).where(l['Status' + suffix] == 'Closed', 0.0).clip(lower=0.0)
         return p.groupby(l['AreaNumber']).sum()
+    g = targets.get('Gen', pd.DataFrame(columns=['ExclusionReason', 'UnitTypeCode', 'AreaNumber', 'Status', 'MWSetPoint', 'Status_Target', 'MWSetPoint_Target']))
+    g = g[scale.included(g) & is_load_unit(g)]
+    def units(suffix: str) -> pd.Series:      # Load units (load = -MW; a positive one only, like the loads).
+        if not len(g):
+            return pd.Series(dtype=float)
+        return (-g['MWSetPoint' + suffix]).where(g['Status' + suffix] == 'Closed', 0.0).clip(lower=0.0).astype(float).groupby(g['AreaNumber']).sum()
     fixed = area_load.set_index('AreaNumber')['Left As Is MW'].clip(lower=0.0)
-    seed, target = total('').add(fixed, fill_value=0.0), total('_Target').add(fixed, fill_value=0.0)
+    seed = total('').add(units(''), fill_value=0.0).add(fixed, fill_value=0.0)
+    target = total('_Target').add(units('_Target'), fill_value=0.0).add(fixed, fill_value=0.0)
     ratio = (target / seed).where(seed > 0, 1.0).reindex(seed_loss.index, fill_value=1.0)
     capped = ratio[ratio > LOSS_RATIO_MAX]
     if len(capped):
@@ -1002,6 +1143,8 @@ def balance_skips(SimAuto: pw.SimAutoApi, final: dict[str, pd.DataFrame], target
             for oid in df.loc[~scale.voltage_ok(df, vpu) | (df['BusNum'].map(island) != scale.MAIN_ISLAND).fillna(True), 'ObjectID']}
     for df in (targets or {}).values():
         skip |= set(df.index[~scale.included(df) | scale.held(df)])
+    if targets is not None and 'Gen' in targets:      # Load units (by key) are never moved by a balance.
+        skip |= set(targets['Gen'].index[is_load_unit(targets['Gen'])])
     return skip
 
 def movable_gens(gen: pd.DataFrame, swing_buses: Collection[int], skip: AbstractSet[str] = frozenset()) -> pd.DataFrame:
@@ -1059,7 +1202,7 @@ def prebalance_targets(targets: dict[str, pd.DataFrame], loss_change: float = 0.
     if abs(swing) < 1.0:
         return None
 
-    gen = g_in[(g_in['Status_Target'] == 'Closed') & (g_in['MWSetPoint_Target'] > 0)]
+    gen = g_in[(g_in['Status_Target'] == 'Closed') & (g_in['MWSetPoint_Target'] > 0) & ~is_load_unit(g_in)]   # Load units never take a share.
     seed = gen['MWSetPoint_Target']
     cap = gen['MWMax'].where(gen['MWMax'] > seed, seed)     # A target already above MWMax isn't raised.
     new = seed + spread_evenly(swing, seed, cap, *gen_keys(gen))[0] if len(gen) else seed
@@ -1171,18 +1314,22 @@ def makeup_targets(final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFra
     going up, floor 0 going down); what they can't take goes onto the rest of the area's gens of every GenType, the same
     way (spread_by_group(), spill_all=False), and what the area can't take stays short. Loads: the area's Closed loads
     with MW > 0, one factor on MW and Mvar; the non-conforming loads (`nonconforming`: reports['nonconforming']) neither
-    count as short nor take a share. skip: ObjectIDs left out (balance_skips()).
+    count as short nor take a share. A load unit (LOAD_UNIT_TYPES, in targets['Gen']) which was excluded counts its shortfall
+    (-MW) as load shortfall, and never takes a gen share (movable_gens()). skip: ObjectIDs left out (balance_skips()).
     Returns (tables in balance_targets()' shape, {'Gen': MW asked, 'Load': MW asked}), or None if no group is short
     by 1 MW or more.
     """
     def shortfall(df: pd.DataFrame, cur: Callable[[pd.DataFrame], pd.Series], tgt: Callable[[pd.DataFrame], pd.Series],
-                  group: Callable[[pd.DataFrame], pd.Series] | None) -> pd.Series:
+                  group: Callable[[pd.DataFrame], pd.Series] | None, sign: float = 1.0) -> pd.Series:
         out = df[~scale.included(df) & ~scale.is_island_reason(df['ExclusionReason'])]
-        return _by_group(out, tgt(out) - cur(out), group(out) if group else None)
+        return _by_group(out, sign * (tgt(out) - cur(out)), group(out) if group else None)
     tp = lambda df: df[[f'{c}_Target' for c in LOAD_P]].sum(axis=1)
     nonc = set(nonconforming)
-    s_gen = shortfall(targets['Gen'], lambda d: d['MWSetPoint'], lambda d: d['MWSetPoint_Target'], classify_gen_type)
+    tg = targets['Gen']
+    s_gen = shortfall(tg[~is_load_unit(tg)], lambda d: d['MWSetPoint'], lambda d: d['MWSetPoint_Target'], classify_gen_type)
     s_load = shortfall(targets['Load'][~targets['Load'].index.isin(nonc)], lambda d: d[LOAD_P].sum(axis=1), tp, None)
+    # A load unit's shortfall is load shortfall (load = -MW).
+    s_load = s_load.add(shortfall(tg[is_load_unit(tg)], lambda d: d['MWSetPoint'], lambda d: d['MWSetPoint_Target'], None, sign=-1.0), fill_value=0.0)
     s_gen, s_load = s_gen[s_gen.abs() >= 1.0], s_load[s_load.abs() >= 1.0]
     if not (len(s_gen) or len(s_load)):
         return None

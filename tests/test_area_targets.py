@@ -166,15 +166,100 @@ def test_load_targets_negative_target_with_no_negative_seed_load_is_unmet():
     assert df['SMW_Target'].tolist() == [20.0]
     assert report['Unmet MW -'].tolist() == [-30.0] and report['Unmet MW +'].tolist() == [0.0]
 
-def test_gen_targets_leave_dc_ties_and_motors_alone():
-    # A pump (MP) of -80 MW in the PWB and -120 MW in the EPC: load, not generation. Neither it nor its EPC MW is scaled.
-    case = gens([('d1', 1, '1', 'Closed', 'DC', 300.0, 500.0, -500.0), ('g1', 1, '2', 'Closed', 'GT', 0.0, 100.0, 0.0),
-                 ('m1', 1, '3', 'Closed', 'MP', -80.0, 0.0, -100.0)])
-    epc = gens([('d1', 1, '1', 'Closed', 'DC', -400.0, 500.0, -500.0), ('g2', 1, '2', 'Closed', 'GT', 60.0, 100.0, 0.0),
-                ('m1', 1, '3', 'Closed', 'MP', -120.0, 0.0, -150.0)])
+def test_gen_targets_leave_dc_ties_alone():
+    case = gens([('d1', 1, '1', 'Closed', 'DC', 300.0, 500.0, -500.0), ('g1', 1, '2', 'Closed', 'GT', 0.0, 100.0, 0.0)])
+    epc = gens([('d1', 1, '1', 'Closed', 'DC', -400.0, 500.0, -500.0), ('g2', 1, '2', 'Closed', 'GT', 60.0, 100.0, 0.0)])
     df, report = area.gen_targets(epc, case)
     assert df.index.tolist() == ['g1'] and df.loc['g1', 'MWSetPoint_Target'] == 60
     assert report['GenType'].tolist() == ['Thermal']
+
+def motor_cases():
+    """Area 1. PWB: load l1 100 MW, motors m1 (-80, keyed) and m2 (-50, PWB-only), gen t1 300. EPC: l1 150, m1 -120, m3 (-30, EPC-only), t1 300."""
+    case_gen = gens([('m1', 1, '3', 'Closed', 'MP', -80.0, 0.0, -100.0), ('m2', 1, '4', 'Closed', 'MP', -50.0, 0.0, -100.0),
+                     ('t1', 1, '2', 'Closed', 'GT', 300.0, 500.0, 0.0)])
+    epc_gen = gens([('m1', 1, '3', 'Closed', 'MP', -120.0, 0.0, -150.0), ('m3', 1, '5', 'Closed', 'MP', -30.0, 0.0, -150.0),
+                    ('t1', 1, '2', 'Closed', 'GT', 300.0, 500.0, 0.0)])
+    return {'Load': loads([('l1', 1, 'Closed', 150.0, 0.0, 0.0, 15.0)]), 'Gen': epc_gen}, {'Load': loads([('l1', 1, 'Closed', 100.0, 0.0, 0.0, 10.0)]), 'Gen': case_gen}
+
+def test_load_units_are_area_load_keyed_ones_set_to_the_epc():
+    epc, case = motor_cases()
+    targets, reports = area.build_targets(epc, case)
+    g, l = targets['Gen'], targets['Load']
+    # m1 is in both cases: the EPC's MW 1:1, out of both load totals. The rest of the EPC load target is 150 + 30 (m3).
+    assert g.loc['m1', ['Method', 'MWSetPoint_Target', 'Status_Target']].tolist() == ['EPC 1:1', -120.0, 'Closed']
+    # l1 (basis: its EPC 150) and m2 (seed 50) make 200 MW: scaled by 180 / 200.
+    assert abs(l.loc['l1', 'SMW_Target'] - 135.0) < 1e-9 and 'm2' not in l.index
+    assert g.loc['m2', ['Method', 'GenType', 'Status_Target']].tolist() == ['Scaled as load', area.LOAD_UNIT, 'Closed']
+    assert abs(g.loc['m2', 'MWSetPoint_Target'] + 45.0) < 1e-9 and 'm3' not in g.index
+    assert l.loc['l1', 'SMvar_Target'] == 15.0                                # m2 takes no Mvar share.
+    # Generation: t1's own target, and no motor MW in any GenType group.
+    plan = reports['area_gen'].set_index('GenType')
+    assert plan.index.tolist() == ['Thermal'] and plan.loc['Thermal', 'Target MW'] == 300 and g.loc['t1', 'MWSetPoint_Target'] == 300
+    assert reports['shortfall'].empty
+    # The Load row: seed 100 + 80 + 50, target 150 + 30 + 120 (m1 too), nothing unmet.
+    row = area.areas(None, reports, targets).set_index('Group').loc['Load']
+    assert (row['Seed MW'], row['Target MW'], row['Unmet MW']) == (230.0, 300.0, 0.0), row
+    assert 'load units (MP) set to EPC: 120.0 MW (1)' in row['Note'] and 'load units (MP) scaled with load: 45.0 MW (1)' in row['Note']
+    # The pre-balance never moves them, and a make-up counts a motor's shortfall as load shortfall.
+    t = dict(targets)
+    t['Gen'] = g.assign(MWMax=500.0)
+    moved = area.prebalance_targets(t, loss_change=60.0)
+    assert moved is not None and moved['Gen'].index.tolist() == ['t1']
+    g2 = g.copy()
+    g2['ExclusionReason'] = np.where(g2.index == 'm2', 'Scale diverged', '')
+    final = {'Gen': case['Gen'].assign(MW=case['Gen']['MWSetPoint'], BusNum=range(1, 4)), 'Load': case['Load'].assign(NomkV=1.0)}
+    made = area.makeup_targets(final, {'Gen': g2, 'Load': l.assign(ExclusionReason='')}, swing_buses=[])
+    assert made is not None and made[0]['Gen'].empty and abs(made[1]['Load'] + 5.0) < 1e-9 and made[1]['Gen'] == 0.0, made     # Load 45 target, 50 now.
+
+def test_load_units_off_leaves_motors_as_unknown_generation():
+    epc, case = motor_cases()
+    with saved_settings():
+        area.LOAD_UNIT_TYPES = set()
+        targets, reports = area.build_targets(epc, case)
+        assert area.classify_gen_type(case['Gen']).tolist() == ['Unknown', 'Unknown', 'Thermal']
+    plan = reports['area_gen'].set_index('GenType')
+    assert plan.loc['Unknown', 'Target MW'] == -150.0 and plan.loc['Thermal', 'Target MW'] == 300      # m1 -120 + m3 -30.
+    assert targets['Gen'].loc[['m1', 'm2'], 'Method'].tolist() == ['Key', 'Seed'] and targets['Load'].loc['l1', 'SMW_Target'] == 150.0
+
+def test_a_keyed_motor_on_the_slack_bus_still_counts_for_the_swing():
+    case = gens([('s1', 1, '1', 'Closed', 'GT', 300.0, 500.0, 0.0), ('m1', 1, '2', 'Closed', 'MP', -80.0, 0.0, -200.0)]).assign(BusNum=9, MW=[300.0, -80.0])
+    epc = gens([('s1', 1, '1', 'Closed', 'GT', 250.0, 500.0, 0.0), ('m1', 1, '2', 'Closed', 'MP', -150.0, 0.0, -200.0)]).assign(BusNum=9)
+    _, reports = area.build_targets({'Load': loads([]), 'Gen': epc}, {'Load': loads([]), 'Gen': case}, swing_buses=[9])
+    assert reports['swing'].to_dict('index') == {'s1': {'Seed MW': 300.0, 'EPC MW': 250.0}, 'm1': {'Seed MW': -80.0, 'EPC MW': -150.0}}
+
+def test_load_unit_is_decided_by_key_across_both_cases():
+    # m1 is MP in the PWB and HY in the EPC, and the EPC keeps its own codes: still a load unit in both, set 1:1.
+    epc, case = motor_cases()
+    epc['Gen'].loc[epc['Gen']['ObjectID'] == 'm1', 'UnitTypeCode'] = 'HY'
+    with saved_settings():
+        area.GEN_TYPES_FROM_PWB = False
+        targets, reports = area.build_targets(epc, case)
+    assert targets['Gen'].loc['m1', ['Method', 'MWSetPoint_Target']].tolist() == ['EPC 1:1', -120.0]
+    assert reports['area_gen']['GenType'].tolist() == ['Thermal'] and 'Hydro' not in reports['area_gen']['GenType'].tolist()
+    # And the other way round: an EPC-coded MP over a PWB hydro unit.
+    epc, case = motor_cases()
+    case['Gen'].loc[case['Gen']['ObjectID'] == 'm1', 'UnitTypeCode'] = 'HY'
+    with saved_settings():
+        area.GEN_TYPES_FROM_PWB = False
+        targets, reports = area.build_targets(epc, case)
+    assert targets['Gen'].loc['m1', ['Method', 'MWSetPoint_Target']].tolist() == ['EPC 1:1', -120.0] and 'Hydro' not in reports['area_gen']['GenType'].tolist()
+
+def test_load_units_planned_past_their_limits_are_warned_not_clamped():
+    epc, case = motor_cases()
+    case['Gen'].loc[case['Gen']['ObjectID'] == 'm1', 'MWMin'] = -100.0      # m1 keyed: EPC -120 is past it.
+    case['Gen'].loc[case['Gen']['ObjectID'] == 'm2', 'MWMin'] = -40.0       # m2 scaled to -45: past it.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        targets, _ = area.build_targets(epc, case)
+    lines = [l for l in buf.getvalue().splitlines() if 'Load units planned past their MW limits' in l]
+    assert len(lines) == 1 and 'm1 -120 MW (MWMin -100)' in lines[0] and 'm2 -45 MW (MWMin -40)' in lines[0], lines
+    assert targets['Gen'].loc['m1', 'MWSetPoint_Target'] == -120.0
+    buf = io.StringIO()
+    epc, case = motor_cases()
+    case['Gen']['MWMin'] = -300.0
+    with contextlib.redirect_stdout(buf):
+        area.build_targets(epc, case)
+    assert 'past their MW limits' not in buf.getvalue()
 
 def test_dist_gen_cleanup_clears_every_load_still_carrying_it():
     # lo is Open: cleared, but it injected nothing. ln is non-conforming and Closed: cleared, and its 5 MW leave the
