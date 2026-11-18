@@ -1,6 +1,7 @@
 """Shared fakes, table builders and settings helpers for the tests (not tests themselves)."""
 import sys
 import importlib.util
+from typing import Any
 from contextlib import contextmanager
 from pathlib import Path
 import pandas as pd
@@ -16,8 +17,8 @@ class FakeSimAuto:
     """
     def __init__(self, bad=()):
         self.bad = set(bad)
-        self.applied = {}
-        self.checkpoint = None
+        self.applied: dict[tuple[str, str], dict] = {}
+        self.checkpoint: dict[tuple[str, str], dict] | None = None
         self.CreateIfNotFound = False
 
     def SaveState(self):
@@ -25,10 +26,11 @@ class FakeSimAuto:
         return ('',)
 
     def LoadState(self):
+        assert self.checkpoint is not None
         self.applied = dict(self.checkpoint)
         return ('',)
 
-    def RunScriptCommand(self, command):
+    def RunScriptCommand(self, command) -> tuple[str]:
         if command.startswith('SolvePowerFlow') and self.diverged():
             return ('Diverged',)
         return ('',)
@@ -54,6 +56,10 @@ def targets_df(**cols):
     df['ExclusionReason'] = ''
     return df
 
+def cell(frame: pd.DataFrame, *key) -> Any:
+    """frame.loc[key] typed as Any (pandas-stubs types a cell as a scalar union, and a row as Series or DataFrame)."""
+    return frame.loc[key]
+
 def results(log):
     return log['step_df']['Result'].tolist()
 
@@ -73,6 +79,10 @@ class SwingSimAuto(FakeSimAuto):
     `slack`: bus numbers which report Slack = YES. Gens on them carry the imbalance too (so they are the swing when there is no xx).
     Written rows (keyed by bus) overlay the starting tables; StoreState/RestoreState work on them as in FakeSimAuto.
     """
+    islands: dict      # Optional (read with getattr): Bus -> IslandNumber text.
+    losses: dict       # Optional: Area -> loss MW.
+    count_dist: bool   # Optional: dist gen counted in the swing.
+
     def __init__(self, gen, load, slack=()):
         super().__init__()
         self.slack = set(slack)
@@ -141,10 +151,11 @@ def restore_settings(saved):
     for (m, k), v in saved.items():
         setattr(m, k, v)
 
-def load_step_02(folder: Path, mode: str):
+def load_step_02(folder: Path, mode: str) -> Any:
     """A fresh pcm_to_pf.py, pointed at `folder`. SimAuto isn't connected: no win32com needed."""
     spec = importlib.util.spec_from_file_location('step_02', Path(__file__).resolve().parents[1] / 'pcm_to_pf.py')
-    step = importlib.util.module_from_spec(spec)
+    assert spec is not None and spec.loader is not None
+    step: Any = importlib.util.module_from_spec(spec)
     saved = module_settings()
     spec.loader.exec_module(step)           # Loads settings.toml: the owner's choices must not reach the tests.
     restore_settings(saved)

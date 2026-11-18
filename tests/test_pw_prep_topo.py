@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from helpers import FakeSimAuto, SwingSimAuto, gens, load_step_02, loads, module_settings, saved_settings, targets_df
+from helpers import cell, FakeSimAuto, SwingSimAuto, gens, load_step_02, loads, module_settings, saved_settings, targets_df
 from Scripts import pw, prep, scale, area, settings, topo
 
 def test_set_df_bisect_returns_failures_and_rolls_them_back():
@@ -260,8 +260,8 @@ def conversion_case(bad=()):
 def test_constant_power_rows_use_net_load_and_skip_open_loads():
     load = loads([('a', 1, 'Closed', 60.0, 20.0, 10.0, 6.0), ('o', 1, 'Open', 50.0, 0.0, 0.0, 5.0)]).assign(NetMW=[85.0, 0.0], NetMvar=[5.0, 0.0])
     out = prep.constant_power_rows(load)
-    assert out.index.tolist() == ['a'] and out.loc['a', ['SMW', 'SMvar']].tolist() == [85.0, 5.0]
-    assert (out.loc['a', ['IMW', 'IMvar', 'ZMW', 'ZMvar', 'DistMWInput', 'DistMvarInput']] == 0).all() and out.loc['a', 'DistStatus'] == 'Open'
+    assert out.index.tolist() == ['a'] and cell(out, 'a', ['SMW', 'SMvar']).tolist() == [85.0, 5.0]
+    assert bool((out.loc['a', ['IMW', 'IMvar', 'ZMW', 'ZMvar', 'DistMWInput', 'DistMvarInput']] == 0).all()) and out.loc['a', 'DistStatus'] == 'Open'
 
 def test_convert_loads_to_constant_power_keeps_the_operating_point():
     sa = conversion_case()
@@ -281,7 +281,7 @@ def test_convert_loads_to_constant_power_keeps_the_operating_point():
     sheet = sheets['load_conversion'].set_index('AreaNumber')
     assert sheet.loc[1, 'Loads'] == 2 and sheet.loc[1, 'Nominal MW'] == 130.0 and sheet.loc[1, 'Dist MW'] == 10.0
     assert (sheet[['Diff MW', 'Diff Mvar']].dropna().abs() < 1e-6).all().all()
-    assert abs(sheet.loc['Swing', 'Net MW Before'] - sheet.loc['Swing', 'Net MW After']) < 1e-6 and sheet.loc['Swing', 'Net MW Before'] == 155.0
+    assert abs(cell(sheet, 'Swing', 'Net MW Before') - cell(sheet, 'Swing', 'Net MW After')) < 1e-6 and sheet.loc['Swing', 'Net MW Before'] == 155.0
 
 def test_convert_loads_lists_loads_which_diverge_and_converts_the_rest():
     sa = conversion_case(bad={'12'})      # Bus 12 (load b) diverges once changed.
@@ -332,7 +332,8 @@ def test_conversion_warnings_flag_area_swing_and_load_moves():
 def test_convert_loads_with_blank_net_fields_stops_before_writing():
     sa = conversion_case()
     real = sa.GetParametersMultipleElementRect
-    sa.GetParametersMultipleElementRect = lambda t, f, g: ('', [['' if x == 'NetMW' else v for x, v in zip(f, row)] for row in real(t, f, g)[1]]) if t == 'Load' else real(t, f, g)
+    setattr(sa, 'GetParametersMultipleElementRect',
+            lambda t, f, g: ('', [['' if x == 'NetMW' else v for x, v in zip(f, row)] for row in real(t, f, g)[1]]) if t == 'Load' else real(t, f, g))
     try:
         prep.convert_loads_to_constant_power(sa)
         assert False, 'expected SystemExit'

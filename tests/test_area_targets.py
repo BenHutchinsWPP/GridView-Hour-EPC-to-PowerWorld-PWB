@@ -4,9 +4,10 @@ Tests for area.py targets, plan, commit, dispatch, key basis and non-conforming 
 """
 import contextlib
 import io
+from typing import Any
 import numpy as np
 import pandas as pd
-from helpers import FakeSimAuto, SwingSimAuto, gens, loads, results, saved_settings
+from helpers import cell, FakeSimAuto, SwingSimAuto, gens, loads, results, saved_settings
 from Scripts import scale, area, topo
 
 def test_classify_gen_type():
@@ -57,7 +58,7 @@ def test_nonconforming_basis_is_the_epc_smw_only():
     epc = loads([('s1', 1, 'Closed', 100.0, 20.0, 30.0, 10.0)]).assign(IMvar=2.0, ZMvar=3.0)
     df = area.nonconforming_targets(epc, case)
     assert df.loc['s1', 'Basis MW'] == 100 and df.loc['s1', 'Basis Mvar'] == 10 and df.loc['s1', 'SMW_Target'] == 100
-    assert (df.loc['s1', ['IMW_Target', 'ZMW_Target', 'IMvar_Target', 'ZMvar_Target']] == 0).all()
+    assert bool((df.loc['s1', ['IMW_Target', 'ZMW_Target', 'IMvar_Target', 'ZMvar_Target']] == 0).all())
 
 def test_topology_targets_take_the_epc_smw_and_zero_its_i_and_z():
     common = dict(BusName='A', NomkV=230.0)
@@ -66,7 +67,7 @@ def test_topology_targets_take_the_epc_smw_and_zero_its_i_and_z():
     gen = pd.DataFrame(columns=['ObjectID', 'BusNum', 'ID', 'Status', 'MWSetPoint', 'BusName', 'NomkV'])
     ld = topo.build_targets({'Gen': gen, 'Load': load(SMW=100.0, SMvar=10.0, IMW=20.0, IMvar=2.0, ZMW=30.0, ZMvar=3.0)}, {'Gen': gen, 'Load': load()})['Load']
     assert ld.loc['l1', 'SMW_Target'] == 100 and ld.loc['l1', 'SMvar_Target'] == 10
-    assert (ld.loc['l1', ['IMW_Target', 'IMvar_Target', 'ZMW_Target', 'ZMvar_Target', 'DistMWInput_Target']] == 0).all()
+    assert bool((ld.loc['l1', ['IMW_Target', 'IMvar_Target', 'ZMW_Target', 'ZMvar_Target', 'DistMWInput_Target']] == 0).all())
 
 def test_load_targets_area_with_no_seed_load_is_unmet():
     case = loads([('l1', 1, 'Open', 10.0, 0.0, 0.0, 0.0)])
@@ -114,7 +115,7 @@ def test_plan_makeup_commits_offline_units_and_follows_storage_down():
     df, report = area.gen_targets(epc, case)
     assert abs(df['MWSetPoint_Target'].sum() - 400.0) < 1e-6 and df.loc['t2', 'Status_Target'] == 'Closed'
     r = report.set_index(['AreaNumber', 'GenType'])
-    assert r.loc[(1, 'Solar'), 'Unmet MW'] == 300 and abs(r.loc[(1, 'Thermal'), 'Make-up MW'] - 300.0) < 1e-6
+    assert r.loc[(1, 'Solar'), 'Unmet MW'] == 300 and abs(cell(r, (1, 'Thermal'), 'Make-up MW') - 300.0) < 1e-6
     # Storage charges -300 MW in the EPC (another key) but the PWB unit can take -100: the area's net gen keeps its total, so
     # Thermal (500) and Hydro (100) come down 200 MW between them, by MW.
     case = gens([('b1', 1, '1', 'Closed', 'BA', 0.0, 100.0, -100.0), ('t1', 1, '2', 'Closed', 'GT', 500.0, 1000.0, 0.0),
@@ -231,7 +232,7 @@ def test_thermal_scaling_up_brings_biggest_units_on_first():
     df, report = area.gen_targets(gens([('e1', 1, '9', 'Closed', 'CC', 250.0, 300.0, 0.0)]), case)
     assert df['Status_Target'].to_dict() == {'g1': 'Closed', 'g2': 'Closed', 'sc': 'Closed'}
     r = report.set_index(['AreaNumber', 'GenType'])
-    assert r.loc[(1, 'Thermal'), ['Committed', 'Decommitted', 'Unmet MW', 'Method']].tolist() == [1, 0, 0, 'Capacity']
+    assert cell(r, (1, 'Thermal'), ['Committed', 'Decommitted', 'Unmet MW', 'Method']).tolist() == [1, 0, 0, 'Capacity']
 
 def test_key_basis_scales_the_whole_group():
     # g3 is in the EPC (online, 150 MW) and e1 isn't in the PWB (100 MW): target 250. g3 starts from its EPC 150 MW and
@@ -242,7 +243,7 @@ def test_key_basis_scales_the_whole_group():
     assert df['MWSetPoint_Target'].to_dict() == {'g1': 62.5, 'g3': 187.5, 'sc': 0.0}
     assert df['Method'].to_dict() == {'g1': 'Seed', 'g3': 'Key', 'sc': 'Seed'}
     r = report.set_index(['AreaNumber', 'GenType'])
-    assert r.loc[(1, 'Thermal'), ['Method', 'Basis MW', 'Key Gens', 'Unmet MW']].tolist() == ['Scaled', 200.0, 1, 0.0]
+    assert cell(r, (1, 'Thermal'), ['Method', 'Basis MW', 'Key Gens', 'Unmet MW']).tolist() == ['Scaled', 200.0, 1, 0.0]
 
 def test_group_with_no_key_scales_from_seed():
     # Decided by Fable 2026-11-15: no unit's key is in the EPC, so the seed dispatch (60 / 40) is scaled to the 50 MW target.
@@ -453,8 +454,8 @@ def test_epc_units_on_islanded_seed_buses_are_left_out_of_the_targets():
     assert reports['area_load'].set_index('AreaNumber').loc[1, 'Target MW'] == 90.0     # 120 - 30 netted; e2 (50) out; nc not counted.
     assert reports['islanded_epc'].to_dict() == {(1, 'Hydro'): 70.0, (1, 'Load'): 50.0}
     out = area.areas(None, reports, targets).set_index('Group')
-    assert 'EPC outside main island, left out: 70.0 MW' in out.loc['Hydro', 'Note']
-    assert 'EPC outside main island, left out: 50.0 MW' in out.loc['Load', 'Note']
+    assert 'EPC outside main island, left out: 70.0 MW' in cell(out, 'Hydro', 'Note')
+    assert 'EPC outside main island, left out: 50.0 MW' in cell(out, 'Load', 'Note')
     # (d) Without islands nothing is left out.
     targets, reports = area.build_targets({'Gen': epc_gen, 'Load': epc_load}, {'Gen': case_gen, 'Load': case_load})
     assert reports['islanded_epc'].empty and reports['area_gen'].set_index('GenType').loc['Hydro', 'Target MW'] == 220.0
@@ -520,7 +521,7 @@ class LowBusSimAuto(SwingSimAuto):
             rows = [[('0.85' if i == v and int(r[n]) in self.low else x) for i, x in enumerate(r)] for r in rows]
         return err, rows
 
-def nonc_hour(case_rows, epc_rows, flags=('YES', 'YES'), epc_flags=('YES', 'YES'), low=(), buses=(3, 4, 5, 6), seed_flags=None):
+def nonc_hour(case_rows, epc_rows, flags=('YES', 'YES'), epc_flags=('YES', 'YES'), low=(), buses=(3, 4, 5, 6), seed_flags=None) -> tuple[Any, Any, Any, Any, list[Any]]:
     """
     Area 1: conforming l1 (seed 200, EPC 120) and the loads of case_rows / epc_rows after it (loads() rows, area 1), on buses 3, 4, ...
     Scales a SwingSimAuto hour through the engine. Returns (sa, targets, reports, areas sheet).

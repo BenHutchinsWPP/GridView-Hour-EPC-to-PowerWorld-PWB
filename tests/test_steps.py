@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from helpers import FakeSimAuto, SwingSimAuto, gens, load_step_02, loads, module_settings, restore_settings, saved_settings
+from helpers import cell, FakeSimAuto, SwingSimAuto, gens, load_step_02, loads, module_settings, restore_settings, saved_settings
 from Scripts import pw, prep, scale, area
 
 class CaseSimAuto(SwingSimAuto):
@@ -141,6 +141,7 @@ def test_step_02_saves_the_case_when_the_log_fails():
 
 def test_merge_reports_merges_hour_logs():
     spec = importlib.util.spec_from_file_location('merge_reports', Path(__file__).resolve().parents[1] / 'pcm_to_pf.py')
+    assert spec is not None and spec.loader is not None
     merge_reports = importlib.util.module_from_spec(spec)
     saved = module_settings()
     spec.loader.exec_module(merge_reports)      # Loads settings.toml: keep the owner's choices out of the tests.
@@ -255,7 +256,7 @@ def test_step_02_estimates_losses_and_clears_untouched_dist_gen():
     assert sheets['runs']['Run'].tolist().index('distgen') == sheets['runs']['Run'].tolist().index('main') + 1
     row = sheets['areas'].set_index('Group').loc['Load']
     assert (row['Seed Loss MW'], round(row['Est. Loss MW'], 9), row['Final Loss MW']) == (10.0, 19.6, 10.0)
-    assert sheets['areas'].set_index('Group').loc['Thermal', ['Seed Loss MW', 'Est. Loss MW', 'Final Loss MW']].isna().all()
+    assert bool(sheets['areas'].set_index('Group').loc['Thermal', ['Seed Loss MW', 'Est. Loss MW', 'Final Loss MW']].isna().all())
 
 def test_step_02_warns_once_when_prepared_pwb_is_unconverted():
     gen, load = two_cases()                                   # loads() fixtures carry dist gen on Closed loads.
@@ -316,7 +317,7 @@ def test_step_02_runs_a_makeup_only_in_area_mode_when_something_is_short():
         sa.bad = {'1'}
         step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')
         runs = pd.read_excel(step.out_dir / 'h1_Log.xlsx', sheet_name='runs').set_index('Run')
-    assert 'gen asked +129 MW, placed +129 MW' in runs.loc['makeup', 'Note']     # No other Thermal unit: h1 (Hydro, same area) takes it.
+    assert 'gen asked +129 MW, placed +129 MW' in cell(runs, 'makeup', 'Note')     # No other Thermal unit: h1 (Hydro, same area) takes it.
     with saved_settings(), tempfile.TemporaryDirectory() as d:                  # A make-up error keeps the hour.
         step = load_step_02(Path(d), 'area')
         sa = CaseSimAuto({'h1.epc': (epc_gen, epc_load), 'Prepared.pwb': (gen, load)}, slack=[99])
@@ -328,7 +329,7 @@ def test_step_02_runs_a_makeup_only_in_area_mode_when_something_is_short():
         finally:
             step.area.makeup_targets = real
         runs = pd.read_excel(step.out_dir / 'h1_Log.xlsx', sheet_name='runs').set_index('Run')
-    assert 'h1.pwb' in sa.saved and runs.loc['makeup', 'Note'].startswith('failed: ZeroDivisionError')
+    assert 'h1.pwb' in sa.saved and cell(runs, 'makeup', 'Note').startswith('failed: ZeroDivisionError')
     with saved_settings(), tempfile.TemporaryDirectory() as d:
         step = load_step_02(Path(d), 'topology')
         assert step.area.MAKEUP                                                  # On, but area mode only.

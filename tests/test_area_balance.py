@@ -4,9 +4,10 @@ Tests for area.py swing balances, midrun, make-up, final balance and the areas l
 """
 import contextlib
 import io
+from typing import Any
 import numpy as np
 import pandas as pd
-from helpers import FakeSimAuto, LOAD_P_ALL, SwingSimAuto, gens, loads, saved_settings, swing_case, targets_df
+from helpers import cell, FakeSimAuto, LOAD_P_ALL, SwingSimAuto, gens, loads, saved_settings, swing_case, targets_df
 from Scripts import pw, prep, scale, area
 
 def test_swing_mw():
@@ -88,7 +89,7 @@ def test_midrun_balancer_keeps_the_swing_near_zero_and_never_moves_it():
     assert abs(swing()) <= area.BALANCE_TRIGGER_MW                      # Balanced as it went.
     assert ('Gen', '99') not in sa.applied                              # The swing unit was never written.
     # Balancing moves gen only: the load reached its own target.
-    assert targets['Load'].loc['l1', 'SMW_Target'] == 3200 and abs(targets['Load'].loc['l1', 'SMW'] - 3200) < 1e-6
+    assert targets['Load'].loc['l1', 'SMW_Target'] == 3200 and abs(cell(targets['Load'], 'l1', 'SMW') - 3200) < 1e-6
     area.balance_swing(sa)
     assert abs(swing()) < area.BALANCE_TOL_MW and ('Gen', '99') not in sa.applied
 
@@ -135,9 +136,9 @@ def test_rescale_targets():
                                   **{f'{c}_Target': [20.0] for c in ['SMW', 'SMvar', 'IMW', 'IMvar', 'ZMW', 'ZMvar']})}
     moved = {'Gen': targets_df(ObjectID=['g1', 'gx'], MWSetPoint=[60.0, 5.0], MWSetPoint_Seed=[50.0, 4.0], MWMax=[500.0, 500.0])}
     area.rescale_targets(targets, moved)
-    assert targets['Gen'].loc['g1', ['MWSetPoint', 'MWSetPoint_Start', 'MWSetPoint_Target']].tolist() == [60.0, 0.0, 120.0]
+    assert cell(targets['Gen'], 'g1', ['MWSetPoint', 'MWSetPoint_Start', 'MWSetPoint_Target']).tolist() == [60.0, 0.0, 120.0]
     assert targets['Gen'].loc['g2', 'MWSetPoint_Target'] == 10.0                    # Not moved.
-    assert targets['Load'].loc['l1', ['SMvar', 'SMvar_Start', 'SMvar_Target']].tolist() == [10.0, 10.0, 20.0]   # Balances move gens only.
+    assert cell(targets['Load'], 'l1', ['SMvar', 'SMvar_Start', 'SMvar_Target']).tolist() == [10.0, 10.0, 20.0]   # Balances move gens only.
 
 def test_midrun_balance_keeps_gens_within_mwmax():
     # Solar s1 (MWMax 100) has 150 MW to place in the EPC: planned at MWMax, 50 MW unmet, which loads the swing.
@@ -400,6 +401,7 @@ def test_prebalance_targets_moves_gen_only_and_leaves_what_gens_cannot_take_on_t
     moved = area.prebalance_targets(t)
     assert t['Gen'].loc['g1', 'MWSetPoint_Target'] == 150.0
     assert t['Load'].loc['l1', 'SMW_Target'] == 600.0 and t['Load'].loc['l1', 'SMvar_Target'] == 320.0
+    assert moved is not None
     assert area.mw_changes(moved) == {'Gen MW Change': 50.0, 'Load MW Change': 0.0}
     t['Gen']['MWMax'] = 1000.0
     area.prebalance_targets(t)
@@ -442,7 +444,7 @@ def test_prebalance_targets_counts_losses():
     t['Gen']['MWSetPoint_Target'], t['Gen']['MWMax'] = 1000.0, 2000.0
     assert area.prebalance_targets(t, 0.0) is None
     area.prebalance_targets(t, loss_change=-40.0)
-    assert abs(t['Gen'].loc['g1', 'MWSetPoint_Target'] - 960.0) < 1e-9
+    assert abs(cell(t['Gen'], 'g1', 'MWSetPoint_Target') - 960.0) < 1e-9
     assert t['Load'].loc['l1', 'SMW_Target'] == 1100.0
 
 def test_loss_estimate_scales_each_area_with_its_load():
@@ -527,14 +529,18 @@ def test_makeup_targets_stay_in_the_group_and_respect_caps_islands_and_signs():
     tl.loc['lx', 'ExclusionReason'] = 'Diverged during scaling'
     final = {'Gen': tg.reset_index().assign(MWMax=[120.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0]),
              'Load': tl.reset_index().assign(AGC='YES', DistStatus='Open')}
-    moved, asked = area.makeup_targets(final, {'Gen': tg, 'Load': tl}, swing_buses=[], skip={'gx', 'gi', 'lx'})
+    made = area.makeup_targets(final, {'Gen': tg, 'Load': tl}, swing_buses=[], skip={'gx', 'gi', 'lx'})
+    assert made is not None
+    moved, asked = made
     assert asked == {'Gen': 60.0, 'Load': 30.0}
     assert moved['Gen']['MWSetPoint_Target'].round(9).to_dict() == {'g1': 120.0, 'g2': 140.0}
     assert moved['Load'].index.tolist() == ['l1'] and moved['Load'].loc['l1', 'SMW_Target'] == 130.0
     assert area.makeup_targets(final, {'Gen': tg.assign(ExclusionReason=''), 'Load': tl.assign(ExclusionReason='')}, []) is None
     # g1 and g2 capped at MWMax: Thermal's 60 MW go onto the area's Hydro h1, not area 2's Thermal g9.
     final['Gen']['MWMax'] = [100.0, 100.0, 1000.0, 1000.0, 1000.0, 1000.0]
-    moved, _ = area.makeup_targets(final, {'Gen': tg, 'Load': tl}, swing_buses=[], skip={'gx', 'gi', 'lx'})
+    made = area.makeup_targets(final, {'Gen': tg, 'Load': tl}, swing_buses=[], skip={'gx', 'gi', 'lx'})
+    assert made is not None
+    moved, _ = made
     assert moved['Gen']['MWSetPoint_Target'].round(9).to_dict() == {'h1': 160.0}
 
 def test_a_gen_above_mwmax_is_not_raised_by_any_placement():
@@ -558,7 +564,9 @@ def test_a_gen_above_mwmax_is_not_raised_by_any_placement():
     tl = targets_df(ObjectID=['l1'], AreaNumber=1, BusNum=1, ID='1', Status='Closed',
                     **{c: 0.0 for c in LOAD_P_ALL}, **{f'{c}_Target': 0.0 for c in LOAD_P_ALL})
     final = {'Gen': tg.reset_index().assign(MWMax=[500.0, 1000.0, 1000.0]), 'Load': tl.reset_index().assign(AGC='YES', DistStatus='Open')}
-    moved, asked = area.makeup_targets(final, {'Gen': tg, 'Load': tl}, swing_buses=[], skip={'gx'})
+    made = area.makeup_targets(final, {'Gen': tg, 'Load': tl}, swing_buses=[], skip={'gx'})
+    assert made is not None
+    moved, asked = made
     assert asked['Gen'] == 60.0 and moved['Gen']['MWSetPoint_Target'].round(9).to_dict() == {'lo': 160.0}
     # gen_targets plan make-up: Hydro (EPC 200 MW) has one 100 MW unit, so 100 MW go onto the area's Thermal, whose unit
     # th sits at 600 above its MWMax 500 (the EPC's 700 Thermal MW leave it there): tl takes the 100 (MWMax 400, at 100).
@@ -591,11 +599,12 @@ def test_midrun_balance_skips_gens_the_scaling_takes_to_zero():
     sa = SwingSimAuto(gen, load)
     after_step, log = area.midrun_balancer(sa)
     scale.iterate_to_gen_load_targets(sa, t, after_step=after_step)
-    assert log and all(r.moved['Gen'].index.tolist() == ['g2'] for r in log)
+    moved: list[Any] = [r.moved for r in log]      # Optional in Run; None would fail the lookups below, as before.
+    assert log and all(m['Gen'].index.tolist() == ['g2'] for m in moved)
     g = t['Gen']
     assert g.loc['g1', 'MWSetPoint_Target'] == 0 and g.loc['g3', 'MWSetPoint_Target'] == 0
     kept = g['MWSetPoint_Target'].sum() - 100.0
-    assert kept > 100.0 and abs(kept - sum(r.moved['Gen']['MWSetPoint'].sum() - r.moved['Gen']['MWSetPoint_Seed'].sum() for r in log)) < 1e-6
+    assert kept > 100.0 and abs(kept - sum(m['Gen']['MWSetPoint'].sum() - m['Gen']['MWSetPoint_Seed'].sum() for m in moved)) < 1e-6
 
 def own_slack_ramp(lo, hi, trigger, down=False):
     """A 3 GW load ramp with the case's own slack (bus 9, MWMin lo, MWMax hi) and no giant swing: (midrun runs, main steps, end swing, goal)."""

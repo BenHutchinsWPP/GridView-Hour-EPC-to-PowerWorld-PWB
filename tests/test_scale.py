@@ -210,6 +210,7 @@ def test_exceptions_and_runs_sheets_have_fixed_columns_and_one_row_per_element_a
 def test_exceptions_join_reasons_from_main_and_a_balance_and_name_the_balance():
     sa, targets, runs = exceptions_run()
     bal = runs[-1].moved
+    assert bal is not None
     bal['Gen'].loc['g3', 'ExclusionReason'] = 'Voltage'         # Pretend the last balance excluded g3 too (and g1 for the first time).
     bal['Gen'].loc['g1', 'ExclusionReason'] = 'Voltage'
     runs[-1].log = {'gen': bal['Gen'][bal['Gen']['ExclusionReason'] != ''], 'load': bal['Load'].iloc[:0]}
@@ -229,7 +230,7 @@ def test_exceptions_list_network_changes_and_target_status_misses():
     assert ex[['Table', 'ObjectID', 'Reason']].values.tolist() == [
         ['Gen', 'g1', 'not on target status'], ['STATCOM', '5 SC', 'midrun3: STATCOM added'],
         ['STATCOM', '6 SC', 'midrun3: STATCOM tried, rolled back (not in the case)'], ['Branch', 'b1', 'main: branch opened (collapse)']]
-    assert pd.isna(ex.loc[3, 'AreaNumber']) and ex.loc[0, 'Final Status'] == 'Open' and ex.loc[0, 'Target MW'] == 5.0   # No Swing Unit row.
+    assert pd.isna(ex['AreaNumber'].loc[3]) and ex.loc[0, 'Final Status'] == 'Open' and ex.loc[0, 'Target MW'] == 5.0   # No Swing Unit row.
     assert scale.exceptions([], None, None).columns.tolist() == scale.EXCEPTION_COLUMNS and len(scale.runs_sheet([])) == 0
 
 def test_balance_starts_at_the_largest_step():
@@ -272,7 +273,7 @@ def test_exclude_islands_names_the_island_and_targets_it_off():
     assert gen['Status_Target'].tolist() == ['Closed', 'Open', 'Open', 'Open', 'Open']
     assert gen['MWSetPoint_Target'].tolist() == [60.0, 0.0, 0.0, 0.0, 0.0]
     assert load['ExclusionReason'].tolist() == ['', 'Island 3, not the main island']
-    assert load.loc['l2', 'Status_Target'] == 'Open' and (load.loc['l2', [f'{c}_Target' for c in LOAD_P_ALL]] == 0).all()
+    assert load.loc['l2', 'Status_Target'] == 'Open' and bool((load.loc['l2', [f'{c}_Target' for c in LOAD_P_ALL]] == 0).all())
 
 def test_turn_off_islanded_writes_island_units_open_and_keeps_those_which_diverge():
     gen = targets_df(ObjectID=['g1', 'g2', 'g3'], BusNum=[1, 2, 3], ID='1', Status='Closed', Status_Target=['Closed', 'Open', 'Open'],
@@ -296,11 +297,13 @@ def test_turn_off_islanded_writes_island_units_open_and_keeps_those_which_diverg
 def test_seed_islands_are_not_checked_when_the_swing_is_not_in_island_1():
     gen, load = swing_case()
     sa = SwingSimAuto(gen, load, slack=[1])
-    assert scale.seed_islands(sa, [1]).to_dict() == {1: 1, 2: 1, 3: 1, 99: 1}
+    got = scale.seed_islands(sa, [1])
+    assert got is not None and got.to_dict() == {1: 1, 2: 1, 3: 1, 99: 1}
     sa.islands = {1: '2'}
     assert scale.seed_islands(sa, [1]) is None
     sa.islands = {2: '2'}                                                       # A live second island with its own slack bus.
-    assert scale.seed_islands(sa, [1, 2]).to_dict()[2] == 2
+    got = scale.seed_islands(sa, [1, 2])
+    assert got is not None and got.to_dict()[2] == 2
 
 def test_a_unit_on_a_bus_out_of_band_from_the_start_is_held_before_scaling_begins():
     gen = targets_df(ObjectID=['g1', 'g2'], BusNum=[1, 2], ID='1', Status='Closed', Status_Target='Closed',
