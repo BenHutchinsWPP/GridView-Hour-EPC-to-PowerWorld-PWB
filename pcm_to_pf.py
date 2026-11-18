@@ -17,6 +17,7 @@ import json
 import multiprocessing as mp
 import multiprocessing.connection
 import os
+import re
 from pathlib import Path
 import traceback
 import numpy as np
@@ -410,37 +411,80 @@ def _worker(gv_fp: Path, out_fp: Path, console_fp: Path, workers: int, conn):
     conn.send(_scale_one(gv_fp, out_fp, console_fp))
     conn.close()
 
+_MAIN_STEP = re.compile(r'^Main scaling: \d+ -> (\d+) of (\d+)')
+_MIDRUN = re.compile(r'\(main scaling at (\d+) of (\d+)\)')
+_ANY_STEP = re.compile(r'^([^:]+?)(?: \(main scaling at [^)]*\))?: \d+ -> \d+ of \d+')
+MAIN_SHARE = 95         # The progress bar counts an hour's main scaling as 95 of its 100; the runs after it, the rest.
+
+def hour_progress(console_fp: Path) -> tuple[int, str]:
+    """
+    (0..MAIN_SHARE, what it is doing) for a running hour, from the end of its console: how far its main scaling has
+    got, and the label of its latest scaling step (e.g. 'Main scaling', 'Balance 2', 'Final balance 1').
+    """
+    try:
+        with open(console_fp, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 16384))
+            lines = f.read().decode('utf-8', 'replace').splitlines()
+    except OSError:
+        return 0, 'starting'
+    stage = next((m[1] for line in reversed(lines) if (m := _ANY_STEP.match(line))), 'planning')
+    for line in reversed(lines):
+        if line.startswith('Main scaling: done'):
+            return MAIN_SHARE, stage
+        if (m := _MAIN_STEP.match(line) or _MIDRUN.search(line)):
+            return MAIN_SHARE * int(m[1]) // int(m[2]), stage
+    return 0, stage
+
 def _scale_hours_parallel(todo: list[tuple[Path, Path]], workers: int):
     """
     Each hour in a process of its own (spawn, as on Windows: it re-imports this module) with its own PowerWorld, at most
-    `workers` at once. A process which dies (e.g. PowerWorld takes it down) costs only its own hour.
+    `workers` at once. A process which dies (e.g. PowerWorld takes it down) costs only its own hour. A progress bar
+    (tqdm) counts 100 per hour, moving with each running hour's main scaling, and shows what each is doing.
     """
+    from tqdm import tqdm
     print(f'Scaling {len(todo)} hours, {workers} at a time. Each hour\'s console: {out_dir / "<hour>_Console.txt"}')
     ctx = mp.get_context('spawn')
-    pending, running, n = list(todo), {}, 0
-    while pending or running:
-        while pending and len(running) < workers:
-            gv_fp, out_fp = pending.pop(0)
-            recv, send = ctx.Pipe(duplex=False)
-            p = ctx.Process(target=_worker, args=(gv_fp, out_fp, out_dir / (gv_fp.stem + '_Console.txt'), workers, send))
-            p.start()
-            send.close()        # The child's end: recv then sees EOF if the child dies without sending.
-            running[p.sentinel] = (p, recv, gv_fp)
-        for sentinel in mp.connection.wait(list(running)):
-            p, recv, gv_fp = running.pop(sentinel)
-            try:
-                summary, error = recv.recv()
-            except EOFError:
-                summary, error = None, None
-            p.join()
-            recv.close()
-            n += 1
-            if error is None and summary is None and p.exitcode != 0:
-                error = f'its process died (exit code {p.exitcode})'
-            if error:
-                print(f'[{n}/{len(todo)}] FAILED: {gv_fp.name}: {error} (see {gv_fp.stem}_Console.txt)')
-            else:
-                print(f'[{n}/{len(todo)}] {summary or gv_fp.stem + ": done (no log, see its console)"}')
+    pending, running, n, failed = list(todo), {}, 0, 0
+    seen: dict[str, int] = {}       # Hour -> its progress so far (never goes back on the bar).
+    with tqdm(total=100 * len(todo), unit='%', dynamic_ncols=True, smoothing=0.05,
+              bar_format='{percentage:3.0f}% |{bar}| {elapsed}<{remaining} {desc}') as bar:
+        def redraw():
+            hours = []
+            for p, recv, gv_fp, console_fp in running.values():
+                progress, stage = hour_progress(console_fp)
+                seen[gv_fp.stem] = max(seen.get(gv_fp.stem, 0), progress)
+                hours.append(f'{gv_fp.stem} {stage} {progress}%')
+            bar.update(100 * n + sum(seen[gv.stem] for _, _, gv, _ in running.values()) - bar.n)
+            bar.set_description_str(f'{n}/{len(todo)} done' + (f', {failed} failed' if failed else '') + ' | ' + ' | '.join(hours))
+
+        while pending or running:
+            while pending and len(running) < workers:
+                gv_fp, out_fp = pending.pop(0)
+                console_fp = out_dir / (gv_fp.stem + '_Console.txt')
+                recv, send = ctx.Pipe(duplex=False)
+                p = ctx.Process(target=_worker, args=(gv_fp, out_fp, console_fp, workers, send))
+                p.start()
+                send.close()        # The child's end: recv then sees EOF if the child dies without sending.
+                running[p.sentinel] = (p, recv, gv_fp, console_fp)
+            for sentinel in mp.connection.wait(list(running), timeout=2.0):
+                p, recv, gv_fp, _ = running.pop(sentinel)
+                try:
+                    summary, error = recv.recv()
+                except EOFError:
+                    summary, error = None, None
+                p.join()
+                recv.close()
+                n += 1
+                seen.pop(gv_fp.stem, None)
+                if error is None and summary is None and p.exitcode != 0:
+                    error = f'its process died (exit code {p.exitcode})'
+                if error:
+                    failed += 1
+                    bar.write(f'[{n}/{len(todo)}] FAILED: {gv_fp.name}: {error} (see {gv_fp.stem}_Console.txt)')
+                else:
+                    bar.write(f'[{n}/{len(todo)}] {summary or gv_fp.stem + ": done (no log, see its console)"}')
+            redraw()
 
 # ================== Step 03: merge the hour logs ==================
 EXCEL_MAX_ROWS = 1_048_576

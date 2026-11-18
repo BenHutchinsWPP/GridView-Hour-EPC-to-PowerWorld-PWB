@@ -2,3 +2,4 @@ numpy
 pandas>=3,<4   # Tested on pandas 3.x. Needs Python 3.11+.
 openpyxl
 pywin32
+tqdm           # The step 02 progress bar with [run] workers > 1.

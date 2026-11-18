@@ -2604,6 +2604,24 @@ def test_step_01_is_redone_when_prepared_pwb_was_made_from_other_settings():
                 pass
             assert not step.pw_fp.exists() and not step.prep_stamp_fp.exists()     # Nothing stale left behind.
 
+def test_the_progress_bar_reads_each_hours_stage_from_its_console():
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        step = load_step_02(Path(d), 'area')
+        fp = Path(d) / 'h1_Console.txt'
+        assert step.hour_progress(fp) == (0, 'starting')                     # No console yet.
+        lines = ['=== h1.epc ===', 'Seed gen 200 / load 200 MW; target gen 200 / load 300 MW']
+        fp.write_text('\n'.join(lines))
+        assert step.hour_progress(fp) == (0, 'planning')
+        lines += ['Main scaling: 0 -> 25 of 100: solved', 'Main scaling: 25 -> 75 of 100: diverged, halving']
+        fp.write_text('\n'.join(lines))
+        assert step.hour_progress(fp) == (step.MAIN_SHARE * 75 // 100, 'Main scaling')
+        lines += ['Balance 1 (main scaling at 50 of 100): 0 -> 100 of 100: solved']        # A midrun balance.
+        fp.write_text('\n'.join(lines))
+        assert step.hour_progress(fp) == (step.MAIN_SHARE * 50 // 100, 'Balance 1')
+        lines += ['Main scaling: 50 -> 100 of 100: solved', 'Main scaling: done', 'Final balance 2: 0 -> 100 of 100: solved']
+        fp.write_text('\n'.join(lines))
+        assert step.hour_progress(fp) == (step.MAIN_SHARE, 'Final balance 2')
+
 if __name__ == '__main__':
     tests = [f for name, f in dict(globals()).items() if name.startswith('test_')]
     for test in tests:
