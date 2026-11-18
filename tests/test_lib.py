@@ -1361,6 +1361,39 @@ def test_final_balance_keeps_the_hour_when_a_round_fails():
         scale.iterate_to_gen_load_targets = saved
     assert [r.name for r in runs] == ['balance1'] and runs[0].note.startswith('stopped: Could not solve') and runs[0].after == runs[0].after
 
+def test_makeup_keeps_the_hour_and_its_note_when_its_scaling_fails():
+    # ledger_run's case, without the midrun balancer, but the make-up's own scaling raises: it still reads After and writes the asked/placed note.
+    gen = gens([('xx', 1, 'xx', 'Closed', '', 0.0, 2e4, -2e4), ('g1', 1, '1', 'Closed', 'GT', 100.0, 5000.0, 0.0),
+                ('g2', 1, '2', 'Closed', 'HY', 100.0, 5000.0, 0.0), ('g3', 1, '3', 'Closed', 'GT', 100.0, 5000.0, 0.0)]
+               ).assign(BusNum=[99, 1, 2, 4], MW=0.0, NomkV=230.0, BusName='b')
+    load = loads([('l1', 1, 'Closed', 200.0, 0.0, 0.0, 20.0)]).assign(BusNum=3, NomkV=230.0, BusName='b')
+    epc_gen = gens([('g1', 1, '1', 'Closed', 'GT', 200.0, 1000.0, 0.0), ('g2', 1, '2', 'Closed', 'HY', 150.0, 1000.0, 0.0),
+                    ('g3', 1, '3', 'Closed', 'GT', 200.0, 1000.0, 0.0)])
+    epc_load = loads([('l1', 1, 'Closed', 3200.0, 0.0, 0.0, 320.0)])
+    sa = SwingSimAuto(gen, load)
+    sa.bad = {'4'}
+    targets, reports = area.build_targets({'Load': epc_load, 'Gen': epc_gen}, {'Load': load, 'Gen': gen}, swing_buses=[99])
+    scale.iterate_to_gen_load_targets(sa, targets)
+    real, reads = scale.iterate_to_gen_load_targets, []
+    def fails_for_makeup(*args, **kwargs):
+        if kwargs.get('label') == 'Make-up':
+            raise pw.SimAutoError('Could not solve the original input case.')
+        return real(*args, **kwargs)
+    real_read = area.read_case
+    def counting_read(*args, **kwargs):
+        reads.append(1)
+        return real_read(*args, **kwargs)
+    scale.iterate_to_gen_load_targets, area.read_case = fails_for_makeup, counting_read
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            runs = area.makeup(sa, targets)
+    finally:
+        scale.iterate_to_gen_load_targets, area.read_case = real, real_read
+    assert [r.name for r in runs] == ['makeup'] and runs[0].note.startswith('gen asked') and 'stopped: Could not solve' in runs[0].note
+    assert runs[0].after == runs[0].after and len(reads) == 2           # The Before read and the After read.
+    assert 'WARNING: Make-up stopped: Could not solve' in out.getvalue()
+
 def test_step_02_saves_the_case_when_the_log_fails():
     # The final log write fails (open in Excel), or the log cannot be built: either way the saved case is kept.
     gen, load = two_cases()

@@ -991,6 +991,24 @@ def mw_changes(moved: dict[str, pd.DataFrame]) -> dict[str, float]:
     return {'Gen MW Change': (moved['Gen']['MWSetPoint'] - moved['Gen']['MWSetPoint_Seed']).sum(),
             'Load MW Change': (moved['Load'][LOAD_P].sum(axis=1) - moved['Load']['P_Seed']).sum()}
 
+def run_correction(SimAuto, run: scale.Run, label: str) -> bool:
+    """
+    Scales run.moved (balance_targets() / makeup_targets() tables) from where the case is, starting at the largest
+    step. The engine edits run.moved in place, so afterwards it holds what was applied. Sets run.log. On a
+    pw.SimAutoError the case is left solved at the last good checkpoint: prints 'WARNING: <label> stopped: <e>',
+    sets run.log to the error's .log ({} if none), appends 'stopped: <e>' to run.note, and returns False. Any other
+    exception propagates (balance_swing() and create_case() note a final balance's or make-up's as 'failed'; a
+    midrun one ends the main scaling, so the hour). True: it ran to the end.
+    """
+    try:
+        run.log = scale.iterate_to_gen_load_targets(SimAuto, run.moved, label=label, initial_step=scale.MAX_STEP)
+        return True
+    except pw.SimAutoError as e:
+        print(f'WARNING: {label} stopped: {e}')
+        run.log = getattr(e, 'log', {})
+        run.note = '; '.join(filter(None, [run.note, f'stopped: {e}']))
+        return False
+
 def balance_swing(SimAuto, scaled: dict[str, pd.DataFrame] | None = None, tables: list | None = None,
                   epc: pd.DataFrame | None = None) -> list[scale.Run]:
     """
@@ -1044,14 +1062,7 @@ def _balance_round(SimAuto, i, slack, epc, scaled, tables, runs) -> bool:
         tables.append(targets)
     run = scale.Run(f'balance{i + 1}', moved=targets, before=swing)
     runs.append(run)
-    try:
-        run.log = scale.iterate_to_gen_load_targets(SimAuto, targets, label=f'Final balance {i + 1}', initial_step=scale.MAX_STEP)
-    except pw.SimAutoError as e:
-        # Keep the hour: the case is solved at the last good checkpoint, and `targets` holds what was applied.
-        print(f'WARNING: Final balance {i + 1} stopped: {e}')
-        run.log, run.note = getattr(e, 'log', {}), f'stopped: {e}'
-        return False
-    return True
+    return run_correction(SimAuto, run, f'Final balance {i + 1}')
 
 def rescale_targets(targets: dict[str, pd.DataFrame], moved: dict[str, pd.DataFrame]):
     """
@@ -1133,11 +1144,7 @@ def makeup(SimAuto, targets: dict[str, pd.DataFrame], tables: list | None = None
     if tables is not None:
         tables.append(moved)
     run = scale.Run('makeup', moved=moved, before=before)
-    try:
-        run.log = scale.iterate_to_gen_load_targets(SimAuto, moved, label='Make-up', initial_step=scale.MAX_STEP)
-    except pw.SimAutoError as e:
-        print(f'WARNING: Make-up stopped: {e}')
-        run.log, run.note = getattr(e, 'log', {}), f'stopped: {e}'
+    run_correction(SimAuto, run, 'Make-up')     # A failed make-up keeps what it applied; the After read and the note still follow.
     run.after = swing_mw(read_case(SimAuto)['Gen'], slack)[0]
     placed = mw_changes(moved)
     run.note = '; '.join(filter(None, [f"gen asked {asked['Gen']:+,.0f} MW, placed {placed['Gen MW Change']:+,.0f} MW; "
@@ -1243,14 +1250,8 @@ def midrun_balancer(SimAuto, epc: pd.DataFrame | None = None):
         label = f'Balance {len(runs) + 1} (main scaling at {progress} of {scale.RESOLUTION})'
         run = scale.Run(f'midrun{len(runs) + 1}', moved=moved, before=swing, at=f'{progress} of {scale.RESOLUTION}')
         runs.append(run)
-        notes = []
-        try:
-            run.log = scale.iterate_to_gen_load_targets(SimAuto, moved, label=label, initial_step=scale.MAX_STEP)
-        except pw.SimAutoError as e:
-            # Keep the hour: the case is solved at the last good checkpoint, and `moved` holds what was applied.
-            print(f'WARNING: {label} stopped: {e}')
-            run.log = getattr(e, 'log', {})
-            notes.append(f'stopped: {e}')
+        run_correction(SimAuto, run, label)
+        notes = [run.note] if run.note else []
         rescale_targets(targets, moved)
         after, _ = swing_mw(pw.get_df(SimAuto, 'Gen', GEN_FIELDS), slack)
         run.after = after
