@@ -647,3 +647,28 @@ if __name__ == '__main__':
     for test in tests:
         test()
     print(f'{len(tests)} tests passed.')
+
+def test_shortfall_sheet_lists_epc_and_pwb_gens_side_by_side():
+    # Area 1: 1000 MW of EPC wind, no PWB wind (flagged first). Solar: 400 MW asked, the PWB's s1 + s2 take 150 (short
+    # 250). s1 is in both cases: on one row. Area 2: Hydro 50 MW short, under the 100 MW threshold: not listed.
+    case = gens([('s1', 1, '1', 'Closed', 'PV', 50.0, 100.0, 0.0), ('s2', 1, '2', 'Open', 'PV', 0.0, 50.0, 0.0),
+                 ('t1', 1, '3', 'Closed', 'GT', 500.0, 3000.0, 0.0), ('h1', 2, '1', 'Closed', 'HY', 100.0, 100.0, 0.0)])
+    epc = gens([('w1', 1, '7', 'Closed', 'WT', 600.0, 700.0, 0.0), ('w2', 1, '8', 'Closed', 'WT', 400.0, 500.0, 0.0),
+                ('e9', 1, '9', 'Closed', 'PV', 300.0, 300.0, 0.0), ('s1', 1, '1', 'Closed', 'PV', 100.0, 100.0, 0.0),
+                ('wo', 1, '6', 'Open', 'WT', 0.0, 900.0, 0.0),
+                ('t1', 1, '3', 'Closed', 'GT', 500.0, 3000.0, 0.0), ('h1', 2, '1', 'Closed', 'HY', 150.0, 150.0, 0.0)])
+    targets, reports = area.build_targets({'Load': loads([]), 'Gen': epc}, {'Load': loads([]), 'Gen': case})
+    s = reports['shortfall']
+    assert s[['AreaNumber', 'GenType', 'Flag']].drop_duplicates().values.tolist() == [
+        [1, 'Wind', 'no PWB units'], [1, 'Solar', 'short of capacity']]
+    wind = s[s['GenType'] == 'Wind']
+    assert wind['EPC ID'].tolist() == ['7', '8'] and wind['PWB ID'].isna().all()      # Closed EPC units only.
+    assert (wind['Unmet MW'] == 1000).all() and (wind['PWB Units'] == 0).all()
+    solar = s[s['GenType'] == 'Solar']
+    assert solar['EPC ID'].tolist() == ['1', '9'] and solar['PWB ID'].tolist() == ['1', '2']    # s1 on the same row.
+    assert solar['PWB Seed Status'].tolist() == ['Closed', 'Open'] and solar['Planned MW'].tolist() == [100.0, 50.0]
+    assert (solar['Unmet MW'] == 250).all() and (solar['PWB Group MWMax'] == 150).all()
+    with saved_settings():
+        area.SHORTFALL_REPORT_MW = 2000.0
+        _, reports = area.build_targets({'Load': loads([]), 'Gen': epc}, {'Load': loads([]), 'Gen': case})
+    assert reports['shortfall'].empty and 'PWB ID' in reports['shortfall']

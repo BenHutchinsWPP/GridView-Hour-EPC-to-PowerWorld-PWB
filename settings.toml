@@ -76,6 +76,10 @@ balance_at_swing_limits = false
 # Stop before scaling if more than this share of the EPC's generation (|MW|) has no GenType (its unit and fuel codes are
 # blank or unknown): scaling would take the rest of the fleet offline. Map the codes below, or set 1.0 to turn this off.
 max_unknown_share = 0.5
+# Each hour's log gets a `shortfall` sheet: the EPC's and the PWB's gens side by side for every area & GenType whose own
+# PWB units can't take at least this many MW of its EPC target (Unmet MW, before make-up). Flag 'no PWB units' marks a
+# group the PWB has no units for at all (e.g. 1000 MW of EPC Wind in an area with no PWB wind).
+shortfall_report_mw = 100.0
 # The GenTypes. Add one here to give it its own group, then map unit/fuel codes to it below.
 gen_types = ["Solar", "Hydro", "Wind", "Thermal", "Battery Storage", "Unknown"]
 

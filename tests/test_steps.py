@@ -50,7 +50,8 @@ def test_step_02_area_mode_end_to_end():
         step.create_case(sa, step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb')
         assert (step.out_dir / 'h1.pwb').exists()
         sheets = pd.read_excel(step.out_dir / 'h1_Log.xlsx', sheet_name=None)
-        assert set(sheets) == {'areas', 'exceptions', 'runs'}
+        assert set(sheets) == {'areas', 'exceptions', 'runs', 'shortfall'}
+        assert sheets['shortfall'].empty and 'PWB ID' in sheets['shortfall']     # Every group's PWB units cover it.
         assert sheets['runs']['Run'].tolist()[:2] == ['prebalance', 'main']        # Targets 100 MW short of load: balanced first.
         assert sorted(fp.name for fp in step.out_dir.glob('*.xlsx')) == ['h1_Log.xlsx']
     out = sa.saved['h1.pwb']
@@ -162,7 +163,7 @@ def test_merge_reports_merges_hour_logs():
                                                     'runs': pd.DataFrame(columns=scale.RUN_COLUMNS)})
         target = merge_reports.merge(out_dir)
         sheets = pd.read_excel(target, sheet_name=None)
-    assert set(sheets) == {'hours', 'areas', 'exceptions', 'runs'}, set(sheets)
+    assert set(sheets) == {'hours', 'areas', 'exceptions', 'runs', 'shortfall'}, set(sheets)
     for name in ('areas', 'exceptions', 'runs'):
         assert sheets[name].columns[0] == 'Hour', name
     assert len(sheets['hours']) == 3

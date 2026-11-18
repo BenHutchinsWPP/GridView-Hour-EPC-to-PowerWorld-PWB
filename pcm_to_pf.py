@@ -269,7 +269,7 @@ def create_case(SimAuto, gv_fp, out_fp) -> str | None:
         if area_mode:
             # Before scaling (final None) nothing has been reached or balanced yet: the plan alone.
             scaled = targets if final is not None else None
-            log = {'areas': area.areas(final, reports, scaled, runs, swing_buses, final_loss), **log}
+            log = {'areas': area.areas(final, reports, scaled, runs, swing_buses, final_loss), **log, 'shortfall': reports['shortfall']}
         return log
 
     # The plan first, so that a failure during the hour's long scaling still leaves it.
@@ -481,7 +481,7 @@ def _scale_hours_parallel(todo: list[tuple[Path, Path]], workers: int):
 
 # ================== Step 03: merge the hour logs ==================
 EXCEL_MAX_ROWS = 1_048_576
-MERGED_SHEETS = ['areas', 'exceptions', 'runs']     # Fixed sheet names written by step 02 (area mode: all three; topology: no areas).
+MERGED_SHEETS = ['areas', 'exceptions', 'runs', 'shortfall']   # Fixed sheet names written by step 02 (topology mode: no areas, shortfall).
 HOUR_COLUMNS = ['Hour', 'Status', 'Final Swing MW', 'Unmet MW', 'Not Reached MW', 'Make-up MW', 'Balance MW', 'Worst Error MW', 'Worst AreaNumber',
                 'Worst Group', 'Exceptions Gen/Load', 'Exceptions STATCOM', 'Exceptions Branch']
 

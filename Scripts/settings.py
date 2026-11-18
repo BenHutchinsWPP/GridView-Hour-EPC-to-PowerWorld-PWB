@@ -37,7 +37,7 @@ SETTINGS = {
     'topology': {'tap_threshold', 'unsupported_gv_branch_types'},
     'area': {'commit', 'commit_max_cf', 'capacity_types', 'off_at_zero_types', 'manual_unit_types', 'scale_nonconforming',
              'loss_exponent', 'makeup', 'balance_tol_mw', 'balance_max_rounds', 'balance_trigger_mw',
-             'balance_at_swing_limits', 'max_unknown_share', 'gen_types', 'unit_gentype', 'fuel_gentype'},
+             'balance_at_swing_limits', 'max_unknown_share', 'shortfall_report_mw', 'gen_types', 'unit_gentype', 'fuel_gentype'},
     'scale': {'add_statcoms', 'drop_collapsed', 'exclude_vmin', 'exclude_vmax', 'statcom_vpu', 'statcom_vnom_min',
               'collapse_vpu', 'pvqv_dv_limit', 'initial_step', 'max_step', 'step_solves', 'final_max_rounds', 'max_workers'},
 }
@@ -90,6 +90,7 @@ def _check_ranges(fp, get):
     _need(fp, get(area, 'BALANCE_TOL_MW') > 0, f'[area] balance_tol_mw must be above 0, not {get(area, "BALANCE_TOL_MW")}')
     _need(fp, get(prep, 'SWING_MW_MIN') < get(prep, 'SWING_MW_MAX'),
           f'[prep] swing_mw_min ({get(prep, "SWING_MW_MIN")}) must be below swing_mw_max ({get(prep, "SWING_MW_MAX")})')
+    _need(fp, get(area, 'SHORTFALL_REPORT_MW') >= 0, f'[area] shortfall_report_mw must be 0 or more, not {get(area, "SHORTFALL_REPORT_MW")}')
     _need(fp, get(area, 'LOSS_EXPONENT') >= 0, f'[area] loss_exponent must be 0 or more, not {get(area, "LOSS_EXPONENT")}')
     gen_types = set(get(area, 'GEN_TYPES'))
     bad = {v for n in ('UNIT_GENTYPE', 'FUEL_GENTYPE') for v in get(area, n).values() if v is not None and v not in gen_types}

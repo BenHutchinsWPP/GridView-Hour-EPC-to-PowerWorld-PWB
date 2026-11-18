@@ -498,10 +498,56 @@ def gen_targets(epc_gen: pd.DataFrame, case_gen: pd.DataFrame) -> tuple[pd.DataF
     df = df[on_seed | on_plan]
     return df.set_index('ObjectID'), report.reset_index()
 
+# The `shortfall` sheet lists, side by side, the EPC's and the PWB's gens of each area & GenType whose own PWB units
+# can't take at least this much of its EPC target (|Unmet MW|, before make-up).
+SHORTFALL_REPORT_MW = 100.0
+_SHORTFALL_UNIT = ['BusNum', 'BusName', 'ID', 'Status', 'MW', 'MWMax']
+
+def shortfall(epc_gen: pd.DataFrame, case_gen: pd.DataFrame, gen_report: pd.DataFrame, planned: pd.Series) -> pd.DataFrame:
+    """
+    The `shortfall` sheet. A row block per area & GenType with |Unmet MW| >= SHORTFALL_REPORT_MW: the EPC's Closed gens
+    (biggest MW first) on the left, all the PWB's gens of the group, any status (biggest MWMax first), on the right; a
+    gen whose key is in both is on one row. Flag 'no PWB units' (none, or no MWMax) or 'short of capacity'; the groups
+    with no PWB units come first, then by |Unmet MW|. epc_gen / case_gen: as gen_targets() takes them.
+    planned: the plan's MW by ObjectID (gen targets' 'Planned MW').
+    """
+    epc_gen, case_gen = scalable_gens(epc_gen), scalable_gens(case_gen)
+    epc = epc_gen[closed(epc_gen)].assign(GenType=classify_gen_type(epc_gen[closed(epc_gen)]), MW=lambda d: d['MWSetPoint'].fillna(0.0))
+    case = case_gen.assign(GenType=classify_gen_type(case_gen), MW=case_gen['MWSetPoint'].where(closed(case_gen), 0.0))
+    case['Planned MW'] = case['ObjectID'].map(planned).fillna(0.0)
+    short = gen_report[gen_report['Unmet MW'].abs() >= SHORTFALL_REPORT_MW]
+    blocks = []
+    for _, g in short.iterrows():
+        a, t = g['AreaNumber'], g['GenType']
+        e = epc[(epc['AreaNumber'] == a) & (epc['GenType'] == t)].sort_values('MW', ascending=False, key=abs)
+        c = case[(case['AreaNumber'] == a) & (case['GenType'] == t)].sort_values('MWMax', ascending=False)
+        # Keys in both on the same row, then the rest of each side in order.
+        both = [k for k in e['ObjectID'] if k in set(c['ObjectID'])]
+        e_ids = both + [k for k in e['ObjectID'] if k not in both]
+        c_ids = both + [k for k in c['ObjectID'] if k not in both]
+        n = max(len(e_ids), len(c_ids), 1)
+        left = e.set_index('ObjectID').reindex(e_ids).reindex(columns=_SHORTFALL_UNIT).add_prefix('EPC ').reset_index(drop=True).reindex(range(n))
+        right = (c.set_index('ObjectID').reindex(c_ids).reindex(columns=_SHORTFALL_UNIT + ['Planned MW']).add_prefix('PWB ')
+                 .rename(columns={'PWB MW': 'PWB Seed MW', 'PWB Status': 'PWB Seed Status', 'PWB Planned MW': 'Planned MW'})
+                 .reset_index(drop=True).reindex(range(n)))
+        no_units = not len(c) or not (c['MWMax'].abs().sum() > 0 or c['MWMin'].abs().sum() > 0)
+        head = pd.DataFrame({'AreaNumber': a, 'GenType': t, 'Flag': 'no PWB units' if no_units else 'short of capacity',
+                             'Target MW': g['Target MW'], 'Unmet MW': g['Unmet MW'], 'EPC Units': len(e),
+                             'PWB Units': len(c), 'PWB Group MWMax': c['MWMax'].sum()}, index=range(n))
+        blocks.append((not no_units, -abs(g['Unmet MW']), pd.concat([head, left, right], axis=1)))
+    if not blocks:
+        return pd.DataFrame(columns=['AreaNumber', 'GenType', 'Flag', 'Target MW', 'Unmet MW', 'EPC Units', 'PWB Units', 'PWB Group MWMax',
+                                     *('EPC ' + c for c in _SHORTFALL_UNIT),
+                                     'PWB BusNum', 'PWB BusName', 'PWB ID', 'PWB Seed Status', 'PWB Seed MW', 'PWB MWMax', 'Planned MW'])
+    blocks.sort(key=lambda b: b[:2])
+    out = pd.concat([b[2] for b in blocks], ignore_index=True)
+    return out.astype({c: 'Int64' for c in ('EPC BusNum', 'PWB BusNum', 'EPC Units', 'PWB Units')})   # Blank, not 101.0.
+
 def build_targets(epc: dict[str, pd.DataFrame], case: dict[str, pd.DataFrame], swing_buses=(),
                   island_by_bus: pd.Series | None = None) -> tuple[dict, dict]:
     """
     Returns (targets {'Gen', 'Load'} for scale.iterate_to_gen_load_targets(), reports {'area_load', 'area_gen', ...}).
+    reports['shortfall']: the `shortfall` sheet (shortfall()).
     reports['nonconforming']: ObjectIDs of the main island's non-conforming loads (flagged in either case; empty with
     SCALE_NONCONFORMING). They are out of the area totals, the balances and the make-up; those with a key in the EPC are
     target rows (Nonconforming True, Method 'EPC 1:1': the EPC's status and MW/Mvar), the rest are left as is.
@@ -553,9 +599,10 @@ def build_targets(epc: dict[str, pd.DataFrame], case: dict[str, pd.DataFrame], s
     load_report = _nonconforming_report(load_report, case_nonc, keyed, nonc_rows)
     off_swing = lambda df: df[~df['BusNum'].isin(swing_buses)]
     gen, gen_report = gen_targets(off_swing(epc['Gen']), off_swing(case['Gen']))
+    short = shortfall(off_swing(epc['Gen']), off_swing(case['Gen']), gen_report, gen['Planned MW'])
     gen, load, islanded_mw = _add_islanded(gen, load, islanded['Gen'], islanded['Load'])
     return {'Gen': gen, 'Load': load}, {'area_load': load_report, 'area_gen': gen_report, 'islanded': islanded_mw, 'islanded_epc': islanded_epc,
-                                        'nonconforming': nonc_ids, 'swing': swing_epc(epc['Gen'], case['Gen'], swing_buses)}
+                                        'nonconforming': nonc_ids, 'shortfall': short, 'swing': swing_epc(epc['Gen'], case['Gen'], swing_buses)}
 
 def _nonconforming_report(load_report: pd.DataFrame, case_nonc: pd.DataFrame, keyed: pd.Series,
                           nonc_rows: pd.DataFrame) -> pd.DataFrame:
