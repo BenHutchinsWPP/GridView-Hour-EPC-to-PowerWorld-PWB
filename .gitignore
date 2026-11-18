@@ -29,3 +29,4 @@ Prepared/*.xls*
 
 # docs/ is matched by *.doc* above.
 !docs/
+Output/*.txt

@@ -74,6 +74,7 @@ def test_gen_targets(pw_fp: Path, gen_df: pd.DataFrame) -> pd.DataFrame:
     """
     Tests each generator target individually, and adds a 'Success' column reporting which individual changes solve.
     """
+    pw.print_opened = pw.print_solve_errors = False     # A process of its own: quiet, as step 02 is.
     SimAuto = pw.connect()
     pw.open_case(SimAuto, pw_fp)
     if not pw.solve(SimAuto):

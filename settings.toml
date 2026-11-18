@@ -1,4 +1,4 @@
-# Settings for "01 Prepare Seed.py" and "02 Scale Hours.py". Read by Scripts/settings.py.
+# Settings for pcm_to_pf.py. Read by Scripts/settings.py.
 # A setting left out keeps its default (the value in the Scripts/*.py file it belongs to). An unknown name is an error.
 
 [run]
@@ -8,6 +8,12 @@
 #         gen and load to its own EPC value.
 mode = "area"
 case_format = "PWB24"                   # PowerWorld Simulator 24 or later opens the saved cases.
+# What pcm_to_pf.py runs with no arguments: step 01 "prepare" (skipped while Prepared/Prepared.pwb exists), 02 "scale",
+# 03 "merge". `python pcm_to_pf.py scale merge` runs only those.
+steps = ["prepare", "scale", "merge"]
+# Hours scaled at once in step 02, each in its own PowerWorld instance (one SimAuto license seat and the case's memory
+# each). Each hour's console goes to Output/<hour>_Console.txt when above 1.
+workers = 1
 
 # Swing. true: add a giant swing generator (ID "xx") to take up the imbalance while scaling.
 # false: use the case's own swing (the gens on its slack bus).
@@ -18,7 +24,8 @@ swing_bus = "slack"
 # Move MW off the swing onto the whole case's gen (load is never moved; one factor on every gen, so each area & GenType
 # moves by the same share): during scaling whenever the swing is further than
 # [area] balance_trigger_mw from 0, and after scaling until it is at its goal: the giant swing 0 MW; the case's own slack
-# its EPC MW if its key is in the EPC, else anywhere within its MWMin..MWMax. The swing unit itself is never moved.
+# its EPC MW if its key is in the EPC, else anywhere within 0..MWMax (a negative MWMin
+# still counts; a positive one doesn't). The swing unit itself is never moved.
 balance_swing = true
 
 # Seed preparation (step 01).
@@ -60,8 +67,8 @@ balance_max_rounds = 10
 # While scaling, balance once the swing goes outside its band. The giant swing: further than balance_trigger_mw from 0
 # (0 = not used), or (balance_at_swing_limits) past its MWMax / MWMin; with both, whichever comes first. The case's own
 # slack: its band is where the plan expects it (moving from its start to its EPC MW as the scaling goes) +/-
-# balance_trigger_mw, within its MWMin / MWMax, but at least +/- balance_trigger_mw / 2 around the point a balance aims
-# at (so the band may reach past a narrow MWMin / MWMax). With balance_trigger_mw 0 the band is [MWMin, MWMax], and
+# balance_trigger_mw, within 0 / MWMax, but at least +/- balance_trigger_mw / 2 around the point a balance aims
+# at (so the band may reach past a narrow 0 / MWMax). With balance_trigger_mw 0 the band is [0, MWMax], and
 # midrun balancing is off for the slack when that range is under 100 MW (MIN_OWN_RANGE_MW). Either way the step size is capped so one step can't carry the swing past
 # its band (a slack ~2 GW off its plan can diverge).
 balance_trigger_mw = 1000.0

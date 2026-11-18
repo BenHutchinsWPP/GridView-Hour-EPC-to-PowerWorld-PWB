@@ -575,7 +575,7 @@ def _nonconforming_report(load_report: pd.DataFrame, case_nonc: pd.DataFrame, ke
 def swing_epc(epc_gen: pd.DataFrame, case_gen: pd.DataFrame, swing_buses) -> pd.DataFrame:
     """
     The case's own slack gens (Closed, on swing_buses) whose key is also in the EPC: 'Seed MW' (their solved MW, or
-    MWSetPoint if MW isn't read) and 'EPC MW' (0 if Open in the EPC; kept within its MWMin to MWMax), by ObjectID. The balances aim each at its EPC MW
+    MWSetPoint if MW isn't read) and 'EPC MW' (0 if Open in the EPC; kept within _limits(): 0 to MWMax), by ObjectID. The balances aim each at its EPC MW
     (swing_goal()). Empty if the case has a giant swing: that one always aims at 0.
     """
     empty = pd.DataFrame(columns=['Seed MW', 'EPC MW'], dtype=float)
@@ -644,7 +644,7 @@ def warn_unconverted_loads(case_load: pd.DataFrame) -> int:
         dist = df['DistMWInput'].where(df['DistStatus'] == 'Closed', 0.0).sum()
         print(f'WARNING: Prepared.pwb has {len(df)} Closed loads with constant current/impedance or dist gen '
               f'({(df["IMW"] + df["ZMW"]).sum():,.0f} MW of I+Z, {dist:,.0f} MW of dist gen). '
-              'Rerun step 01: it converts every load to constant power.')
+              'Rerun step 01 (delete Prepared.pwb first): it converts every load to constant power.')
     return len(df)
 
 def dist_gen_removed(cleanup: pd.DataFrame) -> float:
@@ -866,14 +866,17 @@ def swing_mw(gen: pd.DataFrame, slack_buses) -> tuple[float, list]:
     return float(swing['MW'].sum()), sorted(set(swing['BusNum']))
 
 def _limits(units: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
-    """(low, high) MW limits of each unit: MWMin / MWMax in order, a blank one unlimited."""
+    """
+    (low, high) MW limits of each of the case's own slack gens: 0 (or MWMin, if below 0) to MWMax, a blank one
+    unlimited. 0 rather than a positive MWMin (owner 2026-11-17): a wider range for the slack to take up imbalance.
+    """
     a, b = units['MWMin'].astype(float).fillna(-np.inf), units['MWMax'].astype(float).fillna(np.inf)
-    return np.minimum(a, b), np.maximum(a, b)
+    return np.minimum(np.minimum(a, b), 0.0), np.maximum(a, b)
 
 def swing_band(gen: pd.DataFrame, slack_buses) -> tuple[float, float]:
     """
     (low, high) MW the swing may sit within while scaling, before midrun_balancer() rebalances. The case's own slack
-    gens (no giant swing): their MWMin to MWMax (summed). The giant swing: the narrowest of +/- BALANCE_TRIGGER_MW
+    gens (no giant swing): their _limits(), 0 to MWMax (summed). The giant swing: the narrowest of +/- BALANCE_TRIGGER_MW
     (if not 0) and its MWMin / MWMax (if BALANCE_AT_SWING_LIMITS).
     """
     swing = swing_units(gen, slack_buses)
@@ -891,7 +894,7 @@ def swing_band(gen: pd.DataFrame, slack_buses) -> tuple[float, float]:
 def swing_goal(gen: pd.DataFrame, slack_buses, epc: pd.DataFrame | None = None) -> tuple[float, float]:
     """
     (low, high) MW the swing should end within. The giant swing: 0. The case's own slack gens: each one in `epc`
-    (swing_epc()) at its EPC MW kept within its MWMin to MWMax (an EPC MW past a limit, or 0 for a slack Open in the
+    (swing_epc()) at its EPC MW kept within _limits(), 0 to MWMax (an EPC MW past a limit, or 0 for a slack Open in the
     EPC, aims at that limit), any other anywhere within its limits (a blank limit: unlimited); summed.
     """
     swing = swing_units(gen, slack_buses)
@@ -1151,9 +1154,9 @@ def midrun_balancer(SimAuto, epc: pd.DataFrame | None = None):
       inside its edges if 0 is not there.
     - The case's own slack: the pre-balance plans it to go from where it starts to its goal (swing_goal(), `epc`:
       swing_epc()) as the scaling goes, so at each step it is expected at that point of the way. The band is that
-      point +/- BALANCE_TRIGGER_MW, within its MWMin / MWMax, but at least a half trigger either side of the point a
+      point +/- BALANCE_TRIGGER_MW, within its _limits() (0 / MWMax), but at least a half trigger either side of the point a
       balance aims at (so a zero-width range still has a band); a balance aims back at that point. With a trigger of 0
-      the band is its MWMin / MWMax, and a range under MIN_OWN_RANGE_MW is not balanced midrun. A slack which strays far
+      the band is its _limits(), and a range under MIN_OWN_RANGE_MW is not balanced midrun. A slack which strays far
       diverges (about 2 GW on the owner's case), so this keeps it near its plan.
     If a balance leaves the swing outside the band (e.g. gens at MWMax), the band is widened to where it got to, plus
     a margin (BALANCE_TRIGGER_MW, or 10% of the band if that's 0), so the next balance waits until the swing has moved

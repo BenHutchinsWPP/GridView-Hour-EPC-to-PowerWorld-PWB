@@ -1008,8 +1008,8 @@ class CaseSimAuto(SwingSimAuto):
         return ('',)
 
 def load_step_02(folder: Path, mode: str):
-    """'02 Scale Hours.py' (not importable by name), pointed at `folder`. SimAuto isn't connected: no win32com needed."""
-    spec = importlib.util.spec_from_file_location('step_02', Path(__file__).resolve().parents[1] / '02 Scale Hours.py')
+    """A fresh pcm_to_pf.py, pointed at `folder`. SimAuto isn't connected: no win32com needed."""
+    spec = importlib.util.spec_from_file_location('step_02', Path(__file__).resolve().parents[1] / 'pcm_to_pf.py')
     step = importlib.util.module_from_spec(spec)
     saved = module_settings()
     spec.loader.exec_module(step)           # Loads settings.toml: the owner's choices must not reach the tests.
@@ -1170,12 +1170,14 @@ def test_own_slack_ends_at_its_epc_mw_when_its_key_is_in_the_epc():
     scale.iterate_to_gen_load_targets(sa, load_ramp_targets(), after_step=after_step)
     area.balance_swing(sa, epc=swing)
     assert abs(area.swing_mw(sa.table('Gen'), [9])[0] - 300.0) < area.BALANCE_TOL_MW and ('Gen', '9') not in sa.applied
-    # The goal stays within the slack's limits: an EPC MW past MWMax, or a slack Open in the EPC (0) under MWMin 50.
+    # The goal stays within the slack's limits, 0 (not a positive MWMin) to MWMax: an EPC MW past MWMax is capped, and a
+    # slack Open in the EPC aims at 0 although its MWMin is 50.
     lim = gen.assign(MWMin=[50.0, 0.0, 0.0])
     assert area.swing_goal(lim, [9], pd.DataFrame({'EPC MW': [1500.0]}, index=['s1'])) == (1000.0, 1000.0)
-    assert area.swing_epc(epc_gen.assign(Status='Open'), lim.assign(MW=150.0), [9]).loc['s1', 'EPC MW'] == 50.0
-    assert area.swing_goal(lim.assign(MWMax=np.nan), [9]) == (50.0, np.inf)               # A blank limit: unlimited.
-    assert area.swing_band(lim.assign(MWMin=2000.0), [9]) == (1000.0, 2000.0)             # Swapped limits: in order.
+    assert area.swing_epc(epc_gen.assign(Status='Open'), lim.assign(MW=150.0), [9]).loc['s1', 'EPC MW'] == 0.0
+    assert area.swing_goal(lim.assign(MWMax=np.nan), [9]) == (0.0, np.inf)                # A blank limit: unlimited.
+    assert area.swing_goal(lim.assign(MWMin=-200.0), [9]) == (-200.0, 1000.0)            # A negative MWMin: kept.
+    assert area.swing_band(lim.assign(MWMin=2000.0), [9]) == (0.0, 2000.0)                # Swapped limits: in order.
     # The pre-balance makes up the slack's move too: seed 150 -> EPC 300 leaves 150 MW less for the other gens.
     t = load_ramp_targets()
     t['Load']['SMW_Target'] = 200.0
@@ -1450,9 +1452,11 @@ def test_midrun_balance_leaves_units_the_main_scaling_excluded():
     assert log and out.loc['g1', 'MWSetPoint'] == 100.0 and out.loc['g2', 'MWSetPoint'] > 100.0
 
 def test_merge_reports_merges_hour_logs():
-    spec = importlib.util.spec_from_file_location('merge_reports', Path(__file__).resolve().parents[1] / '03 Merge Reports.py')
+    spec = importlib.util.spec_from_file_location('merge_reports', Path(__file__).resolve().parents[1] / 'pcm_to_pf.py')
     merge_reports = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(merge_reports)
+    saved = module_settings()
+    spec.loader.exec_module(merge_reports)      # Loads settings.toml: keep the owner's choices out of the tests.
+    restore_settings(saved)
     with tempfile.TemporaryDirectory() as d:
         out_dir = Path(d) / 'Output'
         out_dir.mkdir()
@@ -1972,19 +1976,20 @@ def own_slack_ramp(lo, hi, trigger, down=False):
     return log, out['step_df'], area.swing_mw(sa.table('Gen'), [9])[0], area.swing_goal(sa.table('Gen'), [9])
 
 def test_midrun_balance_of_an_own_slack_with_no_range_stays_cheap():
-    log, steps, swing, (lo, hi) = own_slack_ramp(100.0, 100.0, 1000.0)       # MWMin == MWMax: the band used to have no width.
+    log, steps, swing, (lo, hi) = own_slack_ramp(100.0, 100.0, 1000.0)       # MWMin == MWMax: 0..100 MW now (no width before 0 was the floor).
     assert len(log) <= 10 and len(steps) <= 25 and lo - area.BALANCE_TOL_MW <= swing <= hi + area.BALANCE_TOL_MW, (len(log), len(steps), swing)
     log, steps, swing, (lo, hi) = own_slack_ramp(100.0, 100.0, 1000.0, down=True)    # The lower half of the band, on a falling load.
     assert len(log) <= 10 and len(steps) <= 25 and lo - area.BALANCE_TOL_MW <= swing <= hi + area.BALANCE_TOL_MW, (len(log), len(steps), swing)
 
 def test_midrun_balance_of_an_own_slack_is_off_with_no_trigger_and_a_narrow_range():
-    # Trigger 0: the band is the slack's MWMin to MWMax; a range under 100 MW is not balanced midrun (the final balance still runs).
-    # (The plan's example 50..150 is exactly 100 MW wide: 90 MW here, see the T2 report.)
-    log, steps, swing, (lo, hi) = own_slack_ramp(50.0, 140.0, 0.0)
+    # Trigger 0: the band is the slack's 0 (not its MWMin 50) to MWMax; a range under 100 MW is not balanced midrun (the
+    # final balance still runs). 0..90 MW here.
+    log, steps, swing, (lo, hi) = own_slack_ramp(50.0, 90.0, 0.0)
+    assert lo == 0.0
     assert log == [] and lo - area.BALANCE_TOL_MW <= swing <= hi + area.BALANCE_TOL_MW
     log, steps, swing, _ = own_slack_ramp(0.0, 1000.0, 0.0)                  # A wide range: balanced at its limits, not every step.
     assert 1 <= len(log) <= 5, len(log)
-    log, steps, swing, _ = own_slack_ramp(50.0, 150.0, 0.0)                  # Exactly MIN_OWN_RANGE_MW wide: still balanced (strict <).
+    log, steps, swing, _ = own_slack_ramp(50.0, 100.0, 0.0)                  # 0..100, exactly MIN_OWN_RANGE_MW wide: still balanced (strict <).
     assert len(log) >= 1
 
 def test_a_unit_on_a_bus_out_of_band_from_the_start_is_held_before_scaling_begins():
@@ -2089,7 +2094,7 @@ def test_loading_step_02_leaves_the_owners_settings_out_of_the_tests():
         fp.write_text('[run]\nbalance_swing = false\npretest_gens = true\n[area]\ncommit = false\nmakeup = false\n')
         real = settings.load.__defaults__
         original = pw.print_opened, pw.print_solve_errors
-        pw.print_opened = pw.print_solve_errors = True       # The step turns both off at import.
+        pw.print_opened = pw.print_solve_errors = True       # Importing the step must leave both as they are.
         flags = True, True
         with saved_settings():
             before = module_settings()
@@ -2433,10 +2438,87 @@ def test_convert_loads_skips_the_conversion_when_the_case_does_not_solve():
     assert sheets == {} and 'NOT converted' in out.getvalue() and set(sa.applied) == {('Load', '11')}
 
 def test_step_01_runs_the_conversion_after_agc_off_and_before_pvqv_and_the_giant_swing():
-    lines = (Path(__file__).resolve().parents[1] / '01 Prepare Seed.py').read_text().splitlines()
+    lines = (Path(__file__).resolve().parents[1] / 'pcm_to_pf.py').read_text().splitlines()
     first = lambda text: next(i for i, line in enumerate(lines) if text in line)
     order = [first(f'prep.{name}') for name in ('disable_area_agc', 'convert_loads_to_constant_power', 'get_pvqv', 'create_giant_swing')]
     assert order == sorted(order)
+
+# ------------------ pcm_to_pf.py: steps and workers ------------------
+def test_main_runs_the_steps_asked_for_and_skips_a_prepared_seed():
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        step = load_step_02(Path(d), 'area')
+        calls = []
+        step.prepare = lambda: calls.append('prepare')
+        step.scale_hours = lambda workers: calls.append(('scale', workers))
+        step.merge = lambda out_dir: calls.append('merge')
+        step.pw_fp.unlink()
+        with contextlib.redirect_stdout(io.StringIO()):
+            step.main([])                                   # [run] steps and workers.
+            assert calls == ['prepare', ('scale', 1), 'merge']
+            step.pw_fp.write_text('')                       # Prepared: step 01 skipped.
+            calls.clear()
+            step.run['workers'] = 3
+            step.main(['merge', 'scale'])
+            assert calls == [('scale', 3), 'merge']
+            calls.clear()
+            step.main(['prepare'])
+            assert calls == []
+            for bad in (['bogus'], ['--workers', '3']):        # Workers: settings.toml only.
+                try:
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        step.main(bad)
+                    assert False, bad
+                except SystemExit:
+                    pass
+
+def test_settings_check_steps_and_workers():
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        fp = Path(d) / 's.toml'
+        fp.write_text('[run]\nsteps = ["scale"]\nworkers = 4\n')
+        run = settings.load(fp)
+        assert run['steps'] == ['scale'] and run['workers'] == 4
+        for text in ('[run]\nsteps = ["scal"]\n', '[run]\nsteps = []\n', '[run]\nworkers = 0\n', '[run]\nworkers = 1.5\n'):
+            fp.write_text(text)
+            try:
+                settings.load(fp)
+                assert False, text
+            except ValueError:
+                pass
+
+def test_scale_hours_skips_done_hours_and_hands_the_rest_to_the_workers():
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        step = load_step_02(Path(d), 'area')
+        for h in ('h2', 'h3'):
+            (step.gv_dir / f'{h}.epc').write_text('')
+        (step.out_dir / 'h2.pwb').write_text('')           # Done already.
+        handed = []
+        step._scale_hours_parallel = lambda todo, workers: handed.append(([g.name for g, _ in todo], workers))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            step.scale_hours(8)
+        assert handed == [(['h1.epc', 'h3.epc'], 2)] and 'Skipping h2.epc' in out.getvalue()   # No more workers than hours.
+
+def test_a_worker_writes_the_hour_console_and_reports_a_failure():
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        step = load_step_02(Path(d), 'area')
+        console = step.out_dir / 'h1_Console.txt'
+        def fails(SimAuto, gv_fp, out_fp):
+            print('scaling h1')
+            raise ValueError('diverged')
+        step.create_case = fails
+        real_connect = pw.connect
+        pw.connect = FakeSimAuto
+        try:
+            assert step._scale_one(step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb', console) == (None, "ValueError('diverged')")
+            text = console.read_text()
+            assert 'scaling h1' in text and 'Traceback' in text
+            step.create_case = lambda SimAuto, gv_fp, out_fp: 'h1: swing 0.0 MW'
+            assert step._scale_one(step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb', console) == ('h1: swing 0.0 MW', None)
+            def no_seat():
+                raise pw.SimAutoError('no free SimAuto seat')
+            pw.connect = no_seat                                # A failed connect costs this hour only.
+            assert step._scale_one(step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb', console) == (None, "SimAutoError('no free SimAuto seat')")
+        finally:
+            pw.connect = real_connect
 
 if __name__ == '__main__':
     tests = [f for name, f in dict(globals()).items() if name.startswith('test_')]

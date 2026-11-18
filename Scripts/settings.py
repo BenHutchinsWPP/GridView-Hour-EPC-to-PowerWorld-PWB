@@ -1,7 +1,7 @@
 """
 Reads settings.toml (repo root). No dependencies: tomllib is in Python 3.11+.
 
-[run] holds the switches the step scripts read, returned by load(). Every other section sets the constants of the module
+[run] holds the switches pcm_to_pf.py reads, returned by load(). Every other section sets the constants of the module
 it names, by upper-cased key: [scale] exclude_vmin = 0.88 sets Scripts/scale.py's EXCLUDE_VMIN. The modules hold the
 defaults, so a key left out of the file keeps its default, and an unknown key (one not in SETTINGS) is an error.
 """
@@ -24,8 +24,11 @@ RUN_DEFAULTS = {
     'pretest_gens': False,
     'use_pvqv': False,
     'balance_swing': True,
+    'steps': ['prepare', 'scale', 'merge'],  # pcm_to_pf.py's steps when run without arguments.
+    'workers': 1,                           # Hours scaled at once, each in its own PowerWorld instance.
 }
 MODES = ('area', 'topology')
+STEPS = ('prepare', 'scale', 'merge')
 # The keys each section accepts: those in the shipped settings.toml (max_workers is commented out there). Other upper-case
 # names in the modules (RESOLUTION, STATCOM_ID, LOAD_P, STATUS, ...) are code, not settings.
 SETTINGS = {
@@ -132,6 +135,10 @@ def load(fp: Path = DEFAULT_FP) -> dict:
         raise ValueError(f'{fp}: [run] mode must be one of {MODES}, not {run["mode"]!r}')
     if not (run['swing_bus'] in ('slack', 'max_fault_duty') or type(run['swing_bus']) is int):
         raise ValueError(f"{fp}: [run] swing_bus must be 'slack', 'max_fault_duty' or a bus number")
+    if not run['steps'] or set(run['steps']) - set(STEPS):
+        raise ValueError(f'{fp}: [run] steps must be from {STEPS}, not {run["steps"]!r}')
+    if not (_is_int(run['workers']) and run['workers'] >= 1):
+        raise ValueError(f'{fp}: [run] workers must be a whole number of 1 or more, not {run["workers"]!r}')
     _check_ranges(fp, lambda module, name: new.get((module, name), getattr(module, name)))
     for (module, name), value in new.items():
         setattr(module, name, value)
