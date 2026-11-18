@@ -24,6 +24,7 @@ Prepared/*.pwb
 Prepared/*.csv
 Prepared/*.aux
 Prepared/*.xls*
+Prepared/*.json
 
 *pycache*
 

@@ -5,6 +5,7 @@ Tests for the parts of Scripts/ which don't need PowerWorld. Runs on any OS.
 import contextlib
 import importlib.util
 import io
+import json
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -1017,6 +1018,7 @@ def load_step_02(folder: Path, mode: str):
     step.run = dict(settings.RUN_DEFAULTS, mode=mode)
     step.gv_dir, step.out_dir = folder / 'HourEPCs', folder / 'Output'
     step.pw_fp, step.pvqv_fp, step.dummy_bus_fp = folder / 'Prepared.pwb', folder / 'pvqv.csv', folder / 'DummyBus.aux'
+    step.seed_dir, step.prep_stamp_fp = folder / 'Seed', folder / 'Prepared_Settings.json'
     for d in (step.gv_dir, step.out_dir):
         d.mkdir()
     for fp in (step.pw_fp, step.gv_dir / 'h1.epc'):
@@ -2448,15 +2450,18 @@ def test_main_runs_the_steps_asked_for_and_skips_a_prepared_seed():
     with saved_settings(), tempfile.TemporaryDirectory() as d:
         step = load_step_02(Path(d), 'area')
         calls = []
-        step.prepare = lambda: calls.append('prepare')
+        def prepare():
+            calls.append('prepare')
+            step.pw_fp.write_text('')
+            step.prep_stamp_fp.write_text(json.dumps(step.prep_stamp()))
+        step.prepare = prepare
         step.scale_hours = lambda workers: calls.append(('scale', workers))
         step.merge = lambda out_dir: calls.append('merge')
         step.pw_fp.unlink()
         with contextlib.redirect_stdout(io.StringIO()):
             step.main([])                                   # [run] steps and workers.
             assert calls == ['prepare', ('scale', 1), 'merge']
-            step.pw_fp.write_text('')                       # Prepared: step 01 skipped.
-            calls.clear()
+            calls.clear()                                   # Prepared from these settings: step 01 skipped.
             step.run['workers'] = 3
             step.main(['merge', 'scale'])
             assert calls == [('scale', 3), 'merge']
@@ -2519,6 +2524,51 @@ def test_a_worker_writes_the_hour_console_and_reports_a_failure():
             assert step._scale_one(step.gv_dir / 'h1.epc', step.out_dir / 'h1.pwb', console) == (None, "SimAutoError('no free SimAuto seat')")
         finally:
             pw.connect = real_connect
+
+def test_step_01_is_redone_when_prepared_pwb_was_made_from_other_settings():
+    with saved_settings(), tempfile.TemporaryDirectory() as d:
+        step = load_step_02(Path(d), 'area')
+        step.seed_dir.mkdir()
+        (step.seed_dir / 'seed.pwb').write_text('seed')
+        runs = []
+        def prepare():
+            runs.append(step.run['mode'])
+            step.pw_fp.write_text('prepared')
+            step.prep_stamp_fp.write_text(json.dumps(step.prep_stamp()))
+        step.prepare = prepare
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            assert step.prepared_changes() == ['no Prepared_Settings.json records what it was made from']
+            step.check_inputs()                             # An old Prepared.pwb without a record: a warning only.
+            step.prepare_if_needed()                        # ...but step 01 redoes it.
+            assert runs == ['area'] and step.prepared_changes() == []
+            step.prepare_if_needed()                        # The same settings: skipped.
+            assert runs == ['area']
+            step.check_inputs()
+            (step.out_dir / 'h1.pwb').write_text('')
+            step.run['mode'] = 'topology'                  # Switching modes is one line in settings.toml.
+            changes = step.prepared_changes()
+            assert any(c.startswith("mode: 'area' -> 'topology'") for c in changes) and any(c.startswith('epcs') for c in changes)
+            try:
+                step.check_inputs()                         # Scale alone on a stale Prepared.pwb: stops.
+                assert False
+            except SystemExit as e:
+                assert 'other settings' in str(e)
+            step.prepare_if_needed()
+            assert runs == ['area', 'topology'] and step.prepared_changes() == []
+            assert '1 hours in' in out.getvalue()           # The hours scaled from the old one are pointed out.
+            prep.SHUNT_VLOW = 0.9                           # A [prep] setting...
+            assert any(c.startswith('prep:') for c in step.prepared_changes())
+            prep.SHUNT_VLOW = 0.92
+            (step.seed_dir / 'seed.pwb').write_text('a new seed')    # ...or the seed changed.
+            assert any(c.startswith('seed:') for c in step.prepared_changes())
+            def fails():
+                raise SystemExit('the seed does not solve')
+            step.prepare = fails
+            try:
+                step.prepare_if_needed()
+            except SystemExit:
+                pass
+            assert not step.pw_fp.exists() and not step.prep_stamp_fp.exists()     # Nothing stale left behind.
 
 if __name__ == '__main__':
     tests = [f for name, f in dict(globals()).items() if name.startswith('test_')]

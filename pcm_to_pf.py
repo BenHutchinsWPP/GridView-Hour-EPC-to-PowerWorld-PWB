@@ -1,6 +1,7 @@
 """
 The whole run, settings in settings.toml:
-  step 01, prepare: the seed PWB (./Seed/) -> ./Prepared/Prepared.pwb. Skipped when Prepared.pwb exists: delete it to redo.
+  step 01, prepare: the seed PWB (./Seed/) -> ./Prepared/Prepared.pwb. Skipped while Prepared.pwb was made from the
+           same settings and seed (Prepared_Settings.json): change the mode, say, and it is redone.
   step 02, scale: Prepared.pwb to each GridView hour EPC in ./HourEPCs/ -> ./Output/<hour>.pwb and <hour>_Log.xlsx.
            [run] workers = N scales N hours at once, each in its own PowerWorld instance (console: Output/<hour>_Console.txt).
   step 03, merge: every Output/<hour>_Log.xlsx -> '03 Merge Reports.xlsx'.
@@ -12,6 +13,7 @@ load to its own EPC value (topo.build_targets()).
 """
 import argparse
 import contextlib
+import json
 import multiprocessing as mp
 import multiprocessing.connection
 import os
@@ -37,12 +39,61 @@ dummy_bus_fp = prepared_dir / 'DummyBus.aux'
 fault_fp = prepared_dir / 'fault_duty.csv'
 prep_log_fp = prepared_dir / 'Prepared_Log.xlsx'
 created_elements_fp = prepared_dir / 'Prepared_CreatedElements.xlsx'
+prep_stamp_fp = prepared_dir / 'Prepared_Settings.json'   # What Prepared.pwb was made from (prep_stamp()).
 out_dir = cur_dir / 'Output'                # Step 02 output, step 03 input.
 
 STEPS = settings.STEPS      # ('prepare', 'scale', 'merge')
 
 # ================== Step 01: prepare the seed ==================
+# The [run] settings step 01 reads. With [prep], [topology] and [pw], the seed file and (topology mode) the EPCs, they
+# are what Prepared.pwb depends on.
+PREP_RUN_KEYS = ('mode', 'case_format', 'create_giant_swing', 'swing_bus', 'adjust_seed_shunts',
+                 'gen_terminal_voltage_control', 'compute_pvqv')
+
+def prep_stamp() -> dict:
+    """What step 01 would make Prepared.pwb from now, as plain JSON values."""
+    stamp = {k: run[k] for k in PREP_RUN_KEYS}
+    for section in ('prep', 'topology', 'pw'):
+        module = settings.MODULES[section]
+        stamp[section] = {k: getattr(module, k.upper()) for k in sorted(settings.SETTINGS[section])}
+    seed = sorted(seed_dir.glob('*.pwb'))
+    stamp['seed'] = [seed[0].name, seed[0].stat().st_size, seed[0].stat().st_mtime_ns] if seed else None
+    if run['mode'] == 'topology':       # The topology and the XN loads come from the EPCs.
+        stamp['epcs'] = [fp.name for fp in sorted(gv_dir.glob('*.epc'))]
+    return json.loads(json.dumps(stamp, default=sorted))       # Sets as sorted lists, tuples as lists.
+
+def prepared_changes() -> list[str]:
+    """Why Prepared.pwb doesn't match settings.toml and its inputs now; [] if it does, or if there is none."""
+    if not pw_fp.exists():
+        return []
+    try:
+        old = json.loads(prep_stamp_fp.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return [f'no {prep_stamp_fp.name} records what it was made from']
+    except ValueError:
+        return [f'{prep_stamp_fp.name} is unreadable']
+    new = prep_stamp()
+    return [f'{k}: {old.get(k)!r} -> {new.get(k)!r}' for k in sorted(set(old) | set(new)) if old.get(k) != new.get(k)]
+
+def prepare_if_needed():
+    """Step 01, unless Prepared.pwb was made from the same settings and inputs."""
+    changes = prepared_changes()
+    if pw_fp.exists() and not changes:
+        print(f'Skipping step 01: {pw_fp.name} matches settings.toml and the seed. Delete it to re-prepare anyway.')
+        return
+    if changes:
+        print(f'Redoing step 01: {pw_fp.name} was made from other settings or inputs: ' + '; '.join(changes))
+        done = sorted(out_dir.glob('*.pwb'))
+        if done:
+            print(f'WARNING: {len(done)} hours in {out_dir} were scaled from the old {pw_fp.name}, and step 02 skips '
+                  'them: delete them to rescale.')
+    # Nothing stale is left behind if the preparation fails.
+    pw_fp.unlink(missing_ok=True)
+    prep_stamp_fp.unlink(missing_ok=True)
+    prepare()
+
 def prepare():
+    stamp = prep_stamp()        # Before it runs: a seed changed meanwhile shows up as stale next time.
     topology = run['mode'] == 'topology'
     # First PowerWorld PWB. Topology mode: also the first GridView EPC (alphabetically), and all of them for XN loads.
     seed_fps = sorted(seed_dir.glob('*.pwb'))
@@ -144,6 +195,7 @@ def prepare():
         log['distgen_loads'] = try_step('create_distgen_XN_loads()', lambda: topo.create_distgen_XN_loads(SimAuto, gv_load_df))
 
     pw.save_case(SimAuto, pw_fp, run['case_format'])
+    prep_stamp_fp.write_text(json.dumps(stamp, indent=2), encoding='utf-8')
 
     print('Writing log.')
     if log:
@@ -293,10 +345,16 @@ def check_inputs():
     """Stops with a clear message if step 01 didn't leave what this run's settings need."""
     if not pw_fp.exists():
         raise SystemExit(f'Step 02 needs {pw_fp}: run step 01 (prepare) first.')
+    changes = prepared_changes()
+    if changes and prep_stamp_fp.exists():
+        raise SystemExit(f'{pw_fp.name} was made from other settings or inputs than now: ' + '; '.join(changes)
+                         + '. Run step 01 (prepare): it redoes it.')
+    if changes:     # Made before the record existed: it may be fine.
+        print(f'WARNING: {changes[0]}: if settings.toml or the seed changed since it was made, run step 01 (prepare).')
     if run['use_pvqv'] and not pvqv_fp.exists():
-        raise SystemExit(f'use_pvqv needs {pvqv_fp}: delete {pw_fp.name} and run step 01 with compute_pvqv = true.')
+        raise SystemExit(f'use_pvqv needs {pvqv_fp}: run step 01 with compute_pvqv = true.')
     if run['mode'] == 'topology' and not dummy_bus_fp.exists():
-        raise SystemExit(f'Topology mode needs {dummy_bus_fp}: delete {pw_fp.name} and run step 01 in topology mode.')
+        raise SystemExit(f'Topology mode needs {dummy_bus_fp}: run step 01 in topology mode.')
 
 def hours_to_scale() -> list[tuple[Path, Path]]:
     """(EPC, output PWB) for every hour EPC without an output PWB yet."""
@@ -481,11 +539,7 @@ def main(argv=None):
 
     if 'prepare' in steps:
         print('=== Step 01: prepare ===')
-        if pw_fp.exists():
-            print(f'Skipping step 01: {pw_fp} already exists. Delete it to re-prepare the seed (needed after changing '
-                  'the mode or a step 01 setting: swing, shunts, voltage control, PVQV).')
-        else:
-            prepare()
+        prepare_if_needed()
     if 'scale' in steps:
         print(f'=== Step 02: scale ({workers} at a time) ===')
         scale_hours(workers)

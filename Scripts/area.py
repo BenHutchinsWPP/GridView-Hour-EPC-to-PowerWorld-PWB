@@ -644,7 +644,7 @@ def warn_unconverted_loads(case_load: pd.DataFrame) -> int:
         dist = df['DistMWInput'].where(df['DistStatus'] == 'Closed', 0.0).sum()
         print(f'WARNING: Prepared.pwb has {len(df)} Closed loads with constant current/impedance or dist gen '
               f'({(df["IMW"] + df["ZMW"]).sum():,.0f} MW of I+Z, {dist:,.0f} MW of dist gen). '
-              'Rerun step 01 (delete Prepared.pwb first): it converts every load to constant power.')
+              'Rerun step 01 (delete Prepared.pwb first if your settings haven\'t changed): it converts every load to constant power.')
     return len(df)
 
 def dist_gen_removed(cleanup: pd.DataFrame) -> float:

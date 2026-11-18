@@ -8,8 +8,8 @@
 #         gen and load to its own EPC value.
 mode = "area"
 case_format = "PWB24"                   # PowerWorld Simulator 24 or later opens the saved cases.
-# What pcm_to_pf.py runs with no arguments: step 01 "prepare" (skipped while Prepared/Prepared.pwb exists), 02 "scale",
-# 03 "merge". `python pcm_to_pf.py scale merge` runs only those.
+# What pcm_to_pf.py runs with no arguments: step 01 "prepare" (skipped while Prepared/Prepared.pwb was made from these
+# settings and seed: change the mode and it is redone), 02 "scale", 03 "merge". `python pcm_to_pf.py scale merge` runs only those.
 steps = ["prepare", "scale", "merge"]
 # Hours scaled at once in step 02, each in its own PowerWorld instance (one SimAuto license seat and the case's memory
 # each). Each hour's console goes to Output/<hour>_Console.txt when above 1.
