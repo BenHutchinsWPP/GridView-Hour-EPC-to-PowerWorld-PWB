@@ -1201,12 +1201,11 @@ def ledger_run(mutate=None, slack=(99,), makeup=False):
     targets, reports = area.build_targets({'Load': epc_load, 'Gen': epc_gen}, {'Load': load, 'Gen': gen}, swing_buses=list(slack))
     after_step, midrun_log = area.midrun_balancer(sa)
     scale.iterate_to_gen_load_targets(sa, targets, after_step=after_step)
-    tables, mk = [], []
-    if makeup:
-        assert area.makeup(sa, targets, tables=mk)
-    area.balance_swing(sa, targets, tables=tables)
-    assert midrun_log and tables
-    return area.areas(area.read_case(sa), reports, targets, tables, swing_buses=list(slack), makeup_tables=mk), targets
+    mk = area.makeup(sa, targets) if makeup else []
+    assert mk or not makeup
+    runs = [*midrun_log, *mk, *area.balance_swing(sa, targets)]
+    assert midrun_log and any(r.moved is not None for r in runs if r.name.startswith('balance'))
+    return area.areas(area.read_case(sa), reports, targets, runs, swing_buses=list(slack)), targets
 
 def test_areas_ledger_holds_with_midrun_and_final_balances_and_a_diverging_gen():
     out, targets = ledger_run()
@@ -2297,10 +2296,9 @@ def nonc_hour(case_rows, epc_rows, flags=('YES', 'YES'), epc_flags=('YES', 'YES'
     targets, reports = area.build_targets({'Load': epc, 'Gen': gen}, {'Load': case, 'Gen': gen})
     with contextlib.redirect_stdout(io.StringIO()):
         scale.iterate_to_gen_load_targets(sa, targets)
-        mk = []
-        area.makeup(sa, targets, tables=mk, nonconforming=reports['nonconforming'])
-        sheet = area.areas(area.read_case(sa), reports, targets, [], makeup_tables=mk)
-    return sa, targets, reports, sheet, mk
+        mk_runs = area.makeup(sa, targets, nonconforming=reports['nonconforming'])
+        sheet = area.areas(area.read_case(sa), reports, targets, mk_runs)
+    return sa, targets, reports, sheet, [r.moved for r in mk_runs]
 
 def test_load_flagged_only_in_the_epc_is_non_conforming_and_out_of_the_ledger():
     # ss is conforming in the PWB, flagged in the EPC (80 MW): out of the area's target and of Final MW, and set to 80 MW 1:1.

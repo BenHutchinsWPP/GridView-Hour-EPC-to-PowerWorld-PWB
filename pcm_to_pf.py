@@ -269,12 +269,12 @@ def create_case(SimAuto, gv_fp, out_fp) -> str | None:
             pre_runs = [scale.Run('prebalance', moved=moved, note='targets moved before scaling')]
     log_fp = out_dir / (gv_fp.stem + '_Log.xlsx')
 
-    def build_log(runs, final, balance_tables=(), swing_buses=(), exception_runs=(), final_loss=None, makeup_tables=()):
+    def build_log(runs, final, swing_buses=(), exception_runs=(), final_loss=None):
         log = {'exceptions': scale.exceptions([*exception_runs, *runs], targets, final), 'runs': scale.runs_sheet(runs)}
         if area_mode:
             # Before scaling (final None) nothing has been reached or balanced yet: the plan alone.
             scaled = targets if final is not None else None
-            log = {'areas': area.areas(final, reports, scaled, balance_tables, swing_buses, final_loss, makeup_tables), **log}
+            log = {'areas': area.areas(final, reports, scaled, runs, swing_buses, final_loss), **log}
         return log
 
     # The plan first, so that a failure during the hour's long scaling still leaves it.
@@ -292,7 +292,6 @@ def create_case(SimAuto, gv_fp, out_fp) -> str | None:
     except Exception as e:
         print(f'WARNING: could not check the loads for current/impedance/dist gen: {e!r}.')
     pvqv = pd.read_csv(pvqv_fp) if run['use_pvqv'] else None
-    balance_tables, makeup_tables = [], []
     slack = prep.slack_buses(SimAuto)
     swing = lambda: area.swing_mw(pw.get_df(SimAuto, 'Gen', area.GEN_FIELDS), slack)[0]
     before = swing()
@@ -310,14 +309,13 @@ def create_case(SimAuto, gv_fp, out_fp) -> str | None:
     if area_mode and area.MAKEUP:
         # What excluded units didn't reach goes onto their group's other units, before the final balance.
         try:
-            runs += area.makeup(SimAuto, targets, tables=makeup_tables, nonconforming=reports['nonconforming'])
+            runs += area.makeup(SimAuto, targets, nonconforming=reports['nonconforming'])
         except Exception as e:     # Never lose the hour over its make-up: the final balance still runs.
             print(f'WARNING: make-up failed: {e!r}. Carrying on without it.')
-            makeup_tables.clear()
             runs.append(scale.Run('makeup', note=f'failed: {e!r}'))
     if run['balance_swing']:
         try:
-            runs += area.balance_swing(SimAuto, targets, tables=balance_tables, epc=reports['swing'])
+            runs += area.balance_swing(SimAuto, targets, epc=reports['swing'])
         except Exception as e:     # Last resort: balance_swing() keeps its own failed rounds; never lose the hour.
             print(f'WARNING: final balance failed: {e!r}. Saving the case as it is.')
             runs.append(scale.Run('balance', note=f'failed: {e!r}'))
@@ -331,7 +329,7 @@ def create_case(SimAuto, gv_fp, out_fp) -> str | None:
     pw.save_case(SimAuto, out_fp, run['case_format'])
     summary = None
     try:
-        log = build_log(runs, final, balance_tables, swing_buses, final_loss=final_loss, makeup_tables=makeup_tables)
+        log = build_log(runs, final, swing_buses, final_loss=final_loss)
         summary = summary_line(gv_fp.stem, log, area_mode)
         print(summary)
         pw.write_excel(log_fp, log)

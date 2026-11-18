@@ -666,20 +666,21 @@ def _by_group(df: pd.DataFrame, value, group=None) -> pd.Series:
     return frame.groupby(['AreaNumber', 'Group'])['v'].sum()
 
 def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame], targets: dict[str, pd.DataFrame] | None = None,
-          balance_tables=(), swing_buses=(), final_loss: pd.Series | None = None, makeup_tables=()) -> pd.DataFrame:
+          runs=(), swing_buses=(), final_loss: pd.Series | None = None) -> pd.DataFrame:
     """
     The `areas` sheet: a row per (AreaNumber, Group), Group a GenType or 'Load' (AREAS_COLUMNS). The ledger per row:
         Final = Target - Unmet - Not Reached + Make-up + Balance
     Make-up: what the plan moved onto the group to cover another GenType of its area which its own units couldn't
-    (reports['area_gen'] 'Make-up MW'), plus what the make-up run moved onto it (makeup_tables: makeup_targets() tables,
+    (reports['area_gen'] 'Make-up MW'), plus what the make-up run moved onto it (the `makeup` run's moved tables in `runs`,
     after scaling), to cover what excluded units didn't reach.
     Not Reached: over the main scaling's rows, end-of-run target less end-of-run value (excluded, diverged, held units).
     Balance: what swing balancing moved onto the group = the midrun part (end-of-run `_Target` less Planned MW, main rows:
     midrun balances rescale the main targets) + the final part (value less seed in each final balance's table).
     final: read_case() of the scaled case, or None before scaling (Final columns blank). targets: the main tables after
-    scaling (None: nothing reached or balanced). balance_tables: balance_targets() tables of the final balance rounds,
-    after scaling (balance_swing(..., tables=)). Gens on swing_buses are left out, as in build_targets(). The non-conforming
-    loads (reports['nonconforming']) are left out of every column but the Load row's Note.
+    scaling (None: nothing reached or balanced). runs: the hour's scale.Runs; the moved tables (after scaling) of the
+    final balance rounds (`balance<N>`) and the make-up are read from them (midrun and prebalance runs are not: they
+    reach Balance through _Target - Planned MW). Gens on swing_buses are left out, as in build_targets(). The
+    non-conforming loads (reports['nonconforming']) are left out of every column but the Load row's Note.
     Losses go on each area's Load row: Seed and Est. from reports['area_loss'] (loss_estimate()), Final from final_loss
     (area_losses() of the scaled case). An area with losses but no load gets a Load row for them.
     """
@@ -701,7 +702,8 @@ def areas(final: dict[str, pd.DataFrame] | None, reports: dict[str, pd.DataFrame
         planned = _by_group(g, g['Planned MW'], gg).add(_by_group(l, l['Planned MW']), fill_value=0.0)
         parts['Not Reached MW'] = not_reached
         parts['Balance MW'] = end_target.sub(planned, fill_value=0.0)        # The midrun part.
-    for col, tables in (('Balance MW', balance_tables), ('Make-up MW', makeup_tables)):
+    moved = lambda ok: [r.moved for r in runs if r.moved is not None and ok(r.name)]
+    for col, tables in (('Balance MW', moved(lambda n: n.startswith('balance'))), ('Make-up MW', moved(lambda n: n == 'makeup'))):
         for t in tables:
             g, l = t['Gen'], t['Load']
             g = g[~g['BusNum'].isin(swing_buses)]       # Left out of Final MW too (a second slack bus beside the giant swing).
@@ -1013,7 +1015,7 @@ def run_correction(SimAuto, run: scale.Run, label: str) -> bool:
         run.note = '; '.join(filter(None, [run.note, f'stopped: {e}']))
         return False
 
-def balance_swing(SimAuto, scaled: dict[str, pd.DataFrame] | None = None, tables: list | None = None,
+def balance_swing(SimAuto, scaled: dict[str, pd.DataFrame] | None = None,
                   epc: pd.DataFrame | None = None) -> list[scale.Run]:
     """
     With the case open: moves the swing onto the whole case's gen (see balance_targets()) until it is within
@@ -1021,17 +1023,16 @@ def balance_swing(SimAuto, scaled: dict[str, pd.DataFrame] | None = None, tables
     their key is in the EPC (`epc`, swing_epc()), else anywhere within their limits). Returns a scale.Run per round that ran
     (`balance<N>`; the swing after a round is the next round's, or the end swing).
     scaled: the main scaling's tables, so units it held back or excluded are left alone here too (balance_skips()).
-    tables: if a list, each round's balance_targets() tables (after scaling) are appended to it, for areas().
     """
     slack = prep.slack_buses(SimAuto)
     runs: list[scale.Run] = []
     exhausted = True
     for i in range(BALANCE_MAX_ROUNDS):
         try:
-            if not _balance_round(SimAuto, i, slack, epc, scaled, tables, runs):
+            if not _balance_round(SimAuto, i, slack, epc, scaled, runs):
                 exhausted = False
                 break
-        except Exception as e:      # Keep the rounds that ran (their tables are in `tables`, with what each applied).
+        except Exception as e:      # Keep the rounds that ran (their Runs hold their tables, with what each applied).
             print(f'WARNING: Final balance {i + 1} failed: {e!r}')
             if runs and runs[-1].name == f'balance{i + 1}':     # It failed inside its own scaling: note it on its row.
                 runs[-1].note = '; '.join(filter(None, [runs[-1].note, f'failed: {e!r}']))
@@ -1051,7 +1052,7 @@ def balance_swing(SimAuto, scaled: dict[str, pd.DataFrame] | None = None, tables
             runs[-1].note = '; '.join(filter(None, [runs[-1].note, 'stopped at max rounds']))
     return runs
 
-def _balance_round(SimAuto, i, slack, epc, scaled, tables, runs) -> bool:
+def _balance_round(SimAuto, i, slack, epc, scaled, runs) -> bool:
     """One balance_swing() round; False once the swing is at its goal or the round's scaling stopped."""
     final = read_case(SimAuto)
     swing, swing_buses = swing_mw(final['Gen'], slack)
@@ -1062,8 +1063,6 @@ def _balance_round(SimAuto, i, slack, epc, scaled, tables, runs) -> bool:
     m = min(BALANCE_TOL_MW, (hi - lo) / 2)
     aim = float(np.clip(swing, lo + m, hi - m))
     targets = balance_targets(final, swing - aim, swing_buses, balance_skips(SimAuto, final, scaled))
-    if tables is not None:
-        tables.append(targets)
     run = scale.Run(f'balance{i + 1}', moved=targets, before=swing)
     runs.append(run)
     return run_correction(SimAuto, run, f'Final balance {i + 1}')
@@ -1131,11 +1130,10 @@ def makeup_targets(final: dict[str, pd.DataFrame], targets: dict[str, pd.DataFra
         df['ExclusionReason'] = ''
     return {t: df.set_index('ObjectID') for t, df in tables.items()}, {'Gen': float(s_gen.sum()), 'Load': float(s_load.sum())}
 
-def makeup(SimAuto, targets: dict[str, pd.DataFrame], tables: list | None = None, nonconforming=frozenset()) -> list[scale.Run]:
+def makeup(SimAuto, targets: dict[str, pd.DataFrame], nonconforming=frozenset()) -> list[scale.Run]:
     """
     With the case open, after the main scaling: runs makeup_targets() (a `makeup` run; none if nothing is short).
-    tables: if a list, the make-up tables (after scaling) are appended to it, for areas(). A make-up which fails
-    part-way keeps what it applied and the hour carries on.
+    A make-up which fails part-way keeps what it applied and the hour carries on. areas() reads the Run's moved tables.
     """
     slack = prep.slack_buses(SimAuto)
     final = read_case(SimAuto)
@@ -1144,8 +1142,6 @@ def makeup(SimAuto, targets: dict[str, pd.DataFrame], tables: list | None = None
     if made is None:
         return []
     moved, asked = made
-    if tables is not None:
-        tables.append(moved)
     run = scale.Run('makeup', moved=moved, before=before)
     run_correction(SimAuto, run, 'Make-up')     # A failed make-up keeps what it applied; the After read and the note still follow.
     run.after = swing_mw(read_case(SimAuto)['Gen'], slack)[0]

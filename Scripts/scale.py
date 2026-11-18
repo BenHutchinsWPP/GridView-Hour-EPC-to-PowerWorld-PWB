@@ -483,7 +483,9 @@ class Run:
     """
     One scaling run, for the `exceptions` and `runs` sheets.
     name: 'prebalance', 'main', 'midrun<N>', 'distgen', 'makeup', 'pretest' or 'balance<N>'. log: what iterate_to_gen_load_targets() returned (or the error's `.log`).
-    moved: a balance's balance_targets() tables, after scaling (None for the main run). before / after: the swing's MW
+    moved: the tables a correction run scaled (balance_targets() / makeup_targets() / prebalance), after scaling; None
+    for the main run. area.areas() counts those of 'makeup' and 'balance<N>' runs in the ledger, and no others: a new
+    kind of run with `moved` must be added there if it should count. before / after: the swing's MW
     around the run (NaN: not measured). at: a midrun balance's main progress, e.g. '50 of 100'. note: short flags.
     """
     name: str
